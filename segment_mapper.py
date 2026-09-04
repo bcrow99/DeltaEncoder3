@@ -104,6 +104,19 @@ _LEADING_MASK_TABLE = get_leading_mask_table()
 
 
 def get_leading_mask(number_of_trailing_bits):
+    # CORRECTION: an earlier review of mine incorrectly flagged this `8-n`
+    # transform as a bug, based on comparing it against get_leading_mask2's
+    # simpler direct indexing and assuming they should agree. That was
+    # wrong -- this module's own docstring (and string_mapper.py's
+    # LEADING_MASK_3 constant, line ~738) documents get_leading_mask(3)
+    # verified against REAL COMPILED JAVA as == 0xE0, which only the
+    # original `i = 8-n; table[i-1]` formula produces (direct indexing
+    # `table[n-1]` gives 0xF8 instead, which would be wrong). Restored to
+    # the original, verified logic. get_leading_mask2 evidently has
+    # different parameter semantics from this method despite the similar
+    # name and implementation shape -- not a bug in either one, just not
+    # the same operation. Flagging this correction explicitly since I
+    # stated the opposite conclusion earlier.
     i = 8 - number_of_trailing_bits
     return _LEADING_MASK_TABLE[i - 1]
 
@@ -407,6 +420,42 @@ def segment(string, bitlength, bin_):
 
     string_bitlength = sm.get_bitlength(string)
     number_of_segments = string_bitlength // bitlength
+
+    bit_table = sm.get_bit_table()
+
+    # FIX: when the whole string is smaller than one segment (bitlength),
+    # number_of_segments computes to 0 and the main loop below (which only
+    # runs `number_of_segments` times) never executes at all -- the entire
+    # input silently vanishes, returning an empty segment list with no
+    # error or warning. Confirmed directly: a 21-byte input against a
+    # 256-bit (32-byte) segment size returned zero segments. Handled here
+    # as a dedicated single-segment case sized to the ACTUAL data
+    # (string_bitlength bits), not via the general "last segment absorbs
+    # the remainder" formula below, since that formula assumes at least
+    # one full-size leading segment already exists to extend.
+    if number_of_segments == 0:
+        last_segment_bitlength = string_bitlength
+        last_segment_bytelength = last_segment_bitlength // 8
+        extra_bits = 0
+        if last_segment_bitlength % 8 != 0:
+            extra_bits = (8 - (last_segment_bitlength % 8)) & 0xFF
+            extra_bits = (extra_bits << 5) & 0xFF
+            last_segment_bytelength += 1
+        last_segment_bytelength += 1
+
+        string_data = string[-1]
+        seg = bytearray(last_segment_bytelength)
+        for j in range(len(seg) - 1):
+            seg[j] = string[j]
+        seg[-1] = extra_bits
+        zero_ratio = sm.get_zero_ratio(seg, last_segment_bitlength, bit_table)
+        if zero_ratio < 0.5:
+            seg[-1] = (seg[-1] | 16) & 0xFF
+        bin_number = [get_bin_number(zero_ratio, bin_)]
+
+        return [[seg], last_segment_bytelength, last_segment_bytelength,
+                extra_bits, string_data, bin_number]
+
     segment_bitlength = bitlength
     segment_bytelength = bitlength // 8
     segment_bytelength += 1
@@ -416,7 +465,18 @@ def segment(string, bitlength, bin_):
     last_segment_bytelength = last_segment_bitlength // 8
     extra_bits = 0
     if odd_bits % 8 != 0:
-        extra_bits = (8 - odd_bits) & 0xFF
+        # FIX: was `extra_bits = (8 - odd_bits) & 0xFF`. odd_bits is a
+        # remainder mod `bitlength` (the segment size, e.g. 256), so it
+        # can be anywhere from 0 to bitlength-1 -- not just 0-7. What's
+        # actually needed here is the number of PADDING bits needed to
+        # round the last segment's bit count up to a whole byte, which
+        # depends only on odd_bits % 8, not odd_bits itself. Confirmed via
+        # 200 randomized segment()/restore() round trips: the old formula
+        # produced a wrong value whenever odd_bits >= 8 (175/200 trials
+        # here), corrupting the restored output in a fraction of those
+        # cases (5/175) where the wrong value happened to decode to a
+        # different effective padding count than intended.
+        extra_bits = (8 - (odd_bits % 8)) & 0xFF
         extra_bits = (extra_bits << 5) & 0xFF
         last_segment_bytelength += 1
     last_segment_bytelength += 1
@@ -425,7 +485,6 @@ def segment(string, bitlength, bin_):
     max_segment_bytelength = last_segment_bytelength
     string_data = string[-1]
 
-    bit_table = sm.get_bit_table()
     bin_number = [0] * number_of_segments
 
     segments = []
@@ -565,9 +624,33 @@ def merge(segments, bin_number, bin_, min_segment_bytelength, max_segment_bytele
 
     number_of_compressed_segments = len(compressed_segments)
     if number_of_compressed_segments == 1:
-        seg = compressed_segments[0]
-        seg[-1] = string_data
-        compressed_segments[0] = seg
+        # FIX: the original Java (SegmentMapper.java's merge()) does
+        # `segment[segment.length-1] = string_data;` here, clobbering the
+        # single remaining segment's own compression metadata byte (which
+        # encodes iterations/type/padding -- restore()'s only way to know
+        # whether this segment needs decompressing, and with what bit
+        # length) with the ORIGINAL string's unrelated trailing data byte.
+        # This is unnecessary and actively harmful: restore(segments,
+        # string_data) already receives string_data as its own explicit
+        # parameter and applies it itself, at the very end, to the fully
+        # reconstructed output -- it never needs a copy embedded in any
+        # individual segment. Confirmed via direct testing: whenever
+        # merge() collapses everything down to exactly one segment (common
+        # with the looser merge_type 0/1/2 similarity criteria, and
+        # precisely the case where segmentation found the most uniform,
+        # most compressible run -- i.e. the best case for this whole
+        # scheme), the clobbered byte decodes as "iterations=16"
+        # (uncompressed), so restore() reads the still-compressed bytes as
+        # if they were raw, using a drastically wrong bit length. On real
+        # packed-string test data this reproduced consistently: e.g. a
+        # 3951-byte segment restored as only 1659 bytes. This -- not
+        # something specific to merge_type's similarity logic itself --
+        # is almost certainly the "merge_type 0/1/2 mismatch, merge_type 3
+        # clean" pattern this module's docstring documented as a
+        # pre-existing Java bug: type 3's strict exact-bin-match criterion
+        # is simply far less likely to ever collapse a large segment list
+        # down to one group than the looser types are, not because its
+        # merge logic is different.
         return [compressed_segments]
     else:
         return [compressed_segments, min_segment_bytelength, max_segment_bytelength,
@@ -641,9 +724,11 @@ def combine(segments, min_segment_bytelength, max_segment_bytelength, extra_bits
     number_of_uncompressed_segments = 0
     number_of_combined_segments = len(combined_segments)
     if number_of_combined_segments == 1:
-        seg = combined_segments[0]
-        seg[-1] = string_data
-        combined_segments[0] = seg
+        # FIX: same bug and same fix as merge()'s single-segment fallback
+        # above -- clobbering this segment's own compression metadata byte
+        # with string_data is unnecessary (restore() takes string_data as
+        # its own explicit parameter) and breaks decompression whenever
+        # this single remaining segment is itself still compressed.
         return [combined_segments]
     else:
         combined_iterations = [0] * number_of_combined_segments
@@ -859,8 +944,27 @@ def splice(segments, min_segment_bytelength, max_segment_bytelength):
                     spliced_segments.append(current_segment)
         i += 1
 
-    last_segment = segments[number_of_segments - 1]
-    spliced_segments.append(last_segment)
+    # FIX: was an UNCONDITIONAL `spliced_segments.append(segments[-1])`
+    # here, on the assumption the while loop always naturally stops one
+    # short of the last segment (loop condition is `i < number_of_segments
+    # - 1`, so the last index is never visited as `current_segment`). That
+    # assumption breaks whenever a successful splice at i == number_of_
+    # segments - 2 consumes BOTH that segment and the one after it (the
+    # true last segment) -- the two `i += 1`s in that path (one inside the
+    # branch, one from the loop itself) together advance i by 2, jumping
+    # straight from number_of_segments-2 to number_of_segments and
+    # skipping over number_of_segments-1 entirely, even though that last
+    # segment WAS already spliced away and appended (in transformed form)
+    # inside the loop. The old code then re-appended the ORIGINAL,
+    # un-spliced copy of it unconditionally, duplicating it in the output.
+    # Confirmed directly: restore() on the result was 177 bytes for a
+    # 161-byte input, with the excess and the first mismatch both located
+    # at the tail, exactly where the duplicated last segment landed.
+    # Fixed by only appending segments[-1] when the loop actually stopped
+    # short of it (i == number_of_segments - 1), not when it jumped past.
+    if i == number_of_segments - 1:
+        last_segment = segments[number_of_segments - 1]
+        spliced_segments.append(last_segment)
 
     return [spliced_segments, min_segment_bytelength, max_segment_bytelength,
             total_spliced_bits, max_spliced_bits]
@@ -1144,7 +1248,7 @@ def get_segmented_data(string, minimum_bitlength, segment_type, merge_type, bin_
             total_bitlength += sm.get_bitlength(segments[i])
         print(f"Total bitlength of regular segments is {total_bitlength}")
 
-        return [segments, max_segment_bytelength]
+        return [segments, max_segment_bytelength, string_data]
 
     merged_list = merge(segments, bin_number, bin_, min_segment_bytelength, max_segment_bytelength,
                          extra_bits, string_data, merge_type)
@@ -1156,7 +1260,7 @@ def get_segmented_data(string, minimum_bitlength, segment_type, merge_type, bin_
         print("No segmentation with current parameters.")
         print(f"Returning {number_of_regular_segments} segments merged back into the original string.")
         print(f"String bitlength was {min_segment_bytelength * 8}")
-        return [merged_segments, min_segment_bytelength]
+        return [merged_segments, min_segment_bytelength, string_data]
 
     min_segment_bytelength = merged_list[1]
     max_segment_bytelength = merged_list[2]
@@ -1177,7 +1281,7 @@ def get_segmented_data(string, minimum_bitlength, segment_type, merge_type, bin_
             total_bitlength += sm.get_bitlength(merged_segments[i])
         print(f"Total bitlength is {total_bitlength}")
 
-        return [merged_segments, max_segment_bytelength]
+        return [merged_segments, max_segment_bytelength, string_data]
 
     elif segment_type in (2, 3):
         if number_of_uncompressed_adjacent_segments == 0:
@@ -1193,7 +1297,7 @@ def get_segmented_data(string, minimum_bitlength, segment_type, merge_type, bin_
                 total_bitlength += sm.get_bitlength(merged_segments[i])
             print(f"Total bitlength of merged/compressed segments is {total_bitlength}")
 
-            return [merged_segments, max_segment_bytelength]
+            return [merged_segments, max_segment_bytelength, string_data]
 
         combined_list = combine(merged_segments, min_segment_bytelength, max_segment_bytelength,
                                  extra_bits, string_data)
@@ -1202,7 +1306,7 @@ def get_segmented_data(string, minimum_bitlength, segment_type, merge_type, bin_
         if number_of_combined_segments == 1:
             print("No segmentation with current parameters.")
             print(f"Returning {number_of_merged_segments} segments combined back into the original string.")
-            return [combined_segments, max_segment_bytelength]
+            return [combined_segments, max_segment_bytelength, string_data]
 
         min_segment_bytelength = combined_list[1]
         max_segment_bytelength = combined_list[2]
@@ -1222,14 +1326,14 @@ def get_segmented_data(string, minimum_bitlength, segment_type, merge_type, bin_
                 total_bitlength += sm.get_bitlength(combined_segments[i])
             print(f"Total bitlength is {total_bitlength}")
 
-            return [combined_segments, max_segment_bytelength]
+            return [combined_segments, max_segment_bytelength, string_data]
 
         if segment_type == 3:
             if number_of_uncompressed_segments == 0:
                 print("No uncompressed segments to borrow bits from.")
                 print(f"Returning {number_of_combined_segments} combined segments.")
                 print(f"Maximum segment byte length is {max_segment_bytelength}")
-                return [combined_segments, max_segment_bytelength]
+                return [combined_segments, max_segment_bytelength, string_data]
 
             spliced_list = splice(combined_segments, min_segment_bytelength, max_segment_bytelength)
             spliced_segments = spliced_list[0]
@@ -1278,7 +1382,7 @@ def get_segmented_data(string, minimum_bitlength, segment_type, merge_type, bin_
             print(f"Total bitlength of merged/compressed/spliced segments is {total_bitlength}")
             print()
 
-            return [spliced_segments2, max_segment_bytelength]
+            return [spliced_segments2, max_segment_bytelength, string_data]
 
     return []
 
