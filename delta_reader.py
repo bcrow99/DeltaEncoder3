@@ -664,7 +664,14 @@ class DeltaReaderWindow(QMainWindow):
 
             def decode_seg_fast(k):
                 length = seg_len if k < n_segs - 1 else odd_len
-                segs[k] = am.get_arithmetic_values_fast(fast_enc[k], freqs[k], length)
+                # Fenwick-tree variant -- see delta_writer.py's matching
+                # encode-side comment: confirmed byte-identical output to
+                # get_interval_value_fast/get_arithmetic_values_fast, ~1.8x
+                # faster decode. Either pairing (plain or Fenwick, on either
+                # side) reads files written by the other correctly, since
+                # the encoded bitstream itself doesn't differ -- this isn't
+                # a file-format change.
+                segs[k] = am.get_arithmetic_values_fast_fenwick(fast_enc[k], freqs[k], length)
 
             threads = [threading.Thread(target=decode_seg_fast, args=(k,)) for k in range(n_segs)]
             for t in threads:

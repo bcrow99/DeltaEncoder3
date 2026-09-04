@@ -35,7 +35,38 @@ after review of an earlier translation attempt -- see ResizeMapper.java's
 own header comment for what changed). No known-bug workarounds needed here.
 """
 
+import numpy as np
 
+# ---------------------------------------------------------------------------
+# Optional Numba acceleration (see delta_mapper.py's module docstring for
+# the full rationale) -- a no-op fallback decorator if numba isn't
+# installed, so correctness never depends on it, only speed. resizeX2 and
+# resizeY2 (the versions resize() actually calls) are pure index-assignment
+# block-copy/averaging loops with no Python-object logic, so this is a very
+# mechanical conversion: list -> numpy array, otherwise identical control
+# flow and indexing to what's already there (and already verified against
+# real Java -- see this module's own 500-case self-test at the bottom).
+try:
+    from numba import njit as _njit
+    NUMBA_AVAILABLE = True
+
+    def njit(*args, **kwargs):
+        kwargs.setdefault("cache", True)
+        kwargs.setdefault("nogil", True)
+        return _njit(*args, **kwargs)
+except ImportError:
+    NUMBA_AVAILABLE = False
+
+    def njit(*args, **kwargs):
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]
+
+        def _wrap(fn):
+            return fn
+        return _wrap
+
+
+@njit
 def _jdiv(a: int, b: int) -> int:
     """Java/C-style integer division: truncates toward zero.
     Python's `//` floors toward -infinity instead, which differs from Java
@@ -164,10 +195,10 @@ def resizeY(src, xdim, new_ydim):
 # =============================================================================
 # resizeX2 / resizeY2 -- the versions resize() actually calls.
 # =============================================================================
-def resizeX2(src, xdim, new_xdim):
-    src = list(src)
-    ydim = len(src) // xdim
-    dst = [0] * (new_xdim * ydim)
+@njit
+def _resizeX2_core(src, xdim, new_xdim):
+    ydim = src.shape[0] // xdim
+    dst = np.zeros(new_xdim * ydim, dtype=np.int64)
 
     if new_xdim == xdim:
         for i in range(xdim * ydim):
@@ -205,7 +236,7 @@ def resizeX2(src, xdim, new_xdim):
                         start += segment_length + 1
                         stop = start + segment_length
             else:
-                is_long = [False] * number_of_segments
+                is_long = np.zeros(number_of_segments, dtype=np.bool_)
                 interval = 1.0
                 interval /= (remainder + 1)
                 increment = int(interval * number_of_segments)
@@ -269,7 +300,7 @@ def resizeX2(src, xdim, new_xdim):
                     k = stop
                     dst[m] = src[k - 1]; m += 1
             else:
-                is_long = [False] * number_of_segments
+                is_long = np.zeros(number_of_segments, dtype=np.bool_)
                 interval = 1.0
                 interval /= (remainder + 1)
                 increment = int(interval * number_of_segments)
@@ -301,10 +332,15 @@ def resizeX2(src, xdim, new_xdim):
     return dst
 
 
-def resizeY2(src, xdim, new_ydim):
-    src = list(src)
-    ydim = len(src) // xdim
-    dst = [0] * (xdim * new_ydim)
+def resizeX2(src, xdim, new_xdim):
+    src_arr = np.asarray(list(src), dtype=np.int64)
+    return _resizeX2_core(src_arr, xdim, new_xdim).tolist()
+
+
+@njit
+def _resizeY2_core(src, xdim, new_ydim):
+    ydim = src.shape[0] // xdim
+    dst = np.zeros(xdim * new_ydim, dtype=np.int64)
 
     if new_ydim == ydim:
         for i in range(xdim * ydim):
@@ -341,7 +377,7 @@ def resizeY2(src, xdim, new_ydim):
                         start = stop + xdim
                         stop = start + segment_length * xdim
             else:
-                is_long = [False] * number_of_segments
+                is_long = np.zeros(number_of_segments, dtype=np.bool_)
                 interval = 1.0
                 interval /= (remainder + 1)
                 increment = int(interval * number_of_segments)
@@ -349,7 +385,10 @@ def resizeY2(src, xdim, new_ydim):
                 for i in range(remainder):
                     is_long[index] = True
                     index += increment
-                number_of_long_segments = sum(1 for v in is_long if v)  # unused, matches Java
+                number_of_long_segments = 0  # unused, matches Java
+                for v in is_long:
+                    if v:
+                        number_of_long_segments += 1
 
                 for i in range(xdim):
                     m = i
@@ -414,7 +453,7 @@ def resizeY2(src, xdim, new_ydim):
                     k = stop
                     dst[m] = src[k - xdim]
             else:
-                is_long = [False] * number_of_segments
+                is_long = np.zeros(number_of_segments, dtype=np.bool_)
                 interval = 1.0
                 interval /= (remainder + 1)
                 increment = int(interval * number_of_segments)
@@ -422,7 +461,10 @@ def resizeY2(src, xdim, new_ydim):
                 for i in range(remainder):
                     is_long[index] = True
                     index += increment
-                number_of_long_segments = sum(1 for v in is_long if v)  # unused, matches Java
+                number_of_long_segments = 0  # unused, matches Java
+                for v in is_long:
+                    if v:
+                        number_of_long_segments += 1
 
                 for i in range(xdim):
                     m = i
@@ -450,6 +492,11 @@ def resizeY2(src, xdim, new_ydim):
                     dst[m] = src[k - xdim]
 
     return dst
+
+
+def resizeY2(src, xdim, new_ydim):
+    src_arr = np.asarray(list(src), dtype=np.int64)
+    return _resizeY2_core(src_arr, xdim, new_ydim).tolist()
 
 
 def resize(src, xdim, new_xdim, new_ydim):

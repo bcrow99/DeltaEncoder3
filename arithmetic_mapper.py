@@ -51,6 +51,62 @@ overload resolution to preserve and int already covers the full range.
 
 import math
 
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Optional Numba acceleration (see delta_mapper.py's module docstring for
+# the full rationale) -- a no-op fallback decorator if numba isn't
+# installed, so correctness never depends on it, only speed.
+#
+# IMPORTANT SCOPE NOTE: only get_interval_value_fast / get_arithmetic_values_fast
+# (and their small helpers below) are accelerated here -- these are the
+# fast/renormalizing coder delta_writer.py's "Arithmetic" entropy option
+# and delta_reader.py actually use, and their arithmetic stays within
+# fixed 32-bit registers (_TOP = 0x100000000, safely inside int64), so
+# they're numba-compatible the same way everything else already
+# converted is. get_interval_value / get_arithmetic_values (the "Slow
+# Arithmetic" option) are NOT touched and can't safely use this same
+# approach: they do genuine arbitrary-precision rational arithmetic
+# (numerator/denominator pairs that multiply together every symbol),
+# which is exactly why that path is called "slow" and stores its result
+# as BigInteger byte arrays. Numba's nopython mode only supports
+# fixed-width integers, so forcing that algorithm into int64 would
+# either fail to compile or silently produce wrong output on longer
+# segments -- a structural limit, not a caution call.
+try:
+    from numba import njit as _njit
+    NUMBA_AVAILABLE = True
+
+    def njit(*args, **kwargs):
+        kwargs.setdefault("cache", True)
+        kwargs.setdefault("nogil", True)
+        return _njit(*args, **kwargs)
+except ImportError:
+    NUMBA_AVAILABLE = False
+
+    def njit(*args, **kwargs):
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]
+
+        def _wrap(fn):
+            return fn
+        return _wrap
+
+
+def _to_uint8_array(x):
+    """Converts src/encoded to a uint8 numpy array regardless of whether
+    the caller passed a numpy array, a plain Python list, or a
+    bytes/bytearray object -- delta_writer.py/delta_reader.py pass bytes
+    for these, and numba's nopython mode can't run np.asarray() on a raw
+    bytes object directly (only on already-typed arrays/lists), so that
+    conversion happens here, in plain Python, before entering any
+    numba-compiled core."""
+    if isinstance(x, np.ndarray):
+        return x if x.dtype == np.uint8 else x.astype(np.uint8)
+    if isinstance(x, (bytes, bytearray)):
+        return np.frombuffer(bytes(x), dtype=np.uint8)
+    return np.asarray(list(x), dtype=np.uint8)
+
 
 # =============================================================================
 # java.util.Random port (see module docstring)
@@ -1524,20 +1580,33 @@ _TQTR = 0xC0000000
 _MASK32 = 0xFFFFFFFF
 
 
+@njit
 def _fast_write_bit(buf, pos, bit):
     if bit != 0:
         buf[pos >> 3] = (buf[pos >> 3] | (1 << (pos & 7))) & 0xFF
 
 
+@njit
 def _fast_read_bit(buf, data_byte_offset, pos):
     abs_pos = data_byte_offset * 8 + pos
-    return (buf[abs_pos >> 3] >> (abs_pos & 7)) & 1
+    # int() cast matters specifically in the no-numba fallback path: buf
+    # is a uint8 array, so buf[...] is a numpy.uint8 scalar there, and
+    # without this cast that 8-bit width propagates into every downstream
+    # `code = (code << 1) | bit` accumulation, silently overflowing after
+    # a handful of left-shifts (confirmed: raises OverflowError once code
+    # needs more than 8 bits). Inside an actual numba-compiled call this
+    # cast is a no-op -- numba's own type inference already widens
+    # correctly -- so this only changes behavior for the pure-Python
+    # (numba not installed) path, making it correct instead of broken.
+    return int((buf[abs_pos >> 3] >> (abs_pos & 7)) & 1)
 
 
+@njit
 def _find_fast_symbol(s, target):
     """Binary search on cumulative-frequency table s[]. Returns the
     largest index j such that s[j] <= target. s[] is non-decreasing."""
-    lo, hi = 0, len(s) - 1
+    lo = 0
+    hi = s.shape[0] - 1
     while lo < hi:
         mid = (lo + hi + 1) >> 1
         if s[mid] <= target:
@@ -1547,18 +1616,14 @@ def _find_fast_symbol(s, target):
     return lo
 
 
-def get_interval_value_fast(src, frequency):
-    """Java: getIntervalValueFast(byte[], int[]) -> byte[]
-    Fast arithmetic encoder using long-integer E1/E2/E3 renormalization.
-    Drop-in replacement for the encode half of get_interval_value /
-    get_arithmetic_values, but much faster because it avoids big-integer
-    fraction arithmetic entirely."""
-    f = list(frequency)
-    n = len(src)
+@njit
+def _interval_value_fast_core(src, frequency):
+    n = src.shape[0]
+    f = frequency.copy()
 
-    s = [0] * len(f)
+    s = np.zeros(f.shape[0], dtype=np.int64)
     m = 0
-    for i in range(len(f)):
+    for i in range(f.shape[0]):
         s[i] = m
         m += f[i]
 
@@ -1566,11 +1631,11 @@ def get_interval_value_fast(src, frequency):
     high = _TOP
     pending = 0
 
-    buf = bytearray(n * 2 + 16)
+    buf = np.zeros(n * 2 + 16, dtype=np.uint8)
     bit_pos = 0
 
     for i in range(n):
-        j = src[i]
+        j = int(src[i])
 
         range_ = high - low
         new_low = low + (range_ * s[j]) // m
@@ -1606,7 +1671,7 @@ def get_interval_value_fast(src, frequency):
 
         f[j] -= 1
         m -= 1
-        for k in range(j + 1, len(s)):
+        for k in range(j + 1, s.shape[0]):
             s[k] -= 1
 
     pending += 1
@@ -1625,34 +1690,41 @@ def get_interval_value_fast(src, frequency):
 
     bit_length = bit_pos
     byte_length = (bit_length + 7) // 8
-    result = bytearray(4 + byte_length)
+    result = np.zeros(4 + byte_length, dtype=np.uint8)
     result[0] = (bit_length >> 24) & 0xFF
     result[1] = (bit_length >> 16) & 0xFF
     result[2] = (bit_length >> 8) & 0xFF
     result[3] = bit_length & 0xFF
-    result[4:4 + byte_length] = buf[0:byte_length]
+    for i in range(byte_length):
+        result[4 + i] = buf[i]
     return result
 
 
-def get_arithmetic_values_fast(encoded, frequency, n):
-    """Java: getArithmeticValuesFast(byte[], int[], int) -> byte[]
-    Fast arithmetic decoder, exact inverse of get_interval_value_fast.
+def get_interval_value_fast(src, frequency):
+    """Java: getIntervalValueFast(byte[], int[]) -> byte[]
+    Fast arithmetic encoder using long-integer E1/E2/E3 renormalization.
+    Drop-in replacement for the encode half of get_interval_value /
+    get_arithmetic_values, but much faster because it avoids big-integer
+    fraction arithmetic entirely."""
+    src_arr = _to_uint8_array(src)
+    freq_arr = np.asarray(list(frequency), dtype=np.int64)
+    result = _interval_value_fast_core(src_arr, freq_arr)
+    return bytearray(result.tobytes())
 
-    FIX (see module docstring / ArithmeticMapper.java header): includes
-    the boundary-verification-and-nudge step. The initial `scaled`-based
-    guess can land one symbol short of (or, in principle, past) the true
-    one when `code` sits exactly at -- or extremely close to -- a symbol
-    boundary, since `scaled` is computed by truncating-division inverting
-    a value the encoder produced via its own truncating division; those
-    two truncations don't perfectly cancel right at a boundary."""
-    bit_length = ((encoded[0] & 0xFF) << 24) | ((encoded[1] & 0xFF) << 16) \
-        | ((encoded[2] & 0xFF) << 8) | (encoded[3] & 0xFF)
 
-    f = list(frequency)
+@njit
+def _arithmetic_values_fast_core(encoded, frequency, n):
+    b0 = np.int64(encoded[0])
+    b1 = np.int64(encoded[1])
+    b2 = np.int64(encoded[2])
+    b3 = np.int64(encoded[3])
+    bit_length = ((b0 & 0xFF) << 24) | ((b1 & 0xFF) << 16) | ((b2 & 0xFF) << 8) | (b3 & 0xFF)
 
-    s = [0] * len(f)
+    f = frequency.copy()
+
+    s = np.zeros(f.shape[0], dtype=np.int64)
     m = 0
-    for i in range(len(f)):
+    for i in range(f.shape[0]):
         s[i] = m
         m += f[i]
 
@@ -1666,7 +1738,7 @@ def get_arithmetic_values_fast(encoded, frequency, n):
         bit_ptr += 1
         code = (code << 1) | bit
 
-    value = bytearray(n)
+    value = np.zeros(n, dtype=np.uint8)
 
     for i in range(n):
         range_ = high - low
@@ -1677,15 +1749,15 @@ def get_arithmetic_values_fast(encoded, frequency, n):
             scaled = m - 1
 
         j = _find_fast_symbol(s, scaled)
-        while j < len(f) - 1 and f[j] == 0:
+        while j < f.shape[0] - 1 and f[j] == 0:
             j += 1
 
         new_low = low + (range_ * s[j]) // m
         new_high = high if (s[j] + f[j] == m) else low + (range_ * (s[j] + f[j])) // m
 
-        while code >= new_high and j < len(f) - 1:
+        while code >= new_high and j < f.shape[0] - 1:
             j += 1
-            while j < len(f) - 1 and f[j] == 0:
+            while j < f.shape[0] - 1 and f[j] == 0:
                 j += 1
             new_low = low + (range_ * s[j]) // m
             new_high = high if (s[j] + f[j] == m) else low + (range_ * (s[j] + f[j])) // m
@@ -1725,10 +1797,27 @@ def get_arithmetic_values_fast(encoded, frequency, n):
 
         f[j] -= 1
         m -= 1
-        for k in range(j + 1, len(s)):
+        for k in range(j + 1, s.shape[0]):
             s[k] -= 1
 
     return value
+
+
+def get_arithmetic_values_fast(encoded, frequency, n):
+    """Java: getArithmeticValuesFast(byte[], int[], int) -> byte[]
+    Fast arithmetic decoder, exact inverse of get_interval_value_fast.
+
+    FIX (see module docstring / ArithmeticMapper.java header): includes
+    the boundary-verification-and-nudge step. The initial `scaled`-based
+    guess can land one symbol short of (or, in principle, past) the true
+    one when `code` sits exactly at -- or extremely close to -- a symbol
+    boundary, since `scaled` is computed by truncating-division inverting
+    a value the encoder produced via its own truncating division; those
+    two truncations don't perfectly cancel right at a boundary."""
+    encoded_arr = _to_uint8_array(encoded)
+    freq_arr = np.asarray(list(frequency), dtype=np.int64)
+    result = _arithmetic_values_fast_core(encoded_arr, freq_arr, n)
+    return bytearray(result.tobytes())
 
 
 # =============================================================================
@@ -1840,14 +1929,16 @@ def get_approx_offset_fast_ordered(src, frequency, order):
 # (Binary Indexed) tree giving O(log 256) = 8 operations per symbol for
 # both prefix-sum queries and updates.
 # =============================================================================
+@njit
 def _fenwick_build(frequency):
-    bit = [0] * 257
+    bit = np.zeros(257, dtype=np.int64)
     for i in range(256):
         if frequency[i] > 0:
             _fenwick_update(bit, i, frequency[i])
     return bit
 
 
+@njit
 def _fenwick_update(bit, i, delta):
     i += 1
     while i <= 256:
@@ -1855,6 +1946,7 @@ def _fenwick_update(bit, i, delta):
         i += i & (-i)
 
 
+@njit
 def _fenwick_query(bit, i):
     total = 0
     i += 1
@@ -1864,6 +1956,7 @@ def _fenwick_query(bit, i):
     return total
 
 
+@njit
 def _fenwick_find(bit, target):
     """Find 0-indexed symbol j: prefix_sum[0..j-1] <= target < prefix_sum[0..j]"""
     pos = 0
@@ -1989,22 +2082,24 @@ def get_arithmetic_values_fenwick(v, frequency, n):
 # get_arithmetic_values_fast but O(log 256) cumulative frequency updates
 # instead of O(256).
 # =============================================================================
-def get_interval_value_fast_fenwick(src, frequency):
-    """Java: getIntervalValueFastFenwick(byte[], int[]) -> byte[]"""
-    f = list(frequency)
-    n = len(src)
+@njit
+def _interval_value_fast_fenwick_core(src, frequency):
+    n = src.shape[0]
+    f = frequency.copy()
     bit = _fenwick_build(f)
-    m = sum(f)
+    m = 0
+    for i in range(f.shape[0]):
+        m += f[i]
 
     low = 0
     high = _TOP
     pending = 0
 
-    buf = bytearray(n * 2 + 16)
+    buf = np.zeros(n * 2 + 16, dtype=np.uint8)
     bit_pos = 0
 
     for i in range(n):
-        j = src[i]
+        j = int(src[i])
 
         sj = _fenwick_query(bit, j - 1) if j > 0 else 0
         sj_fj = _fenwick_query(bit, j)
@@ -2061,27 +2156,37 @@ def get_interval_value_fast_fenwick(src, frequency):
 
     bit_length = bit_pos
     byte_length = (bit_length + 7) // 8
-    result = bytearray(4 + byte_length)
+    result = np.zeros(4 + byte_length, dtype=np.uint8)
     result[0] = (bit_length >> 24) & 0xFF
     result[1] = (bit_length >> 16) & 0xFF
     result[2] = (bit_length >> 8) & 0xFF
     result[3] = bit_length & 0xFF
-    result[4:4 + byte_length] = buf[0:byte_length]
+    for i in range(byte_length):
+        result[4 + i] = buf[i]
     return result
 
 
-def get_arithmetic_values_fast_fenwick(encoded, frequency, n):
-    """Java: getArithmeticValuesFastFenwick(byte[], int[], int) -> byte[]
+def get_interval_value_fast_fenwick(src, frequency):
+    """Java: getIntervalValueFastFenwick(byte[], int[]) -> byte[]"""
+    src_arr = _to_uint8_array(src)
+    freq_arr = np.asarray(list(frequency), dtype=np.int64)
+    result = _interval_value_fast_fenwick_core(src_arr, freq_arr)
+    return bytearray(result.tobytes())
 
-    FIX: same boundary issue as get_arithmetic_values_fast -- see that
-    function's docstring for the full explanation. Verify and nudge j
-    using Fenwick queries instead of direct array access."""
-    bit_length = ((encoded[0] & 0xFF) << 24) | ((encoded[1] & 0xFF) << 16) \
-        | ((encoded[2] & 0xFF) << 8) | (encoded[3] & 0xFF)
 
-    f = list(frequency)
+@njit
+def _arithmetic_values_fast_fenwick_core(encoded, frequency, n):
+    b0 = np.int64(encoded[0])
+    b1 = np.int64(encoded[1])
+    b2 = np.int64(encoded[2])
+    b3 = np.int64(encoded[3])
+    bit_length = ((b0 & 0xFF) << 24) | ((b1 & 0xFF) << 16) | ((b2 & 0xFF) << 8) | (b3 & 0xFF)
+
+    f = frequency.copy()
     bit = _fenwick_build(f)
-    m = sum(f)
+    m = 0
+    for i in range(f.shape[0]):
+        m += f[i]
 
     low = 0
     high = _TOP
@@ -2093,7 +2198,7 @@ def get_arithmetic_values_fast_fenwick(encoded, frequency, n):
         bit_ptr += 1
         code = (code << 1) | bt
 
-    value = bytearray(n)
+    value = np.zeros(n, dtype=np.uint8)
 
     for i in range(n):
         range_ = high - low
@@ -2104,7 +2209,7 @@ def get_arithmetic_values_fast_fenwick(encoded, frequency, n):
             scaled = m - 1
 
         j = _fenwick_find(bit, scaled)
-        while j < len(f) - 1 and f[j] == 0:
+        while j < f.shape[0] - 1 and f[j] == 0:
             j += 1
 
         sj = _fenwick_query(bit, j - 1) if j > 0 else 0
@@ -2113,9 +2218,9 @@ def get_arithmetic_values_fast_fenwick(encoded, frequency, n):
         new_low = low + (range_ * sj) // m
         new_high = high if (sj_fj == m) else low + (range_ * sj_fj) // m
 
-        while code >= new_high and j < len(f) - 1:
+        while code >= new_high and j < f.shape[0] - 1:
             j += 1
-            while j < len(f) - 1 and f[j] == 0:
+            while j < f.shape[0] - 1 and f[j] == 0:
                 j += 1
             sj = _fenwick_query(bit, j - 1) if j > 0 else 0
             sj_fj = _fenwick_query(bit, j)
@@ -2162,3 +2267,15 @@ def get_arithmetic_values_fast_fenwick(encoded, frequency, n):
         m -= 1
 
     return value
+
+
+def get_arithmetic_values_fast_fenwick(encoded, frequency, n):
+    """Java: getArithmeticValuesFastFenwick(byte[], int[], int) -> byte[]
+
+    FIX: same boundary issue as get_arithmetic_values_fast -- see that
+    function's docstring for the full explanation. Verify and nudge j
+    using Fenwick queries instead of direct array access."""
+    encoded_arr = _to_uint8_array(encoded)
+    freq_arr = np.asarray(list(frequency), dtype=np.int64)
+    result = _arithmetic_values_fast_fenwick_core(encoded_arr, freq_arr, n)
+    return bytearray(result.tobytes())

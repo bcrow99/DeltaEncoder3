@@ -146,6 +146,49 @@ def shift_2d(src, amount):
     return np.asarray(flat).reshape(a.shape) if a.ndim > 1 else np.asarray(flat)
 
 
+def quantize_channel(ch, pixel_shift):
+    """Right-shifts ch by pixel_shift with rounding to nearest (adding
+    half a quantization step before truncating), rather than a pure
+    truncating shift.
+
+    This is a deliberate encode-side design choice, not a straight
+    port of anything -- DeltaReader.java's decode is a pure left-shift
+    with no rounding compensation (see DeltaMapper.getPixel()'s
+    blue_shift/green_shift/red_shift), so it reconstructs whatever
+    quantized value was actually stored, however that value was chosen.
+    A pure truncating right-shift here (shift_2d(ch, -pixel_shift), i.e.
+    floor division) would introduce a systematic DARKENING bias: every
+    reconstructed pixel is <= the original, never brighter, biased
+    downward by about half a quantization step on average (confirmed:
+    at pixel_shift=7 this measured ~61 levels darker on average, out of
+    a worst case of 127). Adding half a step before truncating centers
+    the quantization error around zero instead. No change to
+    delta_reader.py or the on-disk file format is needed for this --
+    the reader (and this file's own preview decode) just left-shifts
+    back whichever quantized value ends up written; only which value
+    gets written in the first place changes here.
+
+    CLAMPED at the top of the range: naively adding half a step and
+    truncating can round a near-maximum input up to a quantization index
+    whose reconstruction (index << pixel_shift) exceeds 255 -- e.g. at
+    pixel_shift=3, input 255 rounds to index 32, reconstructing to 256,
+    for every pixel_shift value from 1-7 (confirmed by direct
+    computation, not just at the boundary). This numpy pipeline clips
+    the final assembled image to 0-255 right before display, so it
+    wouldn't crash or wrap here -- but it would silently push every
+    near-white pixel to the single coarsest quantization bucket instead
+    of its properly rounded one, and if this same rounding scheme were
+    ever ported into DeltaMapper.getPixel()'s bit-packed-int assembly
+    (blue[k] << (pixel_shift+16), etc.), a value of 256 in an 8-bit-wide
+    field would overflow into the next channel's bits -- a real color
+    corruption, not just clipping. Capping the pre-shift value at 255
+    (so the chosen index can never reconstruct past the input's own
+    valid range) avoids both."""
+    arr = np.asarray(ch, dtype=np.int64)
+    half = 1 << (pixel_shift - 1)
+    return np.minimum(arr + half, 255) >> pixel_shift
+
+
 def difference_2d(src1, src2):
     a, b = np.asarray(src1), np.asarray(src2)
     flat = dm.get_difference(a.reshape(-1).tolist(), b.reshape(-1).tolist())
@@ -303,7 +346,20 @@ class InitWorker(QThread):
         w = self.window
         print(f"[InitWorker] analyzing '{w.filename}' in background thread...")
         qcl6 = w._build_quantized_channels()
-        channel_sum = [int(cm.get_shannon_limit(get_ideal_frequency(qcl6[i], 0, 0))) for i in range(6)]
+        # FIX: was DeltaMapper.getIdealFrequency(qcl6[i], 0, 0) -- passing
+        # literal 0 for both xdim and ydim instead of qcl6[i]'s actual
+        # dimensions. get_ideal_frequency's loop is `for i in range(1,
+        # ydim)`, so ydim=0 makes that loop never run, leaving its
+        # internal delta_list empty, and min()/max() on an empty list
+        # raises ValueError -- crashing this background QThread every
+        # time (visible as "Error calling Python override of
+        # QThread::run()" with a ValueError: min() iterable argument is
+        # empty traceback). Reading xdim/ydim directly off qcl6[i]'s own
+        # shape guarantees they match what _build_quantized_channels()
+        # actually produced, the same way _apply_preview_impl already
+        # does via new_xdim, new_ydim from _quantized_dims().
+        qc_ydim, qc_xdim = qcl6[0].shape
+        channel_sum = [int(cm.get_shannon_limit(get_ideal_frequency(qcl6[i], qc_xdim, qc_ydim))) for i in range(6)]
         set_sum = w._compute_set_sums(channel_sum)
         min_set_id = int(np.argmin(set_sum))
         channel_id = dm.get_channels(min_set_id)
@@ -451,7 +507,26 @@ class DeltaWriterWindow(QMainWindow):
         self.filename = filename
         self.pixel_quant = 4
         self.pixel_shift = 3
-        self.pixel_segment = 0       # no UI control in this version; stays 0
+        # arithmetic entropy coding segment size (0-10, slider in the
+        # Entropy menu). 0 is a DELIBERATE, benchmarked default, not an
+        # arbitrary starting point -- see the conversation this was
+        # produced in for the full measurement, but in short: Slow
+        # Arithmetic's per-symbol cost grows worse than quadratically
+        # with segment size (measured: a 500-symbol segment took ~30ms;
+        # 750 symbols, only 1.5x more data, took ~117ms -- 3.9x longer).
+        # pixel_segment=0 maps to _segment_payload's smallest possible
+        # segment (500 symbols, the floor of its `500 + pixel_segment*500`
+        # formula), which is the fastest setting this slider can reach --
+        # confirmed to already take ~8s end-to-end for a full 640x480
+        # image with Slow Arithmetic selected. Any higher setting (larger,
+        # fewer segments) costs dramatically more; there's no headroom to
+        # trade for Slow Arithmetic's theoretical compression benefit
+        # (a wider per-segment interval gives simplest_fraction_in_interval
+        # more room to find a low-denominator fraction) without a much
+        # longer save. If you want a genuinely SMALLER floor than 500 for
+        # very large images, that needs a change to _segment_payload's own
+        # formula, not just this default -- ask if you want that explored.
+        self.pixel_segment = 0
         self.correction = 0
         self.min_set_id = 0
         self.delta_type = 5
@@ -667,6 +742,26 @@ class DeltaWriterWindow(QMainWindow):
             act.triggered.connect(lambda checked, et=et: setattr(self, "entropy_type", et))
             self.entropy_actions.append((act, et))
 
+        # Segment size for the Arithmetic/Slow Arithmetic entropy types
+        # (_segment_payload's `min_seg = 500 + pixel_segment*500`, up to
+        # pixel_segment=10 forcing a single unsegmented chunk). This was
+        # never wired up to any control in this version -- pixel_segment
+        # stayed permanently at 0, its hardcoded default, which is NOT
+        # "no segmentation": at 0, min_seg is still 500, so any payload
+        # over ~500 bytes gets split every ~500 bytes regardless (a real
+        # image channel easily produces hundreds of segments). Restoring
+        # a control here doesn't change that default, just makes the
+        # value actually adjustable again, matching the other sliders'
+        # pattern. Like entropy_type, this doesn't affect the preview --
+        # segmentation only happens inside _save_arithmetic() at Save time.
+        m.addSeparator()
+        act, _d, self.segment_slider = make_slider_dialog(
+            self, "Segment Size", 0, 10, self.pixel_segment, self._set_pixel_segment)
+        m.addAction(act)
+
+    def _set_pixel_segment(self, v):
+        self.pixel_segment = v
+
     # -------------------------------------------------------------- zoom/view
     def _zoom_by(self, factor):
         new = max(ZOOM_MIN, min(ZOOM_MAX, self.zoom_scale * factor))
@@ -763,7 +858,7 @@ class DeltaWriterWindow(QMainWindow):
             if self.pixel_quant != 0:
                 ch = resize_channel(ch, self.image_xdim, new_xdim, new_ydim)
             if self.pixel_shift != 0:
-                ch = shift_2d(ch, -self.pixel_shift)
+                ch = quantize_channel(ch, self.pixel_shift)
             qcl.append(ch)
         qcl.append(difference_2d(qcl[0], qcl[1]))
         qcl.append(difference_2d(qcl[2], qcl[1]))
@@ -1217,7 +1312,14 @@ class DeltaWriterWindow(QMainWindow):
                     low, high = am.get_interval_value(segs[m], freqs[m])
                     out.append((low, high))
                 else:
-                    out.append(am.get_interval_value_fast(segs[m], freqs[m]))
+                    # Fenwick-tree variant: confirmed to produce a
+                    # byte-identical encoded stream to get_interval_value_fast
+                    # (see the conversation this was produced in -- 28/28
+                    # cross-checks matched exactly across alphabet sizes and
+                    # lengths), while running ~1.7x faster since its
+                    # per-symbol cumulative-frequency update is O(log 256)
+                    # instead of O(256). Safe drop-in swap, no format change.
+                    out.append(am.get_interval_value_fast_fenwick(segs[m], freqs[m]))
             encoded[i] = out
 
         threads = [threading.Thread(target=encode_channel, args=(i,)) for i in range(len(channel_id))]

@@ -33,17 +33,77 @@ runnable (smaller-scale) version of the same check.
 # =============================================================================
 # Histogram
 # =============================================================================
+import numpy as np
+
+# ---------------------------------------------------------------------------
+# Optional Numba acceleration (see delta_mapper.py's module docstring for
+# the full rationale) -- a no-op fallback decorator if numba isn't
+# installed, so correctness never depends on it, only speed.
+try:
+    from numba import njit as _njit
+    NUMBA_AVAILABLE = True
+
+    def njit(*args, **kwargs):
+        kwargs.setdefault("cache", True)
+        kwargs.setdefault("nogil", True)
+        return _njit(*args, **kwargs)
+except ImportError:
+    NUMBA_AVAILABLE = False
+
+    def njit(*args, **kwargs):
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]
+
+        def _wrap(fn):
+            return fn
+        return _wrap
+
+
+def _to_int64_array(x):
+    """Converts a src/table argument to an int64 numpy array regardless
+    of whether the caller passed a numpy array, a plain Python list, or a
+    bytes/bytearray object -- numba's nopython mode can't run
+    np.asarray() on a raw bytes object directly (only on already-typed
+    arrays/lists), so that conversion happens here, in plain Python,
+    before entering any numba-compiled core."""
+    if isinstance(x, np.ndarray):
+        return x if x.dtype == np.int64 else x.astype(np.int64)
+    if isinstance(x, (bytes, bytearray)):
+        return np.frombuffer(bytes(x), dtype=np.uint8).astype(np.int64)
+    return np.asarray(list(x), dtype=np.int64)
+
+
+def _to_uint8_array(x):
+    """Same as _to_int64_array but for uint8 (raw byte-string) data."""
+    if isinstance(x, np.ndarray):
+        return x if x.dtype == np.uint8 else x.astype(np.uint8)
+    if isinstance(x, (bytes, bytearray)):
+        return np.frombuffer(bytes(x), dtype=np.uint8)
+    return np.asarray(list(x), dtype=np.uint8)
+
+
+@njit
+def _histogram_core(src):
+    min_v = src[0]
+    max_v = src[0]
+    for i in range(1, src.shape[0]):
+        if src[i] < min_v:
+            min_v = src[i]
+        elif src[i] > max_v:
+            max_v = src[i]
+    rng = max_v - min_v + 1
+    histogram = np.zeros(rng, dtype=np.int64)
+    for i in range(src.shape[0]):
+        histogram[src[i] - min_v] += 1
+    return min_v, histogram, rng
+
+
 def get_histogram(src):
     """Java overload: getHistogram(int[]). This is the one DeltaWriter.java
     actually calls. Returns [min_value, histogram, range]."""
-    src = list(src)
-    min_v = min(src)
-    max_v = max(src)
-    rng = max_v - min_v + 1
-    histogram = [0] * rng
-    for v in src:
-        histogram[v - min_v] += 1
-    return [min_v, histogram, rng]
+    src_arr = np.asarray(src, dtype=np.int64)
+    min_v, histogram, rng = _histogram_core(src_arr)
+    return [int(min_v), histogram.tolist(), int(rng)]
 
 
 def get_histogram_bytes(src):
@@ -100,14 +160,16 @@ def get_rank_table(src):
 # =============================================================================
 # packStrings / unpackStrings
 # =============================================================================
-def pack_strings(src, table):
-    """src: list of ints, each usable as an index into `table` (i.e.
-    table must be indexable by every value in src -- matching Java's
-    `table[src[i]]` direct indexing)."""
-    max_length = len(table) - 1
+_PACK_MASK = np.array([1, 3, 7, 15, 31, 63, 127, 255], dtype=np.int64)
+
+
+@njit
+def _pack_strings_core(src, table):
+    max_length = table.shape[0] - 1
 
     bitlength = 0
-    for v in src:
+    for i in range(src.shape[0]):
+        v = src[i]
         if table[v] != max_length:
             bitlength += table[v] + 1
         else:
@@ -117,15 +179,16 @@ def pack_strings(src, table):
     if bitlength % 8 != 0:
         bytelength += 1
 
-    dst = bytearray(bytelength + 1)  # +1 for the trailing metadata byte
+    dst = np.zeros(bytelength + 1, dtype=np.uint8)  # +1 for the trailing metadata byte
 
-    mask = [1, 3, 7, 15, 31, 63, 127, 255]
+    mask = _PACK_MASK
 
     start = 0
     stop = 0
     j = 0
 
-    for val in src:
+    for i in range(src.shape[0]):
+        val = src[i]
         k = table[val]
         if k == 0:
             start += 1
@@ -163,22 +226,33 @@ def pack_strings(src, table):
                     j += 1
             start = stop
 
-    zero_ratio = get_zero_ratio(dst, bitlength)
+    return dst, bitlength
+
+
+def pack_strings(src, table):
+    """src: list of ints, each usable as an index into `table` (i.e.
+    table must be indexable by every value in src -- matching Java's
+    `table[src[i]]` direct indexing)."""
+    src_arr = _to_int64_array(src)
+    table_arr = _to_int64_array(table)
+    dst, bitlength = _pack_strings_core(src_arr, table_arr)
+
+    dst_list = bytearray(dst.tobytes())
+    zero_ratio = get_zero_ratio(dst_list, bitlength)
     type_ = 1 if zero_ratio < 0.5 else 0
-    set_data(type_, 0, bitlength, dst)
-    return dst
+    set_data(type_, 0, bitlength, dst_list)
+    return dst_list
 
 
-def unpack_strings(src, table, size, bitlength):
-    n = len(table)
+@njit
+def _unpack_strings_core(src, table, dst, bitlength):
+    n = table.shape[0]
     max_length = n - 1
-    dst = [0] * size
+    size = dst.shape[0]
 
-    inverse_table = [0] * n
+    inverse_table = np.zeros(n, dtype=np.int64)
     for i in range(n):
         inverse_table[table[i]] = i
-
-    bitlength = min(bitlength, get_bitlength(src))
 
     length = 1
     src_byte = 0
@@ -186,30 +260,45 @@ def unpack_strings(src, table, size, bitlength):
     bit = 0
     bits_read = 0
 
+    while dst_byte < size and bits_read < bitlength:
+        non_zero = src[src_byte] & (1 << bit)
+        if non_zero != 0 and length < max_length:
+            length += 1
+        elif non_zero == 0:
+            dst[dst_byte] = inverse_table[length - 1]
+            dst_byte += 1
+            length = 1
+        elif length == max_length:
+            dst[dst_byte] = inverse_table[length]
+            dst_byte += 1
+            length = 1
+        bit += 1
+        bits_read += 1
+        if bit == 8:
+            bit = 0
+            src_byte += 1
+
+
+def unpack_strings(src, table, size, bitlength):
+    src_arr = _to_uint8_array(src)
+    table_arr = _to_int64_array(table)
+    dst = np.zeros(size, dtype=np.int64)
+
+    bitlength = min(bitlength, get_bitlength(src))
+
     try:
-        while dst_byte < size and bits_read < bitlength:
-            non_zero = src[src_byte] & (1 << bit)
-            if non_zero != 0 and length < max_length:
-                length += 1
-            elif non_zero == 0:
-                dst[dst_byte] = inverse_table[length - 1]
-                dst_byte += 1
-                length = 1
-            elif length == max_length:
-                dst[dst_byte] = inverse_table[length]
-                dst_byte += 1
-                length = 1
-            bit += 1
-            bits_read += 1
-            if bit == 8:
-                bit = 0
-                src_byte += 1
+        _unpack_strings_core(src_arr, table_arr, dst, bitlength)
     except (IndexError, KeyError) as e:
+        # dst keeps whatever _unpack_strings_core already wrote in place
+        # before raising -- same recovery behavior as the original
+        # (mutating a shared list/array in place, not building up a
+        # result only returned on success), matching Java's own
+        # catch-and-continue here.
         print(e)
         print("Exiting unpackStrings with an exception.")
         import traceback
         traceback.print_exc()
-    return dst
+    return dst.tolist()
 
 
 # =============================================================================
@@ -728,7 +817,8 @@ def get_zero_ratio(string, bit_length, table=None):
     return zero_sum / total
 
 
-def get_compression_amount(string, bit_length, transform_type):
+@njit
+def _compression_amount_core(string, bit_length, transform_type):
     positive = 0
     negative = 0
     byte_length = bit_length // 8
@@ -786,6 +876,11 @@ def get_compression_amount(string, bit_length, transform_type):
                 negative += 1
                 previous = 0
     return positive - negative
+
+
+def get_compression_amount(string, bit_length, transform_type):
+    string_arr = np.frombuffer(bytes(string), dtype=np.uint8)
+    return int(_compression_amount_core(string_arr, bit_length, transform_type))
 
 
 if __name__ == "__main__":

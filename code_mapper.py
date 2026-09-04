@@ -70,8 +70,33 @@ Confirmed identical behavior (same print statements) against real Java.
 import math
 from typing import List
 
+import numpy as np
+
 import string_mapper as sm
 import segment_mapper as segm
+
+# ---------------------------------------------------------------------------
+# Optional Numba acceleration (see delta_mapper.py's module docstring for
+# the full rationale) -- a no-op fallback decorator if numba isn't
+# installed, so correctness never depends on it, only speed.
+try:
+    from numba import njit as _njit
+    NUMBA_AVAILABLE = True
+
+    def njit(*args, **kwargs):
+        kwargs.setdefault("cache", True)
+        kwargs.setdefault("nogil", True)
+        return _njit(*args, **kwargs)
+except ImportError:
+    NUMBA_AVAILABLE = False
+
+    def njit(*args, **kwargs):
+        if len(args) == 1 and callable(args[0]) and not kwargs:
+            return args[0]
+
+        def _wrap(fn):
+            return fn
+        return _wrap
 
 
 # =============================================================================
@@ -791,21 +816,28 @@ def get_code_zero_ratio(code, length, frequency):
     return number_of_zeros / (number_of_zeros + number_of_ones)
 
 
+@njit
 def log2(value):
     return math.log(value) / math.log(2.0)
 
 
-def get_shannon_limit(frequency):
-    n = len(frequency)
-    total = sum(frequency)
-    weight = [frequency[i] / total for i in range(n)]
+@njit
+def _shannon_limit_core(frequency):
+    n = frequency.shape[0]
+    total = frequency.sum()
 
     limit = 0.0
     for i in range(n):
-        if weight[i] != 0:
-            limit -= frequency[i] * log2(weight[i])
+        if frequency[i] != 0:
+            weight = frequency[i] / total
+            limit -= frequency[i] * log2(weight)
 
     return limit
+
+
+def get_shannon_limit(frequency):
+    freq_arr = np.asarray(frequency, dtype=np.float64)
+    return float(_shannon_limit_core(freq_arr))
 
 
 def get_cost(length, frequency):
