@@ -122,12 +122,12 @@ def _freq(fn):
 
 
 get_ideal_frequency = _freq(dm.get_ideal_frequency)
-get_ideal_frequency8 = _freq(dm.get_ideal_frequency8)
-get_ideal_frequency16 = _freq(dm.get_ideal_frequency16)
-get_med_scanline_frequency = _freq(dm.get_med_scanline_frequency)
-get_scanline2_frequency = _freq(dm.get_scanline2_frequency)
-get_mixed_deltas4_frequency = _freq(dm.get_mixed_deltas4_frequency)
-get_mixed_deltas16_frequency = _freq(dm.get_mixed_deltas16_frequency)
+# get_ideal_frequency8/16, get_med_scanline_frequency, get_scanline2_frequency,
+# get_mixed_deltas4_frequency, get_mixed_deltas16_frequency used to be wrapped
+# here too, for InitWorker's old Shannon-limit-estimate shortcut on delta
+# types 6-9/11-12. Removed now that InitWorker builds and compresses a real
+# bit string for every type instead (see InitWorker.run() and
+# print_delta_type_ranking()) -- these wrappers had no other callers.
 
 
 def bilateral_smooth(src, xdim, ydim, threshold):
@@ -335,6 +335,47 @@ def numpy_bgr_to_qpixmap(arr_bgr: np.ndarray) -> QPixmap:
 # Background "init()" worker -- auto-picks channel set / delta type /
 # compress type, mirroring the Java SwingWorker in showInitialImage().
 # =============================================================================
+def print_channel_set_ranking(channel_sum, set_sum, selected_set_id):
+    """Prints the ranked channel-set table (rank, set composition, per-
+    channel entropy estimate, total), marking the set that was actually
+    selected. Mirrors DeltaWriter.java's printChannelSetRanking()."""
+    order = sorted(range(10), key=lambda i: set_sum[i])
+    print("Channel sets (ranked):")
+    for r, idx in enumerate(order):
+        c = dm.get_channels(idx)
+        sel = " **" if idx == selected_set_id else ""
+        print(f"  {r+1:2d}. {SET_STRINGS[idx]:<32s} {channel_sum[c[0]]:10d} {channel_sum[c[1]]:10d} "
+              f"{channel_sum[c[2]]:10d} {set_sum[idx]:12d}{sel}")
+    print()
+
+
+def print_delta_type_ranking(delta_bits, map_bits, delta_compressed, map_compressed, total_delta_sum, selected_dt):
+    """Prints the ranked delta-type table: rank, name, delta bits (with its
+    own compression marker), map bits for the types that have one (with its
+    own marker), and the combined total used for selection -- marking the
+    type that was actually selected. Mirrors DeltaWriter.java's version:
+    types without a map print with the map column blank rather than a
+    misleading 0, so the delta/total columns stay aligned either way.
+
+    A compression marker (*) means compress_strings() ran on that specific
+    bit string (delta or map) and its iterations count indicated real
+    compression, not just a pass-through.
+    """
+    order = sorted(range(13), key=lambda i: total_delta_sum[i])
+    print("Delta types (ranked):")
+    for r, idx in enumerate(order):
+        dc = "*" if delta_compressed[idx] else " "
+        sel = " **" if idx == selected_dt else ""
+        if _ENCODERS[idx][2]:  # has_map
+            mc = "*" if map_compressed[idx] else " "
+            print(f"  {r+1:2d}. {DELTA_TYPE_STRINGS[idx]:<16s} delta: {delta_bits[idx]:12d}{dc}      "
+                  f"map: {map_bits[idx]:12d}{mc}      total: {total_delta_sum[idx]:12d}{sel}")
+        else:
+            print(f"  {r+1:2d}. {DELTA_TYPE_STRINGS[idx]:<16s} delta: {delta_bits[idx]:12d}{dc}                              "
+                  f"total: {total_delta_sum[idx]:12d}{sel}")
+    print()
+
+
 class InitWorker(QThread):
     finished_with = Signal(int, int, int)  # min_set_id, delta_type, compress_type
 
@@ -362,42 +403,48 @@ class InitWorker(QThread):
         channel_sum = [int(cm.get_shannon_limit(get_ideal_frequency(qcl6[i], qc_xdim, qc_ydim))) for i in range(6)]
         set_sum = w._compute_set_sums(channel_sum)
         min_set_id = int(np.argmin(set_sum))
+        print_channel_set_ranking(channel_sum, set_sum, min_set_id)
         channel_id = dm.get_channels(min_set_id)
 
-        # ---- pick the best delta type (mirrors init()'s total_delta_sum loop) ----
-        total_delta_sum = [0] * 13
+        # ---- pick the best delta type: build a REAL delta (and, where
+        # applicable, map) bit string for every one of the 13 candidates
+        # and actually compress it, rather than using a Shannon-limit
+        # estimate for types 6-9/11-12 (matching DeltaWriter.java's most
+        # recent change). This also fixes a pre-existing gap where type
+        # 10's map cost wasn't tracked at all -- it only ever contributed
+        # its delta cost to total_delta_sum. _ENCODERS already uniformly
+        # wraps every type's real value-computing function plus a has_map
+        # flag, so this loop needs no type-specific branches at all,
+        # unlike the old version (which special-cased 0-5, 10, 11-12, and
+        # 6-9 separately).
+        delta_bits       = [0] * 13
+        map_bits         = [0] * 13
+        delta_compressed = [False] * 13
+        map_compressed   = [False] * 13
         for ci in channel_id:
             qc = qcl6[ci]
             xdim, ydim = qc.shape[1], qc.shape[0]
-
-            for t in range(6):  # horizontal..adaptive
-                delta = _ENCODERS[t][0](qc, xdim, ydim)[1]
+            for t in range(13):
+                encode_fn, _, has_map = _ENCODERS[t]
+                result = encode_fn(qc, xdim, ydim)
+                delta = result[1]
                 packed = get_string_list(delta, False)[3]
-                total_delta_sum[t] += sm.get_bitlength(sm.compress_strings(packed))
+                compressed = sm.compress_strings(packed)
+                delta_bits[t] += sm.get_bitlength(compressed)
+                if (sm.get_iterations(compressed) & 15) > 0:
+                    delta_compressed[t] = True
 
-            delta10 = _ENCODERS[10][0](qc, xdim, ydim)[1]  # scanline 5 (mixed 8-rows)
-            packed10 = get_string_list(delta10, False)[3]
-            total_delta_sum[10] += sm.get_bitlength(sm.compress_strings(packed10))
+                if has_map:
+                    map_ = result[2]
+                    map_packed = get_string_list(map_, False)[3]
+                    map_compressed_bytes = sm.compress_strings(map_packed)
+                    map_bits[t] += sm.get_bitlength(map_compressed_bytes)
+                    if (sm.get_iterations(map_compressed_bytes) & 15) > 0:
+                        map_compressed[t] = True
 
-            dhist8, maphist8 = get_ideal_frequency8(qc, xdim, ydim)
-            dhist16, maphist16 = get_ideal_frequency16(qc, xdim, ydim)
-            total_delta_sum[11] += int(cm.get_shannon_limit(dhist8) + cm.get_shannon_limit(maphist8))
-            total_delta_sum[12] += int(cm.get_shannon_limit(dhist16) + cm.get_shannon_limit(maphist16))
-
-            dhist6, rawdelta6 = get_med_scanline_frequency(qc, xdim, ydim)
-            total_delta_sum[6] += int(cm.get_shannon_limit(dhist6)) + \
-                sm.get_bitlength(get_string_list(rawdelta6, False)[3])
-            dhist7, rawdelta7 = get_scanline2_frequency(qc, xdim, ydim)
-            total_delta_sum[7] += int(cm.get_shannon_limit(dhist7)) + \
-                sm.get_bitlength(get_string_list(rawdelta7, False)[3])
-            dhist8b, rawdelta8 = get_mixed_deltas4_frequency(qc, xdim, ydim)
-            total_delta_sum[8] += int(cm.get_shannon_limit(dhist8b)) + \
-                sm.get_bitlength(get_string_list(rawdelta8, False)[3])
-            dhist9, rawdelta9 = get_mixed_deltas16_frequency(qc, xdim, ydim)
-            total_delta_sum[9] += int(cm.get_shannon_limit(dhist9)) + \
-                sm.get_bitlength(get_string_list(rawdelta9, False)[3])
-
+        total_delta_sum = [delta_bits[t] + map_bits[t] for t in range(13)]
         best_dt = int(np.argmin(total_delta_sum))
+        print_delta_type_ranking(delta_bits, map_bits, delta_compressed, map_compressed, total_delta_sum, best_dt)
 
         # ---- pick compress_type (String vs String*) ----
         str_bits = star_bits = 0
