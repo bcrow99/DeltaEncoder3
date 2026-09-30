@@ -402,6 +402,23 @@ def get_frequency_type(frequency):
     return 0 if mx <= 255 else 1 if mx <= 65535 else 2
 
 
+def deflate_frequencies(frequency, type_, level=9):
+    """n*256 counts, little-endian, 1, 2 or 4 bytes each (type_ 0, 1, 2),
+    Deflated -- no header (pack_frequencies adds one)."""
+    dtype = ("<u1", "<u2", "<u4")[type_]
+    raw = np.asarray(frequency, dtype=np.int64).astype(dtype).tobytes()
+    return zlib.compress(raw, level)
+
+
+def inflate_frequencies(zipped, n, type_):
+    width = (1, 2, 4)[type_]
+    raw = zlib.decompressobj().decompress(bytes(zipped), n * 256 * width)
+    if len(raw) < n * 256 * width:
+        raise IOError("frequency tables: inflated %d of %d bytes" % (len(raw), n * 256 * width))
+    dtype = ("<u1", "<u2", "<u4")[type_]
+    return np.frombuffer(raw, dtype=dtype).astype(np.int64).reshape(n, 256)
+
+
 def pack_frequencies(frequency, level=9):
     """int n, int type, int Deflated length, Deflated bytes: n*256 counts,
     little-endian, 1, 2 or 4 bytes each (the smallest that holds them)."""

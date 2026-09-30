@@ -105,16 +105,21 @@ def get_regular_huffman_length(frequency):
         f = [max(1, v // 2) if v > 0 else 0 for v in f]
 
 
-def get_regular_canonical_code(length):
+@njit
+def _canonical_code(length, max_length):
     code = np.zeros(256, dtype=np.int64)
     nxt = 0
-    for L in range(1, REGULAR_MAX_CODE_LENGTH + 1):
+    for L in range(1, max_length + 1):
         for s in range(256):
             if length[s] == L:
                 code[s] = nxt
                 nxt += 1
         nxt <<= 1
     return code
+
+
+def get_regular_canonical_code(length):
+    return _canonical_code(np.asarray(length, dtype=np.int64), REGULAR_MAX_CODE_LENGTH)
 
 
 @njit
@@ -162,12 +167,8 @@ def _unpack_regular(src, n, count, first_code, first_index, order):
     return dst
 
 
-def unpack_regular_code(src, length, n):
-    length = np.asarray(length, dtype=np.int64)
-    used = np.nonzero(length)[0]
-    if len(used) <= 1:
-        return np.full(n, used[0] if len(used) else 0, dtype=np.uint8)
-    M = REGULAR_MAX_CODE_LENGTH
+@njit
+def _decode_tables(length, M):
     count = np.zeros(M + 1, dtype=np.int64)
     for L in length:
         if L > 0:
@@ -175,7 +176,8 @@ def unpack_regular_code(src, length, n):
     first_code = np.zeros(M + 1, dtype=np.int64)
     first_index = np.zeros(M + 1, dtype=np.int64)
     order = np.zeros(256, dtype=np.int64)
-    code_word = index = 0
+    code_word = 0
+    index = 0
     for L in range(1, M + 1):
         first_code[L] = code_word
         first_index[L] = index
@@ -184,6 +186,15 @@ def unpack_regular_code(src, length, n):
                 order[index] = s
                 index += 1
         code_word = (code_word + count[L]) << 1
+    return count, first_code, first_index, order
+
+
+def unpack_regular_code(src, length, n):
+    length = np.asarray(length, dtype=np.int64)
+    used = np.nonzero(length)[0]
+    if len(used) <= 1:
+        return np.full(n, used[0] if len(used) else 0, dtype=np.uint8)
+    count, first_code, first_index, order = _decode_tables(length, REGULAR_MAX_CODE_LENGTH)
     src = np.frombuffer(bytes(src), dtype=np.uint8) if not isinstance(src, np.ndarray) else src
     return _unpack_regular(src, n, count, first_code, first_index, order)
 
@@ -197,3 +208,50 @@ def unpack_regular_tables(packed, n):
     raw = zlib.decompressobj().decompress(bytes(packed), n * 256)
     raw = raw + bytes(n * 256 - len(raw))
     return [np.frombuffer(raw[k * 256:(k + 1) * 256], dtype=np.uint8).copy() for k in range(n)]
+
+
+def get_regular_code_bytes(frequency, length):
+    """Coded size in bytes of pack_regular_code, without coding."""
+    length = np.asarray(length, dtype=np.int64)
+    if np.count_nonzero(length) <= 1:
+        return 0
+    bits = int(np.dot(np.asarray(frequency, dtype=np.int64), length))
+    return (bits + 7) // 8
+
+
+# ---- Varint lengths (the Packet programs' per-packet coded lengths) ----------
+
+def pack_regular_lengths(coded):
+    """Each item's length as a varint: 7 bits per byte, high bit = more."""
+    out = bytearray()
+    for c in coded:
+        v = len(c)
+        while v >= 128:
+            out.append((v & 127) | 128)
+            v >>= 7
+        out.append(v)
+    return bytes(out)
+
+
+def unpack_regular_lengths(packed, n):
+    length = [0] * n
+    position = 0
+    for k in range(n):
+        v = shift = 0
+        while True:
+            b = packed[position]
+            position += 1
+            v |= (b & 127) << shift
+            shift += 7
+            if b < 128:
+                break
+        length[k] = v
+    return length
+
+
+def get_varint_bytes(v):
+    n = 1
+    while v >= 128:
+        v >>= 7
+        n += 1
+    return n
