@@ -1,3729 +1,225 @@
 """
-Python translation of DeltaMapper.java
+delta_mapper.py -- the parts of DeltaMapper.java the Delta programs use:
+quantizing, the six candidate channels and ten channel sets, the fourteen
+delta types (0-13) and their inverses, maps and tables on disk, context
+coding of deltas, and the block-map settings search.
 
-Notes on the translation:
-  - Java's `int` arithmetic wraps at 32 bits; this translation uses Python's
-    arbitrary-precision ints and does not emulate overflow/wraparound. For the
-    pixel-value ranges this code is meant to operate on (8-bit image data and
-    small deltas), this makes no observable difference.
-  - Java's integer division ("/") truncates toward zero, which differs from
-    Python's "//" (floors toward negative infinity) for negative operands.
-    A small helper, `jdiv`, reproduces Java's truncating semantics wherever
-    the original code used "/" between two ints.
-  - Java's ">>" is an arithmetic (sign-propagating) right shift, which is
-    equivalent to Python's ">>" for the same operands, so ">>" is translated
-    directly.
-  - `ArrayList` return values that mix an int, an int[]/list, and possibly a
-    byte[]/list are translated to plain Python lists, matching the original
-    element order (so callers can still do result[0], result[1], ... exactly
-    as in the Java code).
-  - `byte[]` maps (values 0-15) are translated to ordinary Python lists of
-    ints; Python has no fixed-width byte semantics to preserve here since all
-    stored values are small non-negative indices.
-  - `Hashtable<Double, ...>` / tie-breaking logic that relied on Java's
-    Double object identity semantics is translated using plain Python dicts,
-    which behave equivalently for this purpose.
-  - `CodeMapper.getShannonLimit(...)` is provided by code_mapper.py (the
-    Python translation of CodeMapper.java) as a plain module-level function,
-    `code_mapper.get_shannon_limit(frequency)`. It's imported below and used
-    at every site that called `CodeMapper.getShannonLimit(...)` in the Java
-    source (get_med_scanline_frequency, get_scanline2_frequency,
-    get_mixed_deltas4_frequency, get_mixed_deltas_from_values,
-    get_mixed_deltas_from_values4). code_mapper.py must be importable
-    (i.e. on sys.path alongside this file, together with its own
-    string_mapper.py / segment_mapper.py dependencies) for those five
-    functions to run; every other function in this module has no such
-    dependency.
+Channels are flat, row-major numpy int64 arrays (index = y * xdim + x).
+Maps are numpy uint8 arrays. Byte-for-byte compatible with the Java; the
+per-pixel loops are Numba-compiled. Java's truncating division is jdiv().
 """
 
 import math
-from typing import List
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
-import code_mapper
-
-# ---------------------------------------------------------------------------
-# Optional Numba acceleration.
-#
-# Several functions below (the ones profiling showed dominate real-world
-# runtime -- see the conversation this was produced in) are pure per-pixel
-# numeric loops with no Python-object logic, which CPython interprets one
-# bytecode at a time but which a JIT compiler turns into native machine
-# code. Numba is an optional accelerator, not a hard dependency: if it
-# isn't installed, `njit` below becomes a no-op decorator and every
-# function runs exactly as pure Python, at the same correctness (just
-# without the speedup). No function's behavior depends on whether numba
-# is present -- only its speed does.
-#
-# Two settings on by default here: `cache=True` persists compiled machine
-# code to disk, so the (multi-second, one-time) JIT compilation cost is
-# paid once ever on a given machine, not once per process launch.
-# `nogil=True` releases Python's GIL for the duration of each compiled
-# call, which matters specifically because delta_writer.py/delta_reader.py
-# run per-channel and per-segment work on separate threading.Thread
-# objects expecting real parallelism (mirroring Java's real OS threads) --
-# without nogil=True, @njit alone makes each thread's own work fast but
-# the GIL still serializes the threads relative to each other, so multiple
-# cores never actually get used at once. Every accelerated function here
-# is either pure-numeric on already-typed numpy arrays, or (for the few
-# that also accept a plain Python list/bytes and convert it internally)
-# confirmed safe with nogil=True: numba transparently reacquires the GIL
-# just for that conversion step and releases it again for the rest of the
-# call, without changing any result.
-try:
-    from numba import njit as _njit
-    NUMBA_AVAILABLE = True
-
-    def njit(*args, **kwargs):
-        kwargs.setdefault("cache", True)
-        kwargs.setdefault("nogil", True)
-        return _njit(*args, **kwargs)
-except ImportError:
-    NUMBA_AVAILABLE = False
-
-    def njit(*args, **kwargs):
-        # No-op fallback so every @njit-decorated function below still
-        # runs (as plain Python) when numba isn't installed.
-        if len(args) == 1 and callable(args[0]) and not kwargs:
-            return args[0]
-
-        def _wrap(fn):
-            return fn
-        return _wrap
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-@njit
-def jdiv(a: int, b: int) -> int:
-    """Java-style integer division: truncates toward zero."""
-    q, r = divmod(a, b)
-    if r != 0 and ((a < 0) != (b < 0)):
-        q += 1
-    return q
-
-
-def _to_int64_array(x):
-    """Converts src/map_/etc. to an int64 numpy array regardless of
-    whether the caller passed a numpy array, a plain Python list, or a
-    bytes/bytearray object (delta_reader.py passes bytes for map_ in
-    particular -- see the module docstring's note on why this can't just
-    happen inside the @njit functions themselves: nopython mode doesn't
-    support np.asarray() on a raw bytes object)."""
-    if isinstance(x, np.ndarray):
-        return x if x.dtype == np.int64 else x.astype(np.int64)
-    if isinstance(x, (bytes, bytearray)):
-        return np.frombuffer(bytes(x), dtype=np.uint8).astype(np.int64)
-    return np.asarray(list(x), dtype=np.int64)
-
-
-# ---------------------------------------------------------------------------
-# Basic array ops
-# ---------------------------------------------------------------------------
-
-def get_difference(src1: List[int], src2: List[int]) -> List[int]:
-    length = len(src1)
-    if len(src2) != length:
-        raise ValueError(
-            f"get_difference: len(src1) ({length}) != len(src2) ({len(src2)})"
-        )
-    return [src1[i] - src2[i] for i in range(length)]
-
-
-def get_sum(src1: List[int], src2: List[int]) -> List[int]:
-    length = len(src1)
-    if len(src2) != length:
-        raise ValueError(
-            f"get_sum: len(src1) ({length}) != len(src2) ({len(src2)})"
-        )
-    return [src1[i] + src2[i] for i in range(length)]
-
-
-def shift(src: List[int], amount: int) -> List[int]:
-    length = len(src)
-    shifted_value = [0] * length
-    if amount < 0:
-        for i in range(length):
-            shifted_value[i] = src[i] >> -amount
-    else:
-        for i in range(length):
-            shifted_value[i] = src[i] << amount
-    return shifted_value
-
-
-def get_pixel(blue: List[int], green: List[int], red: List[int], xdim: int, pixel_shift: int) -> List[int]:
-    ydim = len(blue) // xdim
-    pixel = [0] * len(blue)
-
-    blue_shift = pixel_shift + 16
-    green_shift = pixel_shift + 8
-    red_shift = pixel_shift
-
-    k = 0
-    for i in range(ydim):
-        for j in range(xdim):
-            pixel[k] = (blue[k] << blue_shift) + (green[k] << green_shift) + (red[k] << red_shift)
-            k += 1
-    return pixel
-
-
-# ---------------------------------------------------------------------------
-# Unified frequency estimator for delta types 0-4.
-# ---------------------------------------------------------------------------
-
-def get_frequency(src: List[int], xdim: int, ydim: int, delta_type: int) -> List[int]:
-    delta_list: List[int] = []
-
-    for i in range(1, ydim):
-        k = i * xdim + 1
-        for j in range(1, xdim - 1):
-            if delta_type == 0:
-                delta = src[k] - src[k - 1]
-            elif delta_type == 1:
-                delta = src[k] - src[k - xdim]
-            elif delta_type == 2:
-                delta = src[k] - jdiv(src[k - 1] + src[k - xdim], 2)
-            elif delta_type == 3:
-                a = src[k - 1]
-                b = src[k - xdim]
-                c = src[k - xdim - 1]
-
-                if c >= max(a, b):
-                    pred = min(a, b)
-                elif c <= min(a, b):
-                    pred = max(a, b)
-                else:
-                    pred = a + b - c
-
-                delta = src[k] - pred
-            else:  # delta_type == 4
-                a = src[k - 1]
-                b = src[k - xdim]
-                c = src[k - xdim - 1]
-                d = src[k - xdim + 1]
-
-                h_edge = abs(b - c) + abs(b - d)
-                v_edge = abs(a - c) + abs(a - b)
-                dl_edge = abs(c - d)
-                dr_edge = abs(a - d)
-
-                if h_edge >= v_edge and h_edge >= dl_edge and h_edge >= dr_edge:
-                    pred = b
-                elif v_edge >= dl_edge and v_edge >= dr_edge:
-                    pred = a
-                elif dl_edge >= dr_edge:
-                    pred = d
-                else:
-                    pred = c
-
-                delta = src[k] - pred
-
-            delta_list.append(delta)
-            k += 1
-
-    delta_min = min(delta_list)
-    delta_max = max(delta_list)
-
-    range_ = delta_max - delta_min
-    frequency = [0] * (range_ + 1)
-    for current_value in delta_list:
-        frequency[current_value - delta_min] += 1
-
-    return frequency
-
-
-# ---------------------------------------------------------------------------
-# Compact Huffman map encoder / decoder.
-# ---------------------------------------------------------------------------
-
-def encode_map_huffman(map_: bytes, n_sym: int, bit_count_out: List[int]) -> bytes:
-    """
-    bit_count_out must be a length-1 list; bit_count_out[0] is set to the
-    total payload bit count (mirrors the Java int[] bit_count_out param).
-    """
-    freq = [0] * n_sym
-    for b in map_:
-        freq[b & 0xFF] += 1
-
-    length = huffman_lengths(freq, n_sym)
-
-    max_len = max(length) if length else 0
-
-    codes = huffman_codes(length, n_sym, max_len)
-
-    total_bits = 0
-    for s in range(n_sym):
-        total_bits += freq[s] * length[s]
-    bit_count_out[0] = total_bits
-
-    header = n_sym // 2
-    out = bytearray(header + (total_bits + 7) // 8)
-
-    for s in range(n_sym):
-        out[s >> 1] |= (length[s] & 0xF) << ((s & 1) << 2)
-
-    bit_pos = 0
-    for b in map_:
-        s = b & 0xFF
-        code = codes[s]
-        clen = length[s]
-        for bit in range(clen - 1, -1, -1):
-            if ((code >> bit) & 1) == 1:
-                out[header + (bit_pos >> 3)] |= 1 << (7 - (bit_pos & 7))
-            bit_pos += 1
-
-    return bytes(out)
-
-
-def decode_map_huffman(encoded: bytes, n_sym: int, map_length: int, bit_count: int) -> bytes:
-    header = n_sym // 2
-
-    length = [0] * n_sym
-    for s in range(n_sym):
-        length[s] = (encoded[s >> 1] >> ((s & 1) << 2)) & 0xF
-
-    max_len = max(length) if length else 0
-    codes = huffman_codes(length, n_sym, max_len)
-
-    map_ = bytearray(map_length)
-    bit_pos = 0
-
-    for q in range(map_length):
-        acc = 0
-        acc_len = 0
-        while True:
-            byte_idx = header + (bit_pos >> 3)
-            acc = (acc << 1) | ((encoded[byte_idx] >> (7 - (bit_pos & 7))) & 1)
-            acc_len += 1
-            bit_pos += 1
-            found = False
-            for s in range(n_sym):
-                if length[s] == acc_len and codes[s] == acc:
-                    map_[q] = s
-                    found = True
-                    break
-            if found:
-                break
-
-    return bytes(map_)
-
-
-def huffman_lengths(freq: List[int], n_sym: int) -> List[int]:
-    length = [0] * n_sym
-    used = sum(1 for f in freq if f > 0)
-
-    if used <= 1:
-        for s in range(n_sym):
-            if freq[s] > 0:
-                length[s] = 1
-                break
-        return length
-
-    node_freq = [0] * (2 * n_sym)
-    parent = [-1] * (2 * n_sym)
-    active = [False] * (2 * n_sym)
-
-    for s in range(n_sym):
-        node_freq[s] = freq[s]
-        active[s] = freq[s] > 0
-        parent[s] = -1
-
-    next_ = n_sym
-    while True:
-        m1 = -1
-        m2 = -1
-        for n in range(next_):
-            if not active[n]:
-                continue
-            if m1 == -1 or node_freq[n] < node_freq[m1]:
-                m2 = m1
-                m1 = n
-            elif m2 == -1 or node_freq[n] < node_freq[m2]:
-                m2 = n
-        if m2 == -1:
-            break
-
-        node_freq[next_] = node_freq[m1] + node_freq[m2]
-        parent[m1] = next_
-        active[m1] = False
-        parent[m2] = next_
-        active[m2] = False
-        active[next_] = True
-        parent[next_] = -1
-        next_ += 1
-
-    root = next_ - 1
-    for s in range(n_sym):
-        if freq[s] == 0:
-            continue
-        depth = 0
-        node = s
-        while node != root:
-            depth += 1
-            node = parent[node]
-        length[s] = depth
-    return length
-
-
-def huffman_codes(length: List[int], n_sym: int, max_len: int) -> List[int]:
-    if max_len == 0:
-        return [0] * n_sym
-
-    bl_count = [0] * (max_len + 1)
-    for s in range(n_sym):
-        bl_count[length[s]] += 1
-    bl_count[0] = 0
-
-    next_code = [0] * (max_len + 2)
-    code = 0
-    for bits in range(1, max_len + 1):
-        code = (code + bl_count[bits - 1]) << 1
-        next_code[bits] = code
-
-    codes = [0] * n_sym
-    for s in range(n_sym):
-        if length[s] > 0:
-            codes[s] = next_code[length[s]]
-            next_code[length[s]] += 1
-
-    return codes
-
-
-# ---------------------------------------------------------------------------
-
-@njit
-def _ideal_frequency_core(src, xdim, ydim):
-    n = (ydim - 1) * (xdim - 2)
-    delta_list = np.empty(n, dtype=np.int64)
-    idx = 0
-
-    for i in range(1, ydim):
-        k = i * xdim + 1
-        for j in range(1, xdim - 1):
-            a = src[k - 1]
-            b = src[k - xdim]
-            c = src[k - xdim - 1]
-            d = src[k - xdim + 1]
-            e = src[k]
-
-            delta_a = abs(a - e)
-            delta_b = abs(b - e)
-            delta_c = abs(c - e)
-            delta_d = abs(d - e)
-
-            if delta_a <= delta_b and delta_a <= delta_c and delta_a <= delta_d:
-                delta = a - e
-            elif delta_b <= delta_c and delta_b <= delta_d:
-                delta = b - e
-            elif delta_c <= delta_d:
-                delta = c - e
-            else:
-                delta = d - e
-            delta_list[idx] = delta
-            idx += 1
-
-            k += 1
-
-    delta_min = delta_list.min()
-    delta_max = delta_list.max()
-
-    range_ = delta_max - delta_min
-    frequency = np.zeros(range_ + 1, dtype=np.int64)
-    for i in range(n):
-        frequency[delta_list[i] - delta_min] += 1
-
-    return frequency
-
-
-def get_ideal_frequency(src: List[int], xdim: int, ydim: int) -> List[int]:
-    src_arr = np.asarray(src, dtype=np.int64)
-    return _ideal_frequency_core(src_arr, xdim, ydim).tolist()
+from numba_support import njit, jdiv
+import arithmetic_mapper as am
+import string_mapper as sm
+from code_mapper import _shannon_limit
+from java_io import DataOutput, DataInput
+
+SET_NAMES = [
+    "blue, green, red", "blue, red, red-green", "blue, red, blue-green",
+    "blue, blue-green, red-green", "blue, blue-green, red-blue",
+    "green, red, blue-green", "red, blue-green, red-green",
+    "green, blue-green, red-green", "green, red-green, red-blue",
+    "red, red-green, red-blue"]
+
+DELTA_TYPE_NAMES = [
+    "horizontal", "vertical", "average", "med", "directional", "adaptive",
+    "scanline (1)", "scanline (2)", "scanline (3)", "scanline (4)", "scanline (5)",
+    "frame map (1)", "frame map (2)", "block map"]
+
+DELTA_TYPES = len(DELTA_TYPE_NAMES)
+MIN_DIM = 4
+
+_CHANNELS = [(0, 1, 2), (0, 2, 4), (0, 2, 3), (0, 3, 4), (0, 3, 5),
+             (1, 2, 3), (2, 3, 4), (1, 3, 4), (1, 4, 5), (2, 4, 5)]
+
+
+def get_channels(set_id):
+    return list(_CHANNELS[set_id])
+
+
+def has_map(delta_type):
+    return delta_type >= 6
+
+
+# =============================================================================
+# Quantizing and channels
+# =============================================================================
+
+def get_quantized_size(xdim, ydim, pixel_quant):
+    """Size after Pixel Resolution (0-10) resizing."""
+    if pixel_quant == 0 or xdim < MIN_DIM or ydim < MIN_DIM:
+        return xdim, ydim
+    factor = pixel_quant / 10.0
+    return xdim - int(factor * (xdim // 2 - 2)), ydim - int(factor * (ydim // 2 - 2))
+
+
+def quantize_channel(channel, pixel_shift):
+    """Right shift by pixel_shift, rounding to nearest (clamped so the result
+    never reconstructs past 255). Returns a new array."""
+    channel = np.asarray(channel, dtype=np.int64)
+    if pixel_shift == 0:
+        return channel.copy()
+    return np.minimum(channel + (1 << (pixel_shift - 1)), 255) >> pixel_shift
+
+
+def shift(channel, amount):
+    channel = np.asarray(channel, dtype=np.int64)
+    return channel >> -amount if amount < 0 else channel << amount
+
+
+def get_candidate_channels(blue, green, red):
+    """The six candidate channels (blue, green, red, blue-green, red-green,
+    red-blue), each difference shifted by its minimum to start at 0; returns
+    (channels, minimums)."""
+    c = [np.asarray(blue, dtype=np.int64), np.asarray(green, dtype=np.int64), np.asarray(red, dtype=np.int64)]
+    c += [c[0] - c[1], c[2] - c[1], c[2] - c[0]]
+    mins = [int(x.min()) for x in c]
+    for i in range(3, 6):
+        c[i] = c[i] - mins[i]
+    return c, mins
+
+
+def get_blue_green_red(set_id, c0, c1, c2):
+    """Rebuilds the three colour channels from a set's channels (with the
+    difference channels' minimums already added back)."""
+    if set_id == 0:   b, g, r = c0, c1, c2
+    elif set_id == 1: b, r = c0, c1; g = r - c2
+    elif set_id == 2: b, r = c0, c1; g = b - c2
+    elif set_id == 3: b = c0; g = b - c1; r = c2 + g
+    elif set_id == 4: b = c0; g = b - c1; r = b + c2
+    elif set_id == 5: g, r = c0, c1; b = c2 + g
+    elif set_id == 6: r = c0; g = r - c2; b = c1 + g
+    elif set_id == 7: g = c0; b = g + c1; r = g + c2
+    elif set_id == 8: g = c0; r = g + c1; b = r - c2
+    elif set_id == 9: r = c0; g = r - c1; b = r - c2
+    else: raise ValueError("set_id %d" % set_id)
+    return [b, g, r]
 
 
 @njit
-def _ideal_frequency8_core(src, xdim, ydim):
-    n = (ydim - 1) * (xdim - 2)
-    delta_list = np.empty(n, dtype=np.int64)
-    map_freq = np.zeros(8, dtype=np.int64)
-    idx = 0
-    pred = np.empty(8, dtype=np.int64)
-
+def _ideal_frequency2(src, xdim, ydim):
+    lo = src.min()
+    hi = src.max()
+    span = hi - lo
+    count = np.zeros(2 * span + 1, dtype=np.int64)
     for i in range(1, ydim):
         for j in range(1, xdim - 1):
             k = i * xdim + j
-            a = src[k - 1]
-            b = src[k - xdim]
-            c = src[k - xdim - 1]
-            d = src[k - xdim + 1]
-            e = src[k]
-
-            pred[0] = a
-            pred[1] = jdiv(a + c, 2)
-            pred[2] = c
-            pred[3] = jdiv(c + b, 2)
-            pred[4] = b
-            pred[5] = jdiv(b + d, 2)
-            pred[6] = d
-            pred[7] = jdiv(d + a, 2)
-
-            best_abs = -1
-            best_n = 0
-            best_delta = 0
-            for m in range(8):
-                delta = e - pred[m]
-                abs_delta = abs(delta)
-                if best_abs < 0 or abs_delta < best_abs:
-                    best_abs = abs_delta
-                    best_n = m
-                    best_delta = delta
-            delta_list[idx] = best_delta
-            idx += 1
-            map_freq[best_n] += 1
-
-    delta_min = delta_list.min()
-    delta_max = delta_list.max()
-    delta_freq = np.zeros(delta_max - delta_min + 1, dtype=np.int64)
-    for i in range(n):
-        delta_freq[delta_list[i] - delta_min] += 1
-
-    return delta_freq, map_freq
+            a = src[k - 1]; b = src[k - xdim]; c = src[k - xdim - 1]; d = src[k - xdim + 1]; e = src[k]
+            da = abs(a - e); db = abs(b - e); dc = abs(c - e); dd = abs(d - e)
+            if da <= db and da <= dc and da <= dd:
+                v = a - e
+            elif db <= dc and db <= dd:
+                v = b - e
+            elif dc <= dd:
+                v = c - e
+            else:
+                v = d - e
+            count[v + span] += 1
+    first = 0
+    while count[first] == 0:
+        first += 1
+    last = count.shape[0] - 1
+    while count[last] == 0:
+        last -= 1
+    return count[first:last + 1].copy()
 
 
-def get_ideal_frequency8(src: List[int], xdim: int, ydim: int):
-    src_arr = np.asarray(src, dtype=np.int64)
-    delta_freq, map_freq = _ideal_frequency8_core(src_arr, xdim, ydim)
-    return [delta_freq.tolist(), map_freq.tolist()]
+def get_ideal_frequency2(src, xdim, ydim):
+    if xdim < 3 or ydim < 2:
+        return np.zeros(2, dtype=np.int64)
+    return _ideal_frequency2(np.asarray(src, dtype=np.int64), xdim, ydim)
 
+
+# =============================================================================
+# Smoothing (Quantization menu)
+# =============================================================================
 
 @njit
-def _ideal_frequency16_core(src, xdim, ydim):
-    n = (ydim - 1) * (xdim - 2)
-    delta_list = np.empty(n, dtype=np.int64)
-    map_freq = np.zeros(16, dtype=np.int64)
-    idx = 0
-    pred = np.empty(16, dtype=np.int64)
-
-    for i in range(1, ydim):
-        for j in range(1, xdim - 1):
-            k = i * xdim + j
-            a = src[k - 1]
-            b = src[k - xdim]
-            c = src[k - xdim - 1]
-            d = src[k - xdim + 1]
-            e = src[k]
-
-            if c >= max(a, b):
-                med = min(a, b)
-            elif c <= min(a, b):
-                med = max(a, b)
-            else:
-                med = a + b - c
-
-            pred[0] = a
-            pred[1] = c
-            pred[2] = b
-            pred[3] = d
-            pred[4] = (a + c) >> 1
-            pred[5] = (c + b) >> 1
-            pred[6] = (b + d) >> 1
-            pred[7] = (d + a) >> 1
-            pred[8] = (a + b) >> 1
-            pred[9] = (c + d) >> 1
-            pred[10] = (a + b + c + d) >> 2
-            pred[11] = med
-            pred[12] = (a + b + c) >> 2
-            pred[13] = (a + b + d) >> 2
-            pred[14] = (a + c + d) >> 2
-            pred[15] = (b + c + d) >> 2
-
-            best_abs = -1
-            best_delta = 0
-            best_n = 0
-            for m in range(16):
-                delta = e - pred[m]
-                abs_delta = abs(delta)
-                if best_abs < 0 or abs_delta < best_abs:
-                    best_abs = abs_delta
-                    best_delta = delta
-                    best_n = m
-            delta_list[idx] = best_delta
-            idx += 1
-            map_freq[best_n] += 1
-
-    delta_min = delta_list.min()
-    delta_max = delta_list.max()
-    delta_freq = np.zeros(delta_max - delta_min + 1, dtype=np.int64)
-    for i in range(n):
-        delta_freq[delta_list[i] - delta_min] += 1
-
-    return delta_freq, map_freq
-
-
-def get_ideal_frequency16(src: List[int], xdim: int, ydim: int):
-    src_arr = np.asarray(src, dtype=np.int64)
-    delta_freq, map_freq = _ideal_frequency16_core(src_arr, xdim, ydim)
-    return [delta_freq.tolist(), map_freq.tolist()]
-
-
-@njit
-def _med_scanline_frequency_core(src, xdim, ydim):
-    n_out = (ydim - 1) * (xdim - 2)
-    delta_list = np.empty(n_out, dtype=np.int64)
-    out_idx = 0
-    map_ = np.zeros(ydim - 1, dtype=np.int64)
-
-    delta = np.empty((4, xdim - 2), dtype=np.int64)
-    limit = np.empty(4, dtype=np.float64)
-
-    # Pass 1: choose best filter per row using Shannon entropy
-    # Filters: 0=horizontal, 1=vertical, 2=average, 3=MED
-    for i in range(1, ydim):
-        k = i * xdim + 1
-        for j in range(1, xdim - 1):
-            delta[0, j - 1] = src[k] - src[k - 1]
-            delta[1, j - 1] = src[k] - src[k - xdim]
-            delta[2, j - 1] = src[k] - jdiv(src[k - 1] + src[k - xdim], 2)
-
-            a = src[k - 1]
-            b = src[k - xdim]
-            c = src[k - xdim - 1]
-
-            if c >= max(a, b):
-                pred = min(a, b)
-            elif c <= min(a, b):
-                pred = max(a, b)
-            else:
-                pred = a + b - c
-
-            delta[3, j - 1] = src[k] - pred
-            k += 1
-
-        for f in range(4):
-            row = delta[f]
-            delta_min = row[0]
-            delta_max = row[0]
-            for kk in range(1, row.shape[0]):
-                if row[kk] < delta_min:
-                    delta_min = row[kk]
-                elif row[kk] > delta_max:
-                    delta_max = row[kk]
-
-            frequency = np.zeros(delta_max - delta_min + 1, dtype=np.float64)
-            for kk in range(row.shape[0]):
-                frequency[row[kk] - delta_min] += 1
-            shannon_limit = code_mapper._shannon_limit_core(frequency)
-            limit[f] = math.floor(shannon_limit)
-
-        value = limit[0]
-        index = 0
-        for kk in range(1, 4):
-            if limit[kk] < value:
-                value = limit[kk]
-                index = kk
-        map_[i - 1] = index
-
-    # Pass 2: collect deltas using chosen filter per row
-    for i in range(1, ydim):
-        k = i * xdim + 1
-        m = map_[i - 1]
-
-        if m == 0:
-            for j in range(1, xdim - 1):
-                delta_list[out_idx] = src[k] - src[k - 1]
-                out_idx += 1
-                k += 1
-        elif m == 1:
-            for j in range(1, xdim - 1):
-                delta_list[out_idx] = src[k] - src[k - xdim]
-                out_idx += 1
-                k += 1
-        elif m == 2:
-            for j in range(1, xdim - 1):
-                delta_list[out_idx] = src[k] - jdiv(src[k - 1] + src[k - xdim], 2)
-                out_idx += 1
-                k += 1
-        else:  # m == 3
-            for j in range(1, xdim - 1):
-                a = src[k - 1]
-                b = src[k - xdim]
-                c = src[k - xdim - 1]
-
-                if c >= max(a, b):
-                    pred = min(a, b)
-                elif c <= min(a, b):
-                    pred = max(a, b)
-                else:
-                    pred = a + b - c
-
-                delta_list[out_idx] = src[k] - pred
-                out_idx += 1
-                k += 1
-
-    delta_min = delta_list.min()
-    delta_max = delta_list.max()
-
-    delta_frequency = np.zeros(delta_max - delta_min + 1, dtype=np.int64)
-    for i in range(n_out):
-        delta_frequency[delta_list[i] - delta_min] += 1
-
-    map_frequency = np.zeros(4, dtype=np.int64)
-    for i in range(ydim - 1):
-        map_frequency[map_[i]] += 1
-
-    return delta_frequency, map_frequency
-
-
-def get_med_scanline_frequency(src: List[int], xdim: int, ydim: int):
-    src_arr = np.asarray(src, dtype=np.int64)
-    delta_frequency, map_frequency = _med_scanline_frequency_core(src_arr, xdim, ydim)
-    return [delta_frequency.tolist(), map_frequency.tolist()]
-
-
-@njit
-def _scanline2_frequency_core(src, xdim, ydim):
-    n_out = (ydim - 1) * (xdim - 2)
-    delta_list = np.empty(n_out, dtype=np.int64)
-    out_idx = 0
-    map_ = np.zeros(ydim - 1, dtype=np.int64)
-
-    delta = np.empty((4, xdim - 2), dtype=np.int64)
-    limit = np.empty(4, dtype=np.float64)
-
-    for i in range(1, ydim):
-        k = i * xdim + 1
-        for j in range(1, xdim - 1):
-            delta[0, j - 1] = src[k] - src[k - 1]
-            delta[1, j - 1] = src[k] - src[k - xdim]
-            delta[2, j - 1] = src[k] - jdiv(src[k - 1] + src[k - xdim], 2)
-            delta[3, j - 1] = src[k] - jdiv(src[k - 1] + src[k - xdim + 1], 2)
-            k += 1
-
-        for f in range(4):
-            row = delta[f]
-            delta_min = row[0]
-            delta_max = row[0]
-            for kk in range(1, row.shape[0]):
-                if row[kk] < delta_min:
-                    delta_min = row[kk]
-                elif row[kk] > delta_max:
-                    delta_max = row[kk]
-
-            frequency = np.zeros(delta_max - delta_min + 1, dtype=np.float64)
-            for kk in range(row.shape[0]):
-                frequency[row[kk] - delta_min] += 1
-            shannon_limit = code_mapper._shannon_limit_core(frequency)
-            limit[f] = math.floor(shannon_limit)
-
-        value = limit[0]
-        index = 0
-        for kk in range(1, 4):
-            if limit[kk] < value:
-                value = limit[kk]
-                index = kk
-        map_[i - 1] = index
-
-    for i in range(1, ydim):
-        k = i * xdim + 1
-        m = map_[i - 1]
-
-        if m == 0:
-            for j in range(1, xdim - 1):
-                delta_list[out_idx] = src[k] - src[k - 1]
-                out_idx += 1
-                k += 1
-        elif m == 1:
-            for j in range(1, xdim - 1):
-                delta_list[out_idx] = src[k] - src[k - xdim]
-                out_idx += 1
-                k += 1
-        elif m == 2:
-            for j in range(1, xdim - 1):
-                delta_list[out_idx] = src[k] - jdiv(src[k - 1] + src[k - xdim], 2)
-                out_idx += 1
-                k += 1
-        else:  # m == 3
-            for j in range(1, xdim - 1):
-                delta_list[out_idx] = src[k] - jdiv(src[k - 1] + src[k - xdim + 1], 2)
-                out_idx += 1
-                k += 1
-
-    delta_min = delta_list.min()
-    delta_max = delta_list.max()
-
-    frequency = np.zeros(delta_max - delta_min + 1, dtype=np.int64)
-    for i in range(n_out):
-        frequency[delta_list[i] - delta_min] += 1
-
-    map_frequency = np.zeros(4, dtype=np.int64)
-    for i in range(ydim - 1):
-        map_frequency[map_[i]] += 1
-
-    return frequency, map_frequency
-
-
-def get_scanline2_frequency(src: List[int], xdim: int, ydim: int):
-    src_arr = np.asarray(src, dtype=np.int64)
-    frequency, map_frequency = _scanline2_frequency_core(src_arr, xdim, ydim)
-    return [frequency.tolist(), map_frequency.tolist()]
-
-
-@njit
-def _mixed_deltas4_frequency_core(src, xdim, ydim):
-    n_out = (ydim - 1) * (xdim - 2)
-    delta_list = np.empty(n_out, dtype=np.int64)
-    out_idx = 0
-    map_ = np.zeros(ydim - 1, dtype=np.int64)
-
-    delta = np.empty((4, xdim - 2), dtype=np.int64)
-    limit = np.empty(4, dtype=np.float64)
-
-    # Pass 1: choose best filter per row using Shannon entropy
-    # Filters: 0=horizontal, 1=average, 2=MED, 3=directional
-    for i in range(1, ydim):
-        k = i * xdim + 1
-        for j in range(1, xdim - 1):
-            a = src[k - 1]
-            b = src[k - xdim]
-            c = src[k - xdim - 1]
-            d = src[k - xdim + 1]
-
-            delta[0, j - 1] = src[k] - a
-            delta[1, j - 1] = src[k] - jdiv(a + b, 2)
-
-            if c >= max(a, b):
-                med_pred = min(a, b)
-            elif c <= min(a, b):
-                med_pred = max(a, b)
-            else:
-                med_pred = a + b - c
-            delta[2, j - 1] = src[k] - med_pred
-
-            h_edge = abs(b - c) + abs(b - d)
-            v_edge = abs(a - c) + abs(a - b)
-            dl_edge = abs(c - d)
-            dr_edge = abs(a - d)
-
-            if h_edge >= v_edge and h_edge >= dl_edge and h_edge >= dr_edge:
-                dir_pred = b
-            elif v_edge >= dl_edge and v_edge >= dr_edge:
-                dir_pred = a
-            elif dl_edge >= dr_edge:
-                dir_pred = d
-            else:
-                dir_pred = c
-            delta[3, j - 1] = src[k] - dir_pred
-
-            k += 1
-
-        for f in range(4):
-            row = delta[f]
-            delta_min = row[0]
-            delta_max = row[0]
-            for kk in range(1, row.shape[0]):
-                if row[kk] < delta_min:
-                    delta_min = row[kk]
-                elif row[kk] > delta_max:
-                    delta_max = row[kk]
-
-            frequency = np.zeros(delta_max - delta_min + 1, dtype=np.float64)
-            for kk in range(row.shape[0]):
-                frequency[row[kk] - delta_min] += 1
-            shannon_limit = code_mapper._shannon_limit_core(frequency)
-            limit[f] = math.floor(shannon_limit)
-
-        value = limit[0]
-        index = 0
-        for kk in range(1, 4):
-            if limit[kk] < value:
-                value = limit[kk]
-                index = kk
-        map_[i - 1] = index
-
-    # Pass 2: collect deltas using chosen filter per row
-    for i in range(1, ydim):
-        k = i * xdim + 1
-        m = map_[i - 1]
-
-        if m == 0:
-            for j in range(1, xdim - 1):
-                delta_list[out_idx] = src[k] - src[k - 1]
-                out_idx += 1
-                k += 1
-        elif m == 1:
-            for j in range(1, xdim - 1):
-                delta_list[out_idx] = src[k] - jdiv(src[k - 1] + src[k - xdim], 2)
-                out_idx += 1
-                k += 1
-        elif m == 2:
-            for j in range(1, xdim - 1):
-                a = src[k - 1]
-                b = src[k - xdim]
-                c = src[k - xdim - 1]
-
-                if c >= max(a, b):
-                    pred = min(a, b)
-                elif c <= min(a, b):
-                    pred = max(a, b)
-                else:
-                    pred = a + b - c
-
-                delta_list[out_idx] = src[k] - pred
-                out_idx += 1
-                k += 1
-        else:  # m == 3
-            for j in range(1, xdim - 1):
-                a = src[k - 1]
-                b = src[k - xdim]
-                c = src[k - xdim - 1]
-                d = src[k - xdim + 1]
-
-                h_edge = abs(b - c) + abs(b - d)
-                v_edge = abs(a - c) + abs(a - b)
-                dl_edge = abs(c - d)
-                dr_edge = abs(a - d)
-
-                if h_edge >= v_edge and h_edge >= dl_edge and h_edge >= dr_edge:
-                    pred = b
-                elif v_edge >= dl_edge and v_edge >= dr_edge:
-                    pred = a
-                elif dl_edge >= dr_edge:
-                    pred = d
-                else:
-                    pred = c
-
-                delta_list[out_idx] = src[k] - pred
-                out_idx += 1
-                k += 1
-
-    delta_min = delta_list.min()
-    delta_max = delta_list.max()
-
-    delta_frequency = np.zeros(delta_max - delta_min + 1, dtype=np.int64)
-    for i in range(n_out):
-        delta_frequency[delta_list[i] - delta_min] += 1
-
-    map_frequency = np.zeros(4, dtype=np.int64)
-    for i in range(ydim - 1):
-        map_frequency[map_[i]] += 1
-
-    return delta_frequency, map_frequency
-
-
-def get_mixed_deltas4_frequency(src: List[int], xdim: int, ydim: int):
-    src_arr = np.asarray(src, dtype=np.int64)
-    delta_frequency, map_frequency = _mixed_deltas4_frequency_core(src_arr, xdim, ydim)
-    return [delta_frequency.tolist(), map_frequency.tolist()]
-
-
-# ---------------------------------------------------------------------------
-# Delta encoders / decoders
-# ---------------------------------------------------------------------------
-
-def get_horizontal_deltas_from_values(src: List[int], xdim: int, ydim: int) -> list:
-    dst = [0] * (xdim * ydim)
-    total_sum = 0
-    init_value = src[0]
-    original_init_value = src[0]
-    value = init_value
-
-    k = 0
-    for i in range(ydim):
-        if i == 0:
-            dst[k] = 0
-            k += 1
-        else:
-            delta = src[k] - init_value
-            dst[k] = delta
-            k += 1
-            init_value += delta
-            total_sum += abs(delta)
-            value = init_value
-
-        for j in range(1, xdim):
-            delta = src[k] - value
-            value += delta
-            total_sum += abs(delta)
-            dst[k] = delta
-            k += 1
-
-    return [total_sum, dst, original_init_value]
-
-
-def get_values_from_horizontal_deltas(src: List[int], xdim: int, ydim: int, init_value: int) -> List[int]:
-    dst = [0] * (xdim * ydim)
-
-    k = 0
-    value = init_value
-    for i in range(ydim):
-        if i != 0:
-            value += src[k]
-        current_value = value
-        dst[k] = current_value
-        k += 1
-        for j in range(1, xdim):
-            current_value += src[k]
-            dst[k] = current_value
-            k += 1
-    return dst
-
-
-def get_vertical_deltas_from_values(src: List[int], xdim: int, ydim: int) -> list:
-    dst = [0] * (xdim * ydim)
-    init_value = src[0]
-    value = init_value
-    delta = 0
-    total_sum = 0
-
-    k = 0
-    for i in range(ydim):
-        for j in range(xdim):
-            if i == 0:
-                if j == 0:
-                    dst[k] = 0
-                    k += 1
-                else:
-                    delta = src[k] - value
-                    value += delta
-                    dst[k] = delta
-                    k += 1
-                    total_sum += abs(delta)
-            else:
-                delta = src[k] - src[k - xdim]
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-
-    return [total_sum, dst, init_value]
-
-
-def get_values_from_vertical_deltas(src: List[int], xdim: int, ydim: int, init_value: int) -> List[int]:
-    dst = [0] * (xdim * ydim)
-    dst[0] = init_value
-    value = init_value
-
-    for i in range(1, xdim):
-        value += src[i]
-        dst[i] = value
-
-    for i in range(1, ydim):
-        for j in range(xdim):
-            index = i * xdim + j
-            dst[index] = dst[index - xdim] + src[index]
-
-    return dst
-
-
-def get_average_deltas_from_values(src: List[int], xdim: int, ydim: int) -> list:
-    dst = [0] * (xdim * ydim)
-    total_sum = 0
-    init_value = src[0]
-
-    k = 0
-    dst[k] = 0
-    k += 1
-    for i in range(1, xdim):
-        delta = src[k] - src[k - 1]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-    for i in range(1, ydim):
-        delta = src[k] - src[k - xdim]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-        for j in range(1, xdim):
-            delta = src[k] - jdiv(src[k - 1] + src[k - xdim], 2)
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-
-    return [total_sum, dst, init_value]
-
-
-def get_values_from_average_deltas(src: List[int], xdim: int, ydim: int, init_value: int) -> List[int]:
-    dst = [0] * (xdim * ydim)
-    k = 0
-    dst[k] = init_value
-    k += 1
-
-    for i in range(1, xdim):
-        value = dst[k - 1] + src[k]
-        dst[k] = value
-        k += 1
-
-    for i in range(1, ydim):
-        value = dst[k - xdim] + src[k]
-        dst[k] = value
-        k += 1
-        for j in range(1, xdim):
-            value = jdiv(dst[k - 1] + dst[k - xdim], 2) + src[k]
-            dst[k] = value
-            k += 1
-
-    return dst
-
-
-def get_paeth_deltas_from_values(src: List[int], xdim: int, ydim: int) -> list:
-    dst = [0] * (xdim * ydim)
-    init_value = src[0]
-    original_init_value = src[0]
-    value = init_value
-    delta = 0
-    total_sum = 0
-    k = 0
-
-    for i in range(ydim):
-        if i == 0:
-            for j in range(xdim):
-                if j == 0:
-                    dst[k] = 0
-                    k += 1
-                else:
-                    delta = src[k] - value
-                    value += delta
-                    dst[k] = delta
-                    k += 1
-                    total_sum += abs(delta)
-        else:
-            for j in range(xdim):
-                if j == 0:
-                    delta = src[k] - init_value
-                    init_value = src[k]
-                    dst[k] = delta
-                    k += 1
-                    total_sum += abs(delta)
-                else:
-                    a = src[k - 1]
-                    b = src[k - xdim]
-                    c = src[k - xdim - 1]
-                    d = a + b - c
-
-                    delta_a = abs(a - d)
-                    delta_b = abs(b - d)
-                    delta_c = abs(c - d)
-
-                    if delta_a <= delta_b and delta_a <= delta_c:
-                        delta = src[k] - src[k - 1]
-                    elif delta_b <= delta_c:
-                        delta = src[k] - src[k - xdim]
-                    else:
-                        delta = src[k] - src[k - xdim - 1]
-
-                    dst[k] = delta
-                    k += 1
-                    total_sum += abs(delta)
-
-    return [total_sum, dst, original_init_value]
-
-
-def get_values_from_paeth_deltas(src: List[int], xdim: int, ydim: int, init_value: int) -> List[int]:
-    dst = [0] * (xdim * ydim)
-    dst[0] = init_value
-    value = init_value
-
-    for i in range(1, xdim):
-        value += src[i]
-        dst[i] = value
-
-    for i in range(1, ydim):
-        for j in range(xdim):
-            if j == 0:
-                init_value += src[i * xdim]
-                dst[i * xdim] = init_value
-                value = init_value
-            else:
-                a = dst[i * xdim + j - 1]
-                b = dst[(i - 1) * xdim + j]
-                c = dst[(i - 1) * xdim + j - 1]
-                d = a + b - c
-
-                delta_a = abs(a - d)
-                delta_b = abs(b - d)
-                delta_c = abs(c - d)
-
-                if delta_a <= delta_b and delta_a <= delta_c:
-                    dst[i * xdim + j] = a + src[i * xdim + j]
-                elif delta_b <= delta_c:
-                    dst[i * xdim + j] = b + src[i * xdim + j]
-                else:
-                    dst[i * xdim + j] = c + src[i * xdim + j]
-    return dst
-
-
-@njit
-def _med_deltas_from_values_core(src, xdim, ydim):
-    dst = np.zeros(xdim * ydim, dtype=np.int64)
-    total_sum = 0
-    k = 0
-
-    dst[k] = 0
-    k += 1
-    for j in range(1, xdim):
-        delta = src[k] - src[k - 1]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-    for i in range(1, ydim):
-        delta = src[k] - src[k - xdim]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-        for j in range(1, xdim):
-            a = src[k - 1]
-            b = src[k - xdim]
-            c = src[k - xdim - 1]
-
-            if c >= max(a, b):
-                pred = min(a, b)
-            elif c <= min(a, b):
-                pred = max(a, b)
-            else:
-                pred = a + b - c
-
-            delta = src[k] - pred
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-
-    return total_sum, dst
-
-
-def get_med_deltas_from_values(src: List[int], xdim: int, ydim: int) -> list:
-    src_arr = np.asarray(src, dtype=np.int64)
-    total_sum, dst = _med_deltas_from_values_core(src_arr, xdim, ydim)
-    return [int(total_sum), dst.tolist(), int(src_arr[0])]
-
-
-@njit
-def get_values_from_med_deltas(src, xdim: int, ydim: int, init_value: int) -> List[int]:
-    src = np.asarray(src, dtype=np.int64)
-    dst = np.zeros(xdim * ydim, dtype=np.int64)
-    k = 0
-
-    dst[k] = init_value
-    k += 1
-    for j in range(1, xdim):
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-
-    for i in range(1, ydim):
-        dst[k] = dst[k - xdim] + src[k]
-        k += 1
-
-        for j in range(1, xdim):
-            a = dst[k - 1]
-            b = dst[k - xdim]
-            c = dst[k - xdim - 1]
-
-            if c >= max(a, b):
-                pred = min(a, b)
-            elif c <= min(a, b):
-                pred = max(a, b)
-            else:
-                pred = a + b - c
-
-            dst[k] = pred + src[k]
-            k += 1
-
-    return dst
-
-
-@njit
-def _directional_deltas_from_values_core(src, xdim, ydim):
-    dst = np.zeros(xdim * ydim, dtype=np.int64)
-    total_sum = 0
-    k = 0
-
-    dst[k] = 0
-    k += 1
-    for j in range(1, xdim):
-        delta = src[k] - src[k - 1]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-    for i in range(1, ydim):
-        delta = src[k] - src[k - xdim]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-        for j in range(1, xdim - 1):
-            a = src[k - 1]
-            b = src[k - xdim]
-            c = src[k - xdim - 1]
-            d = src[k - xdim + 1]
-
-            h_edge = abs(b - c) + abs(b - d)
-            v_edge = abs(a - c) + abs(a - b)
-            dl_edge = abs(c - d)
-            dr_edge = abs(a - d)
-
-            if h_edge >= v_edge and h_edge >= dl_edge and h_edge >= dr_edge:
-                pred = b
-            elif v_edge >= dl_edge and v_edge >= dr_edge:
-                pred = a
-            elif dl_edge >= dr_edge:
-                pred = d
-            else:
-                pred = c
-
-            delta = src[k] - pred
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-
-        # Last column: no above-right, fall back to MED
-        a = src[k - 1]
-        b = src[k - xdim]
-        c = src[k - xdim - 1]
-
-        if c >= max(a, b):
-            pred = min(a, b)
-        elif c <= min(a, b):
-            pred = max(a, b)
-        else:
-            pred = a + b - c
-
-        delta = src[k] - pred
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-    return total_sum, dst
-
-
-def get_directional_deltas_from_values(src: List[int], xdim: int, ydim: int) -> list:
-    src_arr = np.asarray(src, dtype=np.int64)
-    total_sum, dst = _directional_deltas_from_values_core(src_arr, xdim, ydim)
-    return [int(total_sum), dst.tolist(), int(src_arr[0])]
-
-
-@njit
-def get_values_from_directional_deltas(src, xdim: int, ydim: int, init_value: int) -> List[int]:
-    src = np.asarray(src, dtype=np.int64)
-    dst = np.zeros(xdim * ydim, dtype=np.int64)
-    k = 0
-
-    dst[k] = init_value
-    k += 1
-    for j in range(1, xdim):
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-
-    for i in range(1, ydim):
-        dst[k] = dst[k - xdim] + src[k]
-        k += 1
-
-        for j in range(1, xdim - 1):
-            a = dst[k - 1]
-            b = dst[k - xdim]
-            c = dst[k - xdim - 1]
-            d = dst[k - xdim + 1]
-
-            h_edge = abs(b - c) + abs(b - d)
-            v_edge = abs(a - c) + abs(a - b)
-            dl_edge = abs(c - d)
-            dr_edge = abs(a - d)
-
-            if h_edge >= v_edge and h_edge >= dl_edge and h_edge >= dr_edge:
-                pred = b
-            elif v_edge >= dl_edge and v_edge >= dr_edge:
-                pred = a
-            elif dl_edge >= dr_edge:
-                pred = d
-            else:
-                pred = c
-
-            dst[k] = pred + src[k]
-            k += 1
-
-        # Last column: MED
-        a = dst[k - 1]
-        b = dst[k - xdim]
-        c = dst[k - xdim - 1]
-
-        if c >= max(a, b):
-            pred = min(a, b)
-        elif c <= min(a, b):
-            pred = max(a, b)
-        else:
-            pred = a + b - c
-
-        dst[k] = pred + src[k]
-        k += 1
-
-    return dst
-
-
-def get_gradient_deltas_from_values(src: List[int], xdim: int, ydim: int) -> list:
-    dst = [0] * (xdim * ydim)
-    gradient = [0] * 4
-    init_value = src[0]
-    original_init_value = src[0]
-    total_sum = 0
-    delta = 0
-    k = 0
-
-    dst[k] = 0
-    k += 1
-    for i in range(1, xdim):
-        delta = src[k] - src[k - 1]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-    delta = src[k] - init_value
-    dst[k] = delta
-    k += 1
-    init_value += delta
-    total_sum += abs(delta)
-
-    for i in range(1, xdim):
-        delta = src[k] - src[k - 1]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-    for i in range(2, ydim):
-        delta = src[k] - init_value
-        dst[k] = delta
-        k += 1
-        init_value += delta
-        total_sum += abs(delta)
-
-        for j in range(1, xdim - 1):
-            a = src[k - 1]
-            b = src[k - xdim]
-            c = src[k - xdim - 1]
-            d = src[k - xdim + 1]
-            e = src[k - 2 * xdim - 1]
-
-            gradient[0] = abs(a - e)
-            gradient[1] = abs(c - d)
-            gradient[2] = abs(a - d)
-            gradient[3] = abs(b - e)
-
-            max_value = gradient[0]
-            max_index = 0
-            for m in range(1, 4):
-                if gradient[m] > max_value:
-                    max_value = gradient[m]
-                    max_index = m
-
-            if max_index == 0:
-                delta = src[k] - src[k - 1]
-            elif max_index == 1:
-                delta = src[k] - src[k - xdim]
-            elif max_index == 2:
-                delta = src[k] - src[k - xdim - 1]
-            else:
-                delta = src[k] - src[k - xdim + 1]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-
-        delta = src[k] - src[k - 1]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-    return [total_sum, dst, original_init_value]
-
-
-def get_values_from_gradient_deltas(src: List[int], xdim: int, ydim: int, init_value: int) -> List[int]:
-    dst = [0] * (xdim * ydim)
-    gradient = [0] * 4
-    k = 0
-
-    dst[k] = init_value
-    k += 1
-    for i in range(1, xdim):
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-
-    init_value += src[k]
-    dst[k] = init_value
-    k += 1
-    for i in range(1, xdim):
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-
-    for i in range(2, ydim):
-        init_value += src[k]
-        dst[k] = init_value
-        k += 1
-
-        for j in range(1, xdim - 1):
-            a = dst[k - 1]
-            b = dst[k - xdim]
-            c = dst[k - xdim - 1]
-            d = dst[k - xdim + 1]
-            e = dst[k - 2 * xdim - 1]
-
-            gradient[0] = abs(a - e)
-            gradient[1] = abs(c - d)
-            gradient[2] = abs(a - d)
-            gradient[3] = abs(b - e)
-
-            max_value = gradient[0]
-            max_index = 0
-            for m in range(1, 4):
-                if gradient[m] > max_value:
-                    max_value = gradient[m]
-                    max_index = m
-
-            if max_index == 0:
-                dst[k] = dst[k - 1] + src[k]
-            elif max_index == 1:
-                dst[k] = dst[k - xdim] + src[k]
-            elif max_index == 2:
-                dst[k] = dst[k - xdim - 1] + src[k]
-            else:
-                dst[k] = dst[k - xdim + 1] + src[k]
-            k += 1
-
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-
-    return dst
-
-
-def get_gradient_deltas_from_values2(src: List[int], xdim: int, ydim: int) -> list:
-    dst = [0] * (xdim * ydim)
-    gradient = [0] * 4
-    init_value = src[0]
-    original_init_value = src[0]
-    total_sum = 0
-    k = 0
-
-    dst[k] = 0
-    k += 1
-    for i in range(1, xdim):
-        delta = src[k] - src[k - 1]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-    for i in range(1, ydim):
-        delta = src[k] - init_value
-        dst[k] = delta
-        k += 1
-        init_value += delta
-        total_sum += abs(delta)
-
-        delta = src[k] - src[k - 1]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-        for j in range(2, xdim - 1):
-            a = src[k - 1]
-            b = src[k - xdim]
-            c = src[k - xdim - 1]
-            d = src[k - xdim + 1]
-            e = src[k - xdim - 2]
-
-            gradient[0] = abs(c - b)
-            gradient[1] = abs(c - a)
-            gradient[2] = abs(a - b)
-            gradient[3] = abs(a - e)
-
-            max_value = gradient[0]
-            max_index = 0
-            for m in range(1, 4):
-                if gradient[m] > max_value:
-                    max_value = gradient[m]
-                    max_index = m
-
-            if max_index == 0:
-                delta = src[k] - src[k - 1]
-            elif max_index == 1:
-                delta = src[k] - src[k - xdim]
-            elif max_index == 2:
-                delta = src[k] - src[k - xdim - 1]
-            else:
-                delta = src[k] - src[k - xdim + 1]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-
-        delta = src[k] - src[k - 1]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-    return [total_sum, dst, original_init_value]
-
-
-def get_values_from_gradient_deltas2(src: List[int], xdim: int, ydim: int, init_value: int) -> List[int]:
-    dst = [0] * (xdim * ydim)
-    gradient = [0] * 4
-    k = 0
-
-    dst[k] = init_value
-    k += 1
-    for i in range(1, xdim):
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-
-    for i in range(1, ydim):
-        init_value += src[k]
-        dst[k] = init_value
-        k += 1
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-
-        for j in range(2, xdim - 1):
-            a = dst[k - 1]
-            b = dst[k - xdim]
-            c = dst[k - xdim - 1]
-            d = dst[k - xdim + 1]
-            e = dst[k - xdim - 2]
-
-            gradient[0] = abs(c - b)
-            gradient[1] = abs(c - a)
-            gradient[2] = abs(a - b)
-            gradient[3] = abs(a - e)
-
-            max_value = gradient[0]
-            max_index = 0
-            for m in range(1, 4):
-                if gradient[m] > max_value:
-                    max_value = gradient[m]
-                    max_index = m
-
-            if max_index == 0:
-                dst[k] = dst[k - 1] + src[k]
-            elif max_index == 1:
-                dst[k] = dst[k - xdim] + src[k]
-            elif max_index == 2:
-                dst[k] = dst[k - xdim - 1] + src[k]
-            else:
-                dst[k] = dst[k - xdim + 1] + src[k]
-            k += 1
-
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-
-    return dst
-
-
-def get_mixed_deltas_from_values(src: List[int], xdim: int, ydim: int) -> list:
-    map_ = [0] * (ydim - 1)
-
-    for i in range(1, ydim):
-        delta = [[0] * (xdim - 2) for _ in range(4)]
-
-        k = i * xdim + 1
-        for j in range(1, xdim - 1):
-            delta[0][j - 1] = src[k] - src[k - 1]
-            delta[1][j - 1] = src[k] - src[k - xdim]
-            delta[2][j - 1] = src[k] - jdiv(src[k - 1] + src[k - xdim], 2)
-
-            a = src[k - 1]
-            b = src[k - xdim]
-            c = src[k - xdim - 1]
-
-            if c >= max(a, b):
-                pred = min(a, b)
-            elif c <= min(a, b):
-                pred = max(a, b)
-            else:
-                pred = a + b - c
-
-            delta[3][j - 1] = src[k] - pred
-            k += 1
-
-        limit = [0] * 4
-        for j in range(4):
-            current_delta = delta[j]
-
-            delta_min = current_delta[0]
-            delta_max = current_delta[0]
-            for kk in range(1, len(current_delta)):
-                if current_delta[kk] < delta_min:
-                    delta_min = current_delta[kk]
-                elif current_delta[kk] > delta_max:
-                    delta_max = current_delta[kk]
-
-            for kk in range(len(current_delta)):
-                current_delta[kk] -= delta_min
-            range_ = delta_max - delta_min
-            frequency = [0] * (range_ + 1)
-            for kk in range(len(current_delta)):
-                frequency[current_delta[kk]] += 1
-            shannon_limit = code_mapper.get_shannon_limit(frequency)
-            limit[j] = math.floor(shannon_limit)
-
-        value = limit[0]
-        index = 0
-        for kk in range(1, 4):
-            if limit[kk] < value:
-                value = limit[kk]
-                index = kk
-        map_[i - 1] = index
-
-    dst = [0] * (xdim * ydim)
-    init_value = src[0]
-    original_init_value = src[0]
-    total_sum = 0
-    k = 0
-
-    dst[k] = 0
-    k += 1
-    delta = src[k] - init_value
-    value = src[k]
-    dst[k] = delta
-    k += 1
-    total_sum += abs(delta)
-
-    for i in range(2, xdim):
-        delta = src[k] - value
-        value = src[k]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-    for i in range(1, ydim):
-        delta = src[k] - init_value
-        init_value = src[k]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-        m = map_[i - 1]
-
-        if m == 0:
-            for j in range(1, xdim - 1):
-                delta = src[k] - src[k - 1]
-                dst[k] = delta
-                k += 1
-            delta = src[k] - src[k - 1]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-        elif m == 1:
-            for j in range(1, xdim - 1):
-                delta = src[k] - src[k - xdim]
-                dst[k] = delta
-                k += 1
-            delta = src[k] - src[k - 1]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-        elif m == 2:
-            for j in range(1, xdim - 1):
-                delta = src[k] - jdiv(src[k - 1] + src[k - xdim], 2)
-                dst[k] = delta
-                k += 1
-            delta = src[k] - src[k - 1]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-        elif m == 3:
-            for j in range(1, xdim - 1):
-                a = src[k - 1]
-                b = src[k - xdim]
-                c = src[k - xdim - 1]
-
-                if c >= max(a, b):
-                    pred = min(a, b)
-                elif c <= min(a, b):
-                    pred = max(a, b)
-                else:
-                    pred = a + b - c
-
-                delta = src[k] - pred
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-            delta = src[k] - src[k - 1]
-            dst[k] = delta
-            k += 1
-
-    return [total_sum, dst, map_, original_init_value]
-
-
-def get_values_from_mixed_deltas(src: List[int], xdim: int, ydim: int, init_value: int, map_: List[int]) -> List[int]:
-    dst = [0] * (xdim * ydim)
-    k = 0
-    value = init_value
-
-    dst[k] = init_value
-    k += 1
-    for i in range(1, xdim):
-        value += src[k]
-        dst[k] = value
-        k += 1
-
-    for i in range(1, ydim):
-        init_value += src[k]
-        dst[k] = init_value
-        k += 1
-
-        m = map_[i - 1]
-        if m == 0:
-            for j in range(1, xdim - 1):
-                value = dst[k - 1] + src[k]
-                dst[k] = value
-                k += 1
-        elif m == 1:
-            for j in range(1, xdim - 1):
-                value = dst[k - xdim] + src[k]
-                dst[k] = value
-                k += 1
-        elif m == 2:
-            for j in range(1, xdim - 1):
-                value = jdiv(dst[k - xdim] + dst[k - 1], 2) + src[k]
-                dst[k] = value
-                k += 1
-        elif m == 3:
-            for j in range(1, xdim - 1):
-                a = dst[k - 1]
-                b = dst[k - xdim]
-                c = dst[k - xdim - 1]
-
-                if c >= max(a, b):
-                    pred = min(a, b)
-                elif c <= min(a, b):
-                    pred = max(a, b)
-                else:
-                    pred = a + b - c
-
-                value = pred + src[k]
-                dst[k] = value
-                k += 1
-        value = dst[k - 1] + src[k]
-        dst[k] = value
-        k += 1
-
-    return dst
-
-
-def get_mixed_deltas_from_values2(src: List[int], xdim: int, ydim: int) -> list:
-    map_ = [0] * (ydim - 1)
-
-    for i in range(1, ydim):
-        sum_ = [0] * 4
-
-        for j in range(1, xdim - 1):
-            k = i * xdim + j
-            sum_[0] += abs(src[k] - src[k - 1])
-            sum_[1] += abs(src[k] - src[k - xdim])
-            sum_[2] += abs(src[k] - jdiv(src[k - 1] + src[k - xdim], 2))
-            sum_[3] += abs(src[k] - jdiv(src[k - 1] + src[k - xdim + 1], 2))
-
-        value = sum_[0]
-        index = 0
-        for k in range(1, 4):
-            if sum_[k] < value:
-                value = sum_[k]
-                index = k
-        map_[i - 1] = index
-
-    dst = [0] * (xdim * ydim)
-    init_value = src[0]
-    original_init_value = src[0]
-    value = init_value
-    total_sum = 0
-
-    for i in range(ydim):
-        if i == 0:
-            for j in range(xdim):
-                if j == 0:
-                    dst[j] = 0
-                else:
-                    delta = src[j] - value
-                    value += delta
-                    dst[j] = delta
-        else:
-            k = i * xdim
-            delta = src[k] - init_value
-            init_value = src[k]
-            dst[k] = delta
-            k += 1
-
-            m = map_[i - 1]
-
-            for j in range(1, xdim - 1):
-                if m == 0:
-                    delta = src[k] - src[k - 1]
-                elif m == 1:
-                    delta = src[k] - src[k - xdim]
-                elif m == 2:
-                    delta = src[k] - jdiv(src[k - 1] + src[k - xdim], 2)
-                else:
-                    delta = src[k] - jdiv(src[k - 1] + src[k - xdim + 1], 2)  # m == 3
-
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-
-            delta = src[k] - src[k - 1]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-
-    return [total_sum, dst, map_, original_init_value]
-
-
-def get_values_from_mixed_deltas2(src: List[int], xdim: int, ydim: int, init_value: int, map_: List[int]) -> List[int]:
-    dst = [0] * (xdim * ydim)
-    dst[0] = init_value
-    value = init_value
-
-    for i in range(1, xdim):
-        value += src[i]
-        dst[i] = value
-
-    for i in range(1, ydim):
-        m = map_[i - 1]
-        for j in range(xdim):
-            k = i * xdim + j
-            if j == 0:
-                init_value += src[k]
-                dst[k] = init_value
-            elif j < xdim - 1:
-                if m == 0:
-                    value = dst[k - 1]
-                elif m == 1:
-                    value = dst[k - xdim]
-                elif m == 2:
-                    value = jdiv(dst[k - 1] + dst[k - xdim], 2)
-                elif m == 3:
-                    value = jdiv(dst[k - 1] + dst[k - xdim + 1], 2)
-
-                value += src[k]
-                dst[k] = value
-            else:
-                value = dst[k - 1] + src[k]
-                dst[k] = value
-    return dst
-
-
-def get_mixed_deltas_from_values3(src: List[int], xdim: int, ydim: int) -> list:
-    line_map = [0] * (ydim - 1)
-    m = 0
-    for i in range(1, ydim):
-        sum_ = [0] * 5
-
-        for j in range(1, xdim - 1):
-            k = i * xdim + j
-            sum_[0] += abs(src[k] - src[k - 1])
-            sum_[1] += abs(src[k] - src[k - xdim])
-            sum_[2] += abs(src[k] - src[k - xdim - 1])
-            sum_[3] += abs(src[k] - jdiv(src[k - 1] + src[k - xdim], 2))
-            sum_[4] += abs(src[k] - jdiv(src[k - 1] + src[k - xdim + 1], 2))
-
-        key_list = []
-        delta_table = {}
-
-        current_key = float(sum_[0])
-        addend = 0.00000001
-
-        key_list.append(current_key)
-        delta_table[current_key] = 0
-        for k in range(1, 5):
-            current_key = float(sum_[k])
-            if current_key in key_list:
-                current_key += addend
-                addend *= 2.0
-            key_list.append(current_key)
-            delta_table[current_key] = k
-
-        key_list.sort()
-
-        first_key = key_list[0]
-        first_type = delta_table[first_key]
-        second_key = key_list[1]
-        second_type = delta_table[second_key]
-
-        type_list = [first_type, second_type]
-
-        if 0 in type_list and 1 in type_list:
-            line_map[m] = 0
-        elif 0 in type_list and 2 in type_list:
-            line_map[m] = 1
-        elif 0 in type_list and 3 in type_list:
-            line_map[m] = 2
-        elif 0 in type_list and 4 in type_list:
-            line_map[m] = 3
-        elif 1 in type_list and 2 in type_list:
-            line_map[m] = 4
-        elif 1 in type_list and 3 in type_list:
-            line_map[m] = 5
-        elif 1 in type_list and 4 in type_list:
-            line_map[m] = 6
-        elif 2 in type_list and 3 in type_list:
-            line_map[m] = 7
-        elif 2 in type_list and 4 in type_list:
-            line_map[m] = 8
-        else:
-            line_map[m] = 9
-        m += 1
-
-    pixel_map = [0] * ((xdim - 2) * (ydim - 1))
-    n = 0
-    for i in range(1, ydim):
-        m = line_map[i - 1]
-        value = [0, 0]
-        for j in range(1, xdim - 1):
-            k = i * xdim + j
-            if m == 0 or m == 1:
-                value[0] += abs(src[k] - src[k - 1])
-                value[1] += abs(src[k] - src[k - xdim])
-            elif m == 2:
-                value[0] += abs(src[k] - src[k - 1])
-                value[1] += abs(src[k] - jdiv(src[k - 1] + src[k - xdim], 2))
-            elif m == 3:
-                value[0] += abs(src[k] - src[k - 1])
-                value[1] += abs(src[k] - jdiv(src[k - 1] + src[k - xdim + 1], 2))
-            elif m == 4:
-                value[0] += abs(src[k] - src[k - xdim])
-                value[1] += abs(src[k] - src[k - xdim - 1])
-            elif m == 5:
-                value[0] += abs(src[k] - src[k - xdim])
-                value[1] += abs(src[k] - jdiv(src[k - 1] + src[k - xdim], 2))
-            elif m == 6:
-                value[0] += abs(src[k] - src[k - xdim])
-                value[1] += abs(src[k] - jdiv(src[k - 1] + src[k - xdim + 1], 2))
-            elif m == 7:
-                value[0] += abs(src[k] - src[k - xdim - 1])
-                value[1] += abs(src[k] - jdiv(src[k - 1] + src[k - xdim], 2))
-            elif m == 8:
-                value[0] += abs(src[k] - src[k - xdim - 1])
-                value[1] += abs(src[k] - jdiv(src[k - 1] + src[k - xdim + 1], 2))
-            else:
-                value[0] += abs(src[k] - jdiv(src[k - 1] + src[k - xdim], 2))
-                value[1] += abs(src[k] - jdiv(src[k - 1] + src[k - xdim + 1], 2))
-            pixel_map[n] = 0 if value[0] <= value[1] else 1
-            n += 1
-
-    dst = [0] * (xdim * ydim)
-    init_value = src[0]
-    original_init_value = src[0]
-    value = init_value
-    total_sum = 0
-    p = 0
-
-    for i in range(ydim):
-        if i == 0:
-            for j in range(xdim):
-                if j == 0:
-                    dst[j] = 0
-                else:
-                    delta = src[j] - value
-                    value += delta
-                    dst[j] = delta
-        else:
-            k = i * xdim
-            delta = src[k] - init_value
-            init_value = src[k]
-            dst[k] = delta
-            k += 1
-
-            m = line_map[i - 1]
-
-            for j in range(1, xdim - 1):
-                n = pixel_map[p]
-                p += 1
-                if m == 0:
-                    delta = (src[k] - src[k - 1]) if n == 0 else (src[k] - src[k - xdim])
-                elif m == 1:
-                    delta = (src[k] - src[k - 1]) if n == 0 else (src[k] - src[k - xdim - 1])
-                elif m == 2:
-                    delta = (src[k] - src[k - 1]) if n == 0 else (src[k] - jdiv(src[k - 1] + src[k - xdim], 2))
-                elif m == 3:
-                    delta = (src[k] - src[k - 1]) if n == 0 else (src[k] - jdiv(src[k - 1] + src[k - xdim + 1], 2))
-                elif m == 4:
-                    delta = (src[k] - src[k - xdim]) if n == 0 else (src[k] - src[k - xdim - 1])
-                elif m == 5:
-                    delta = (src[k] - src[k - xdim]) if n == 0 else (src[k] - jdiv(src[k - 1] + src[k - xdim], 2))
-                elif m == 6:
-                    delta = (src[k] - src[k - xdim]) if n == 0 else (src[k] - jdiv(src[k - 1] + src[k - xdim + 1], 2))
-                elif m == 7:
-                    delta = (src[k] - src[k - xdim - 1]) if n == 0 else (src[k] - jdiv(src[k - 1] + src[k - xdim], 2))
-                elif m == 8:
-                    delta = (src[k] - src[k - xdim - 1]) if n == 0 else (src[k] - jdiv(src[k - 1] + src[k - xdim + 1], 2))
-                else:
-                    delta = (src[k] - jdiv(src[k - 1] + src[k - xdim], 2)) if n == 0 else (src[k] - jdiv(src[k - 1] + src[k - xdim + 1], 2))
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-
-            delta = src[k] - src[k - 1]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-
-    return [total_sum, dst, line_map, pixel_map, original_init_value]
-
-
-def get_values_from_mixed_deltas3(src: List[int], xdim: int, ydim: int, init_value: int,
-                                   line_map: List[int], pixel_map: List[int]) -> List[int]:
-    dst = [0] * (xdim * ydim)
-    dst[0] = init_value
-    value = init_value
-
-    for i in range(1, xdim):
-        value += src[i]
-        dst[i] = value
-
-    p = 0
-    for i in range(1, ydim):
-        m = line_map[i - 1]
-        for j in range(xdim):
-            k = i * xdim + j
-            if j == 0:
-                init_value += src[k]
-                dst[k] = init_value
-            elif j < xdim - 1:
-                n = pixel_map[p]
-                p += 1
-                if m == 0:
-                    value = dst[k - 1] if n == 0 else dst[k - xdim]
-                elif m == 1:
-                    value = dst[k - 1] if n == 0 else dst[k - xdim - 1]
-                elif m == 2:
-                    value = dst[k - 1] if n == 0 else jdiv(dst[k - 1] + dst[k - xdim], 2)
-                elif m == 3:
-                    value = dst[k - 1] if n == 0 else jdiv(dst[k - 1] + dst[k - xdim + 1], 2)
-                elif m == 4:
-                    value = dst[k - xdim] if n == 0 else dst[k - xdim - 1]
-                elif m == 5:
-                    value = dst[k - xdim] if n == 0 else jdiv(dst[k - 1] + dst[k - xdim], 2)
-                elif m == 6:
-                    value = dst[k - xdim] if n == 0 else jdiv(dst[k - 1] + dst[k - xdim + 1], 2)
-                elif m == 7:
-                    value = dst[k - xdim - 1] if n == 0 else jdiv(dst[k - 1] + dst[k - xdim], 2)
-                elif m == 8:
-                    value = dst[k - xdim - 1] if n == 0 else jdiv(dst[k - 1] + dst[k - xdim + 1], 2)
-                else:
-                    value = jdiv(dst[k - 1] + dst[k - xdim], 2) if n == 0 else jdiv(dst[k - 1] + dst[k - xdim + 1], 2)
-                value += src[k]
-                dst[k] = value
-            else:
-                value = dst[k - 1] + src[k]
-                dst[k] = value
-    return dst
-
-
-def get_mixed_deltas_from_values4(src: List[int], xdim: int, ydim: int) -> list:
-    map_ = [0] * (ydim - 1)
-
-    for i in range(1, ydim):
-        delta = [[0] * (xdim - 2) for _ in range(4)]
-
-        k = i * xdim + 1
-        for j in range(1, xdim - 1):
-            a = src[k - 1]
-            b = src[k - xdim]
-            c = src[k - xdim - 1]
-            d = src[k - xdim + 1]
-
-            delta[0][j - 1] = src[k] - a
-            delta[1][j - 1] = src[k] - jdiv(a + b, 2)
-
-            if c >= max(a, b):
-                med_pred = min(a, b)
-            elif c <= min(a, b):
-                med_pred = max(a, b)
-            else:
-                med_pred = a + b - c
-            delta[2][j - 1] = src[k] - med_pred
-
-            h_edge = abs(b - c) + abs(b - d)
-            v_edge = abs(a - c) + abs(a - b)
-            dl_edge = abs(c - d)
-            dr_edge = abs(a - d)
-
-            if h_edge >= v_edge and h_edge >= dl_edge and h_edge >= dr_edge:
-                dir_pred = b
-            elif v_edge >= dl_edge and v_edge >= dr_edge:
-                dir_pred = a
-            elif dl_edge >= dr_edge:
-                dir_pred = d
-            else:
-                dir_pred = c
-            delta[3][j - 1] = src[k] - dir_pred
-
-            k += 1
-
-        limit = [0] * 4
-        for j in range(4):
-            current_delta = delta[j]
-
-            delta_min = current_delta[0]
-            delta_max = current_delta[0]
-            for kk in range(1, len(current_delta)):
-                if current_delta[kk] < delta_min:
-                    delta_min = current_delta[kk]
-                elif current_delta[kk] > delta_max:
-                    delta_max = current_delta[kk]
-
-            for kk in range(len(current_delta)):
-                current_delta[kk] -= delta_min
-            range_ = delta_max - delta_min
-            frequency = [0] * (range_ + 1)
-            for kk in range(len(current_delta)):
-                frequency[current_delta[kk]] += 1
-            shannon_limit = code_mapper.get_shannon_limit(frequency)
-            limit[j] = math.floor(shannon_limit)
-
-        value = limit[0]
-        index = 0
-        for kk in range(1, 4):
-            if limit[kk] < value:
-                value = limit[kk]
-                index = kk
-        map_[i - 1] = index
-
-    dst = [0] * (xdim * ydim)
-    init_value = src[0]
-    original_init_value = src[0]
-    total_sum = 0
-    k = 0
-
-    dst[k] = 0
-    k += 1
-    delta = src[k] - init_value
-    value = src[k]
-    dst[k] = delta
-    k += 1
-    total_sum += abs(delta)
-
-    for i in range(2, xdim):
-        delta = src[k] - value
-        value = src[k]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-    for i in range(1, ydim):
-        delta = src[k] - init_value
-        init_value = src[k]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-        m = map_[i - 1]
-
-        if m == 0:
-            for j in range(1, xdim - 1):
-                delta = src[k] - src[k - 1]
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-            delta = src[k] - src[k - 1]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-        elif m == 1:
-            for j in range(1, xdim - 1):
-                delta = src[k] - jdiv(src[k - 1] + src[k - xdim], 2)
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-            delta = src[k] - src[k - 1]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-        elif m == 2:
-            for j in range(1, xdim - 1):
-                a = src[k - 1]
-                b = src[k - xdim]
-                c = src[k - xdim - 1]
-
-                if c >= max(a, b):
-                    pred = min(a, b)
-                elif c <= min(a, b):
-                    pred = max(a, b)
-                else:
-                    pred = a + b - c
-
-                delta = src[k] - pred
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-            delta = src[k] - src[k - 1]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-        elif m == 3:
-            for j in range(1, xdim - 1):
-                a = src[k - 1]
-                b = src[k - xdim]
-                c = src[k - xdim - 1]
-                d = src[k - xdim + 1]
-
-                h_edge = abs(b - c) + abs(b - d)
-                v_edge = abs(a - c) + abs(a - b)
-                dl_edge = abs(c - d)
-                dr_edge = abs(a - d)
-
-                if h_edge >= v_edge and h_edge >= dl_edge and h_edge >= dr_edge:
-                    pred = b
-                elif v_edge >= dl_edge and v_edge >= dr_edge:
-                    pred = a
-                elif dl_edge >= dr_edge:
-                    pred = d
-                else:
-                    pred = c
-
-                delta = src[k] - pred
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-
-            # Last column: MED fallback
-            a = src[k - 1]
-            b = src[k - xdim]
-            c = src[k - xdim - 1]
-
-            if c >= max(a, b):
-                pred = min(a, b)
-            elif c <= min(a, b):
-                pred = max(a, b)
-            else:
-                pred = a + b - c
-
-            delta = src[k] - pred
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-
-    return [total_sum, dst, map_, original_init_value]
-
-
-def get_values_from_mixed_deltas4(src: List[int], xdim: int, ydim: int, init_value: int, map_: List[int]) -> List[int]:
-    dst = [0] * (xdim * ydim)
-    k = 0
-    value = init_value
-
-    dst[k] = init_value
-    k += 1
-    for i in range(1, xdim):
-        value += src[k]
-        dst[k] = value
-        k += 1
-
-    for i in range(1, ydim):
-        init_value += src[k]
-        dst[k] = init_value
-        k += 1
-
-        m = map_[i - 1]
-
-        if m == 0:
-            for j in range(1, xdim - 1):
-                value = dst[k - 1] + src[k]
-                dst[k] = value
-                k += 1
-        elif m == 1:
-            for j in range(1, xdim - 1):
-                value = jdiv(dst[k - 1] + dst[k - xdim], 2) + src[k]
-                dst[k] = value
-                k += 1
-        elif m == 2:
-            for j in range(1, xdim - 1):
-                a = dst[k - 1]
-                b = dst[k - xdim]
-                c = dst[k - xdim - 1]
-
-                if c >= max(a, b):
-                    pred = min(a, b)
-                elif c <= min(a, b):
-                    pred = max(a, b)
-                else:
-                    pred = a + b - c
-
-                value = pred + src[k]
-                dst[k] = value
-                k += 1
-        elif m == 3:
-            for j in range(1, xdim - 1):
-                a = dst[k - 1]
-                b = dst[k - xdim]
-                c = dst[k - xdim - 1]
-                d = dst[k - xdim + 1]
-
-                h_edge = abs(b - c) + abs(b - d)
-                v_edge = abs(a - c) + abs(a - b)
-                dl_edge = abs(c - d)
-                dr_edge = abs(a - d)
-
-                if h_edge >= v_edge and h_edge >= dl_edge and h_edge >= dr_edge:
-                    pred = b
-                elif v_edge >= dl_edge and v_edge >= dr_edge:
-                    pred = a
-                elif dl_edge >= dr_edge:
-                    pred = d
-                else:
-                    pred = c
-
-                value = pred + src[k]
-                dst[k] = value
-                k += 1
-
-            # Last column: MED fallback
-            a = dst[k - 1]
-            b = dst[k - xdim]
-            c = dst[k - xdim - 1]
-
-            if c >= max(a, b):
-                pred = min(a, b)
-            elif c <= min(a, b):
-                pred = max(a, b)
-            else:
-                pred = a + b - c
-
-            value = pred + src[k]
-            dst[k] = value
-            k += 1
-            continue
-
-        value = dst[k - 1] + src[k]
-        dst[k] = value
-        k += 1
-
-    return dst
-
-
-# ---------------------------------------------------------------------------
-# Scanline (4) -- per-row selection from 16 predictors
-# ---------------------------------------------------------------------------
-
-@njit
-def pred16(a: int, b: int, c: int, d: int, p: int) -> int:
-    if p == 0:
-        return a
-    if p == 1:
-        return b
-    if p == 2:
-        return c
-    if p == 3:
-        return d
-    if p == 4:
-        return (a + b) >> 1
-    if p == 5:
-        return (b + c) >> 1
-    if p == 6:
-        return (a + c) >> 1
-    if p == 7:
-        return (b + d) >> 1
-    if p == 8:
-        return (c + d) >> 1
-    if p == 9:
-        return (a + b + c + d + 2) >> 2
-    if p == 10:
-        return a + b - c
-    if p == 11:
-        if c >= max(a, b):
-            return min(a, b)
-        if c <= min(a, b):
-            return max(a, b)
-        return a + b - c
-    if p == 12:
-        return (a * 3 + b + 2) >> 2
-    if p == 13:
-        return (a + b * 3 + 2) >> 2
-    if p == 14:
-        return (a * 3 + d + 2) >> 2
-    if p == 15:
-        return (b * 3 + a + 2) >> 2
-    return a
-
-
-@njit
-def _mixed_deltas16_frequency_core(src, xdim, ydim):
-    delta_freq = np.zeros(511, dtype=np.int64)
-    map_freq = np.zeros(16, dtype=np.int64)
-
-    for row in range(ydim):
-        best_pred = 0
-        best_sad = -1
-        for p in range(16):
-            sad = 0
-            for col in range(xdim):
-                k = row * xdim + col
-                if k == 0:
-                    continue
-                a = src[k - 1] if col > 0 else 0
-                b = src[k - xdim] if row > 0 else 0
-                c = src[k - xdim - 1] if (row > 0 and col > 0) else 0
-                d = src[k - xdim + 1] if (row > 0 and col < xdim - 1) else 0
-                sad += abs(src[k] - pred16(a, b, c, d, p))
-            if best_sad < 0 or sad < best_sad:
-                best_sad = sad
-                best_pred = p
-        map_freq[best_pred] += 1
-        for col in range(xdim):
-            k = row * xdim + col
-            if k == 0:
-                continue
-            a = src[k - 1] if col > 0 else 0
-            b = src[k - xdim] if row > 0 else 0
-            c = src[k - xdim - 1] if (row > 0 and col > 0) else 0
-            d = src[k - xdim + 1] if (row > 0 and col < xdim - 1) else 0
-            delta = src[k] - pred16(a, b, c, d, best_pred)
-            idx = delta + 255
-            if 0 <= idx < 511:
-                delta_freq[idx] += 1
-
-    return delta_freq, map_freq
-
-
-def get_mixed_deltas16_frequency(src: List[int], xdim: int, ydim: int):
-    src_arr = np.asarray(src, dtype=np.int64)
-    delta_freq, map_freq = _mixed_deltas16_frequency_core(src_arr, xdim, ydim)
-    return [delta_freq.tolist(), map_freq.tolist()]
-
-
-@njit
-def _mixed_deltas_from_values16_rows_core(src, xdim, ydim):
-    dst = np.zeros(xdim * ydim, dtype=np.int64)
-    map_ = np.zeros(ydim, dtype=np.int64)  # one entry per row, value 0-15
-
-    dst[0] = 0
-    for row in range(ydim):
-        best_pred = 0
-        best_sad = -1
-        for p in range(16):
-            sad = 0
-            for col in range(xdim):
-                k = row * xdim + col
-                if k == 0:
-                    continue
-                a = src[k - 1] if col > 0 else 0
-                b = src[k - xdim] if row > 0 else 0
-                c = src[k - xdim - 1] if (row > 0 and col > 0) else 0
-                d = src[k - xdim + 1] if (row > 0 and col < xdim - 1) else 0
-                sad += abs(src[k] - pred16(a, b, c, d, p))
-            if best_sad < 0 or sad < best_sad:
-                best_sad = sad
-                best_pred = p
-        map_[row] = best_pred
-        for col in range(xdim):
-            k = row * xdim + col
-            if k == 0:
-                continue
-            a = src[k - 1] if col > 0 else 0
-            b = src[k - xdim] if row > 0 else 0
-            c = src[k - xdim - 1] if (row > 0 and col > 0) else 0
-            d = src[k - xdim + 1] if (row > 0 and col < xdim - 1) else 0
-            dst[k] = src[k] - pred16(a, b, c, d, best_pred)
-
-    return dst, map_
-
-
-def get_mixed_deltas_from_values16_rows(src: List[int], xdim: int, ydim: int) -> list:
-    src_arr = np.asarray(src, dtype=np.int64)
-    dst, map_ = _mixed_deltas_from_values16_rows_core(src_arr, xdim, ydim)
-    total = int(np.abs(dst).sum())
-    return [total, dst.tolist(), map_.tolist(), int(src_arr[0])]
-
-
-@njit
-def _values_from_mixed_deltas16_rows_core(src, xdim, ydim, init_value, map_):
-    dst = np.zeros(xdim * ydim, dtype=np.int64)
-    dst[0] = init_value
-
-    for row in range(ydim):
-        p = map_[row] & 0xF
-        for col in range(xdim):
-            k = row * xdim + col
-            if k == 0:
-                continue
-            a = dst[k - 1] if col > 0 else 0
-            b = dst[k - xdim] if row > 0 else 0
-            c = dst[k - xdim - 1] if (row > 0 and col > 0) else 0
-            d = dst[k - xdim + 1] if (row > 0 and col < xdim - 1) else 0
-            dst[k] = src[k] + pred16(a, b, c, d, p)
-    return dst
-
-
-def get_values_from_mixed_deltas16_rows(src, xdim: int, ydim: int, init_value: int, map_) -> List[int]:
-    return _values_from_mixed_deltas16_rows_core(_to_int64_array(src), xdim, ydim, init_value, _to_int64_array(map_))
-
-
-# ---------------------------------------------------------------------------
-# Bilateral smoothing -- preserves edges, suppresses noise.
-# threshold 0 = no-op; 1-10 maps range sigma 10-100.
-# ---------------------------------------------------------------------------
-
-def bilateral_smooth(src: List[int], xdim: int, ydim: int, threshold: int) -> List[int]:
-    if threshold == 0:
-        return list(src)
-
-    sigma_r = threshold * threshold
-    sigma_s = 1.5
-    radius = 2
-
-    rw = [0.0] * 256
+def _bilateral(src, xdim, ydim, threshold):
+    sigma_r = float(threshold * threshold)
+    rw = np.zeros(256)
     r2 = 2.0 * sigma_r * sigma_r
     for d in range(256):
         rw[d] = math.exp(-(d * d) / r2)
-
-    ksize = 2 * radius + 1
-    sw = [[0.0] * ksize for _ in range(ksize)]
-    s2 = 2.0 * sigma_s * sigma_s
-    for dy in range(-radius, radius + 1):
-        for dx in range(-radius, radius + 1):
-            sw[dy + radius][dx + radius] = math.exp(-(dx * dx + dy * dy) / s2)
-
-    dst = [0] * len(src)
+    sw = np.zeros((5, 5))
+    s2 = 2.0 * 1.5 * 1.5
+    for dy in range(-2, 3):
+        for dx in range(-2, 3):
+            sw[dy + 2, dx + 2] = math.exp(-(dx * dx + dy * dy) / s2)
+    dst = np.zeros(src.shape[0], dtype=np.int64)
     for row in range(ydim):
         for col in range(xdim):
             center = src[row * xdim + col]
             sum_w = 0.0
             sum_v = 0.0
-            for dy in range(-radius, radius + 1):
+            for dy in range(-2, 3):
                 ny = row + dy
                 if ny < 0 or ny >= ydim:
                     continue
-                for dx in range(-radius, radius + 1):
+                for dx in range(-2, 3):
                     nx = col + dx
                     if nx < 0 or nx >= xdim:
                         continue
                     v = src[ny * xdim + nx]
-                    w = sw[dy + radius][dx + radius] * rw[abs(v - center)]
+                    w = sw[dy + 2, dx + 2] * rw[abs(v - center)]
                     sum_w += w
                     sum_v += w * v
-            dst[row * xdim + col] = round(sum_v / sum_w)
+            dst[row * xdim + col] = int(math.floor(sum_v / sum_w + 0.5))   # Math.round
     return dst
 
 
-# ---------------------------------------------------------------------------
-# Anisotropic diffusion (Perona-Malik) -- iterative edge-preserving smooth.
-# threshold 0 = no-op; iterations = threshold, K = threshold*3+5 (8-35).
-# lambda = 0.25 (stability limit for 4-directional scheme).
-# ---------------------------------------------------------------------------
+def bilateral_smooth(src, xdim, ydim, threshold):
+    src = np.asarray(src, dtype=np.int64)
+    return src.copy() if threshold == 0 else _bilateral(src, xdim, ydim, threshold)
 
-def anisotropic_smooth(src: List[int], xdim: int, ydim: int, threshold: int) -> List[int]:
-    if threshold == 0:
-        return list(src)
 
-    iterations = threshold
+@njit
+def _anisotropic(src, xdim, ydim, threshold):
     K2 = (threshold * 3.0 + 5.0) * (threshold * 3.0 + 5.0)
-    lambda_ = 0.25
-
-    c = [0.0] * 511
+    c = np.zeros(511)
     for d in range(-255, 256):
         c[d + 255] = math.exp(-(d * d) / K2)
-
-    img = [float(v) for v in src]
-    next_ = [0.0] * len(src)
-
-    for _ in range(iterations):
+    img = src.astype(np.float64)
+    nxt = np.zeros(src.shape[0])
+    for _ in range(threshold):
         for row in range(ydim):
             for col in range(xdim):
                 k = row * xdim + col
                 v = img[k]
-                dN = img[k - xdim] - v if row > 0 else 0
-                dS = img[k + xdim] - v if row < ydim - 1 else 0
-                dE = img[k + 1] - v if col < xdim - 1 else 0
-                dW = img[k - 1] - v if col > 0 else 0
+                dN = img[k - xdim] - v if row > 0 else 0.0
+                dS = img[k + xdim] - v if row < ydim - 1 else 0.0
+                dE = img[k + 1] - v if col < xdim - 1 else 0.0
+                dW = img[k - 1] - v if col > 0 else 0.0
                 iN = max(0, min(510, int(dN + 255.5)))
                 iS = max(0, min(510, int(dS + 255.5)))
                 iE = max(0, min(510, int(dE + 255.5)))
                 iW = max(0, min(510, int(dW + 255.5)))
-                next_[k] = v + lambda_ * (c[iN] * dN + c[iS] * dS + c[iE] * dE + c[iW] * dW)
-        img, next_ = next_, img
-
-    dst = [0] * len(src)
-    for i in range(len(src)):
-        dst[i] = max(0, min(255, round(img[i])))
+                nxt[k] = v + 0.25 * (c[iN] * dN + c[iS] * dS + c[iE] * dE + c[iW] * dW)
+        img, nxt = nxt, img
+    dst = np.zeros(src.shape[0], dtype=np.int64)
+    for i in range(src.shape[0]):
+        dst[i] = max(0, min(255, int(math.floor(img[i] + 0.5))))
     return dst
 
 
-# ---------------------------------------------------------------------------
+def anisotropic_smooth(src, xdim, ydim, threshold):
+    src = np.asarray(src, dtype=np.int64)
+    return src.copy() if threshold == 0 else _anisotropic(src, xdim, ydim, threshold)
 
-# Each row maps local predictor index 0-7 to a pred16 index. A numpy array
-# (not a Python list of lists) so pred8 below can be numba-compiled --
-# nopython mode needs a typed, homogeneous array for a module-level
-# lookup table, not a reflected list-of-lists.
-# Add new rows here to define new variants; variant 0 is the default.
-FILTER_SETS_8 = np.array([
-    # variant 0: spread coverage -- directional anchors + best composites
-    [0, 1, 2, 3, 4, 10, 9, 5],
-    # variant 1: averaging focus -- left, above, avg(l,a), avg-all-4, gradient, MED, weighted blends
-    [0, 1, 4, 9, 10, 11, 12, 13],
-    # variant 2: variant 1 with weighted 1:3 swapped for avg(above, above-right)
-    [0, 1, 4, 9, 10, 11, 12, 7],
-], dtype=np.int64)
 
+# =============================================================================
+# Predictors
+# =============================================================================
 
 @njit
-def pred8(a: int, b: int, c: int, d: int, p: int, variant: int) -> int:
-    return pred16(a, b, c, d, FILTER_SETS_8[variant, p])
-
-
-@njit
-def _mixed_deltas8_frequency_core(src, xdim, ydim, variant):
-    delta_freq = np.zeros(511, dtype=np.int64)
-    map_freq = np.zeros(8, dtype=np.int64)
-
-    for row in range(ydim):
-        best_pred = 0
-        best_sad = -1
-        for p in range(8):
-            sad = 0
-            for col in range(xdim):
-                k = row * xdim + col
-                if k == 0:
-                    continue
-                a = src[k - 1] if col > 0 else 0
-                b = src[k - xdim] if row > 0 else 0
-                c = src[k - xdim - 1] if (row > 0 and col > 0) else 0
-                d = src[k - xdim + 1] if (row > 0 and col < xdim - 1) else 0
-                sad += abs(src[k] - pred8(a, b, c, d, p, variant))
-            if best_sad < 0 or sad < best_sad:
-                best_sad = sad
-                best_pred = p
-        map_freq[best_pred] += 1
-        for col in range(xdim):
-            k = row * xdim + col
-            if k == 0:
-                continue
-            a = src[k - 1] if col > 0 else 0
-            b = src[k - xdim] if row > 0 else 0
-            c = src[k - xdim - 1] if (row > 0 and col > 0) else 0
-            d = src[k - xdim + 1] if (row > 0 and col < xdim - 1) else 0
-            delta = src[k] - pred8(a, b, c, d, best_pred, variant)
-            idx = delta + 255
-            if 0 <= idx < 511:
-                delta_freq[idx] += 1
-
-    return delta_freq, map_freq
-
-
-def get_mixed_deltas8_frequency(src: List[int], xdim: int, ydim: int, variant: int):
-    src_arr = np.asarray(src, dtype=np.int64)
-    delta_freq, map_freq = _mixed_deltas8_frequency_core(src_arr, xdim, ydim, variant)
-    return [delta_freq.tolist(), map_freq.tolist()]
-
-
-@njit
-def _mixed_deltas_from_values8_rows_core(src, xdim, ydim, variant):
-    dst = np.zeros(xdim * ydim, dtype=np.int64)
-    map_ = np.zeros(ydim, dtype=np.int64)
-
-    dst[0] = 0
-    for row in range(ydim):
-        best_pred = 0
-        best_sad = -1
-        for p in range(8):
-            sad = 0
-            for col in range(xdim):
-                k = row * xdim + col
-                if k == 0:
-                    continue
-                a = src[k - 1] if col > 0 else 0
-                b = src[k - xdim] if row > 0 else 0
-                c = src[k - xdim - 1] if (row > 0 and col > 0) else 0
-                d = src[k - xdim + 1] if (row > 0 and col < xdim - 1) else 0
-                sad += abs(src[k] - pred8(a, b, c, d, p, variant))
-            if best_sad < 0 or sad < best_sad:
-                best_sad = sad
-                best_pred = p
-        map_[row] = best_pred
-        for col in range(xdim):
-            k = row * xdim + col
-            if k == 0:
-                continue
-            a = src[k - 1] if col > 0 else 0
-            b = src[k - xdim] if row > 0 else 0
-            c = src[k - xdim - 1] if (row > 0 and col > 0) else 0
-            d = src[k - xdim + 1] if (row > 0 and col < xdim - 1) else 0
-            dst[k] = src[k] - pred8(a, b, c, d, best_pred, variant)
-
-    return dst, map_
-
-
-def get_mixed_deltas_from_values8_rows(src: List[int], xdim: int, ydim: int, variant: int) -> list:
-    src_arr = np.asarray(src, dtype=np.int64)
-    dst, map_ = _mixed_deltas_from_values8_rows_core(src_arr, xdim, ydim, variant)
-    total = int(np.abs(dst).sum())
-    return [total, dst.tolist(), map_.tolist(), int(src_arr[0])]
-
-
-@njit
-def _values_from_mixed_deltas8_rows_core(src, xdim, ydim, init_value, map_, variant):
-    dst = np.zeros(xdim * ydim, dtype=np.int64)
-    dst[0] = init_value
-
-    for row in range(ydim):
-        p = map_[row] & 0x7
-        for col in range(xdim):
-            k = row * xdim + col
-            if k == 0:
-                continue
-            a = dst[k - 1] if col > 0 else 0
-            b = dst[k - xdim] if row > 0 else 0
-            c = dst[k - xdim - 1] if (row > 0 and col > 0) else 0
-            d = dst[k - xdim + 1] if (row > 0 and col < xdim - 1) else 0
-            dst[k] = src[k] + pred8(a, b, c, d, p, variant)
-    return dst
-
-
-def get_values_from_mixed_deltas8_rows(src, xdim: int, ydim: int,
-                                        init_value: int, map_, variant: int) -> List[int]:
-    return _values_from_mixed_deltas8_rows_core(_to_int64_array(src), xdim, ydim, init_value, _to_int64_array(map_), variant)
-
-
-# ---------------------------------------------------------------------------
-# Ideal delta helpers (pixel-map variants)
-# ---------------------------------------------------------------------------
-
-def get_ideal_deltas_from_values(src: List[int], xdim: int, ydim: int) -> list:
-    dst = [0] * (xdim * ydim)
-    map_ = [0] * (xdim * (ydim - 1))
-
-    init_value = src[0]
-    m = 0
-
-    for i in range(1, ydim - 1):
-        for j in range(xdim):
-            k = i * xdim + j
-            if j == 0:
-                map_[m] = 1 if (abs(src[k] - src[k - xdim]) <= abs(src[k] - src[k - xdim + 1])) else 3
-                m += 1
-            elif j < xdim - 1:
-                da = abs(src[k] - src[k - 1])
-                db = abs(src[k] - src[k - xdim])
-                dc = abs(src[k] - src[k - xdim - 1])
-                dd = abs(src[k] - src[k - xdim + 1])
-                if da <= db and da <= dc and da <= dd:
-                    map_[m] = 0
-                elif db <= dc and db <= dd:
-                    map_[m] = 1
-                elif dc <= dd:
-                    map_[m] = 2
-                else:
-                    map_[m] = 3
-                m += 1
-            else:
-                da = abs(src[k] - src[k - 1])
-                db = abs(src[k] - src[k - xdim])
-                dc = abs(src[k] - src[k - xdim - 1])
-                if da <= db and da <= dc:
-                    map_[m] = 0
-                elif db <= dc:
-                    map_[m] = 1
-                else:
-                    map_[m] = 2
-                m += 1
-
-    k = xdim * (ydim - 1)
-    for j in range(xdim):
-        if j == 0:
-            map_[m] = 1 if (abs(src[k] - src[k - xdim]) <= abs(src[k] - src[k - xdim + 1])) else 3
-            m += 1
-        elif j < xdim - 1:
-            da = abs(src[k] - src[k - 1])
-            db = abs(src[k] - src[k - xdim])
-            dc = abs(src[k] - src[k - xdim - 1])
-            dd = abs(src[k] - src[k - xdim + 1])
-            if da <= db and da <= dc and da <= dd:
-                map_[m] = 0
-            elif db <= dc and db <= dd:
-                map_[m] = 1
-            elif dc <= dd:
-                map_[m] = 2
-            else:
-                map_[m] = 3
-            m += 1
-        else:
-            da = abs(src[k] - src[k - 1])
-            db = abs(src[k] - src[k - xdim])
-            dc = abs(src[k] - src[k - xdim - 1])
-            if da <= db and da <= dc:
-                map_[m] = 0
-            elif db <= dc:
-                map_[m] = 1
-            else:
-                map_[m] = 2
-            m += 1
-        k += 1
-
-    k = 0
-    m = 0
-    delta = 0
-    for i in range(ydim):
-        if i == 0:
-            for j in range(xdim):
-                if j == 0:
-                    dst[k] = delta
-                    k += 1
-                else:
-                    delta = src[k] - src[k - 1]
-                    dst[k] = delta
-                    k += 1
-        else:
-            for j in range(xdim):
-                n = map_[m]
-                m += 1
-                if n == 0:
-                    delta = src[k] - src[k - 1]
-                elif n == 1:
-                    delta = src[k] - src[k - xdim]
-                elif n == 2:
-                    delta = src[k] - src[k - xdim - 1]
-                else:
-                    delta = src[k] - src[k - xdim + 1]
-                dst[k] = delta
-                k += 1
-
-    return [0, dst, map_, init_value]
-
-
-def get_values_from_ideal_deltas(src: List[int], xdim: int, ydim: int, init_value: int, map_: List[int]) -> List[int]:
-    dst = [0] * (xdim * ydim)
-    k = 0
-    dst[k] = init_value
-    k += 1
-
-    for i in range(1, xdim):
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-
-    m = 0
-    for i in range(1, ydim):
-        for j in range(xdim):
-            n = map_[m]
-            m += 1
-            if n == 0:
-                dst[k] = dst[k - 1] + src[k]
-            elif n == 1:
-                dst[k] = dst[k - xdim] + src[k]
-            elif n == 2:
-                dst[k] = dst[k - xdim - 1] + src[k]
-            else:
-                dst[k] = dst[k - xdim + 1] + src[k]
-            k += 1
-    return dst
-
-
-def get_ideal_deltas_from_values2(src: List[int], xdim: int, ydim: int) -> list:
-    dst = [0] * (xdim * ydim)
-    map_ = [0] * ((xdim - 2) * (ydim - 1))
-    init_value = src[0]
-
-    m = 0
-    for i in range(1, ydim - 1):
-        for j in range(1, xdim - 1):
-            k = i * xdim + j
-            map_[m] = 0 if (abs(src[k] - src[k - 1]) <= abs(src[k] - src[k - xdim])) else 1
-            m += 1
-
-    k = 0
-    m = 0
-    total_sum = 0
-    for i in range(ydim):
-        if i == 0:
-            dst[k] = 0
-            k += 1
-            for j in range(1, xdim):
-                delta = src[k] - src[k - 1]
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-        else:
-            delta = src[k] - src[k - xdim]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-            for j in range(1, xdim - 1):
-                n = map_[m]
-                m += 1
-                delta = (src[k] - src[k - 1]) if n == 0 else (src[k] - src[k - xdim])
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-            delta = src[k] - src[k - 1]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-
-    return [total_sum, dst, map_, init_value]
-
-
-def get_values_from_ideal_deltas2(src: List[int], xdim: int, ydim: int, init_value: int, map_: List[int]) -> List[int]:
-    dst = [0] * (xdim * ydim)
-    k = 0
-    dst[k] = init_value
-    k += 1
-    for i in range(1, xdim):
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-
-    m = 0
-    for i in range(1, ydim):
-        init_value += src[k]
-        dst[k] = init_value
-        k += 1
-        for j in range(1, xdim - 1):
-            n = map_[m]
-            m += 1
-            if n == 0:
-                dst[k] = dst[k - 1] + src[k]
-            elif n == 1:
-                dst[k] = dst[k - xdim] + src[k]
-            else:
-                dst[k] = jdiv(dst[k - 1] + dst[k - xdim], 2) + src[k]
-            k += 1
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-    return dst
-
-
-def get_ideal_deltas_from_values3(src: List[int], xdim: int, ydim: int) -> list:
-    dst = [0] * (xdim * ydim)
-    map_ = [0] * ((xdim - 2) * (ydim - 1))
-    init_value = src[0]
-
-    m = 0
-    for i in range(1, ydim - 1):
-        for j in range(1, xdim - 1):
-            k = i * xdim + j
-            delta = [
-                src[k] - src[k - 1],
-                src[k] - src[k - xdim],
-                src[k] - jdiv(src[k - 1] + src[k - xdim], 2),
-            ]
-            value = abs(delta[0])
-            index = 0
-            for n in range(1, 3):
-                if abs(delta[n]) < value:
-                    value = abs(delta[n])
-                    index = n
-            map_[m] = index
-            m += 1
-
-    k = 0
-    m = 0
-    total_sum = 0
-    for i in range(ydim):
-        if i == 0:
-            dst[k] = 0
-            k += 1
-            for j in range(1, xdim):
-                delta = src[k] - src[k - 1]
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-        else:
-            delta = src[k] - src[k - xdim]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-            for j in range(1, xdim - 1):
-                n = map_[m]
-                m += 1
-                if n == 0:
-                    delta = src[k] - src[k - 1]
-                elif n == 1:
-                    delta = src[k] - src[k - xdim]
-                else:
-                    delta = src[k] - jdiv(src[k - 1] + src[k - xdim], 2)
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-            delta = src[k] - src[k - 1]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-
-    return [total_sum, dst, map_, init_value]
-
-
-def get_values_from_ideal_deltas3(src: List[int], xdim: int, ydim: int, init_value: int, map_: List[int]) -> List[int]:
-    dst = [0] * (xdim * ydim)
-    k = 0
-    dst[k] = init_value
-    k += 1
-    for i in range(1, xdim):
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-
-    m = 0
-    for i in range(1, ydim):
-        init_value += src[k]
-        dst[k] = init_value
-        k += 1
-        for j in range(1, xdim - 1):
-            n = map_[m]
-            m += 1
-            if n == 0:
-                dst[k] = dst[k - 1] + src[k]
-            elif n == 1:
-                dst[k] = dst[k - xdim] + src[k]
-            else:
-                dst[k] = jdiv(dst[k - 1] + dst[k - xdim], 2) + src[k]
-            k += 1
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-    return dst
-
-
-def get_ideal_deltas_from_values4(src: List[int], xdim: int, ydim: int) -> list:
-    dst = [0] * (xdim * ydim)
-    map_ = [0] * ((xdim - 2) * (ydim - 1))
-    init_value = src[0]
-
-    m = 0
-    for i in range(1, ydim - 1):
-        for j in range(1, xdim - 1):
-            k = i * xdim + j
-            delta = [
-                src[k] - src[k - 1],
-                src[k] - src[k - xdim],
-                src[k] - jdiv(src[k - 1] + src[k - xdim], 2),
-                src[k] - jdiv(src[k - 1] + src[k - xdim + 1], 2),
-            ]
-            value = abs(delta[0])
-            index = 0
-            for n in range(1, 4):
-                if abs(delta[n]) < value:
-                    value = abs(delta[n])
-                    index = n
-            map_[m] = index
-            m += 1
-
-    k = 0
-    m = 0
-    total_sum = 0
-    for i in range(ydim):
-        if i == 0:
-            dst[k] = 0
-            k += 1
-            for j in range(1, xdim):
-                delta = src[k] - src[k - 1]
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-        else:
-            delta = src[k] - src[k - xdim]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-            for j in range(1, xdim - 1):
-                n = map_[m]
-                m += 1
-                if n == 0:
-                    delta = src[k] - src[k - 1]
-                elif n == 1:
-                    delta = src[k] - src[k - xdim]
-                elif n == 2:
-                    delta = src[k] - jdiv(src[k - 1] + src[k - xdim], 2)
-                else:
-                    delta = src[k] - jdiv(src[k - 1] + src[k - xdim + 1], 2)
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-            delta = src[k] - src[k - 1]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-
-    return [total_sum, dst, map_, init_value]
-
-
-def get_values_from_ideal_deltas4(src: List[int], xdim: int, ydim: int, init_value: int, map_: List[int]) -> List[int]:
-    dst = [0] * (xdim * ydim)
-    k = 0
-    dst[k] = init_value
-    k += 1
-    for i in range(1, xdim):
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-
-    m = 0
-    for i in range(1, ydim):
-        init_value += src[k]
-        dst[k] = init_value
-        k += 1
-        for j in range(1, xdim - 1):
-            n = map_[m]
-            m += 1
-            if n == 0:
-                dst[k] = dst[k - 1] + src[k]
-            elif n == 1:
-                dst[k] = dst[k - xdim] + src[k]
-            elif n == 2:
-                dst[k] = jdiv(dst[k - 1] + dst[k - xdim], 2) + src[k]
-            else:
-                dst[k] = jdiv(dst[k - 1] + dst[k - xdim + 1], 2) + src[k]
-            k += 1
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-    return dst
-
-
-def get_ideal_deltas_from_values5(src: List[int], xdim: int, ydim: int) -> list:
-    dst = [0] * (xdim * ydim)
-    map_ = [0] * ((xdim - 2) * (ydim - 1))
-    init_value = src[0]
-
-    m = 0
-    for i in range(1, ydim - 1):
-        for j in range(1, xdim - 1):
-            k = i * xdim + j
-            delta = [
-                src[k] - src[k - 1],
-                src[k] - src[k - xdim],
-                src[k] - src[k - xdim - 1],
-                src[k] - jdiv(src[k - 1] + src[k - xdim], 2),
-                src[k] - jdiv(src[k - 1] + src[k - xdim + 1], 2),
-            ]
-            value = abs(delta[0])
-            index = 0
-            for n in range(1, 5):
-                if abs(delta[n]) < value:
-                    value = abs(delta[n])
-                    index = n
-            map_[m] = index
-            m += 1
-
-    k = 0
-    m = 0
-    total_sum = 0
-    for i in range(ydim):
-        if i == 0:
-            dst[k] = 0
-            k += 1
-            for j in range(1, xdim):
-                delta = src[k] - src[k - 1]
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-        else:
-            delta = src[k] - src[k - xdim]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-            for j in range(1, xdim - 1):
-                n = map_[m]
-                m += 1
-                if n == 0:
-                    delta = src[k] - src[k - 1]
-                elif n == 1:
-                    delta = src[k] - src[k - xdim]
-                elif n == 2:
-                    delta = src[k] - src[k - xdim - 1]
-                elif n == 3:
-                    delta = src[k] - jdiv(src[k - 1] + src[k - xdim], 2)
-                else:
-                    delta = src[k] - jdiv(src[k - 1] + src[k - xdim + 1], 2)
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-            delta = src[k] - src[k - 1]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-
-    return [total_sum, dst, map_, init_value]
-
-
-def get_values_from_ideal_deltas5(src: List[int], xdim: int, ydim: int, init_value: int, map_: List[int]) -> List[int]:
-    dst = [0] * (xdim * ydim)
-    k = 0
-    dst[k] = init_value
-    k += 1
-    for i in range(1, xdim):
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-
-    m = 0
-    for i in range(1, ydim):
-        init_value += src[k]
-        dst[k] = init_value
-        k += 1
-        for j in range(1, xdim - 1):
-            n = map_[m]
-            m += 1
-            if n == 0:
-                dst[k] = dst[k - 1] + src[k]
-            elif n == 1:
-                dst[k] = dst[k - xdim] + src[k]
-            elif n == 2:
-                dst[k] = dst[k - xdim - 1] + src[k]
-            elif n == 3:
-                dst[k] = jdiv(dst[k - 1] + dst[k - xdim], 2) + src[k]
-            else:
-                dst[k] = jdiv(dst[k - 1] + dst[k - xdim + 1], 2) + src[k]
-            k += 1
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-    return dst
-
-
-def get_ideal_deltas_from_values6(src: List[int], xdim: int, ydim: int) -> list:
-    dst = [0] * (xdim * ydim)
-    map_ = [0] * ((xdim - 2) * (ydim - 1))
-    init_value = src[0]
-
-    m = 0
-    for i in range(1, ydim - 1):
-        for j in range(1, xdim - 1):
-            k = i * xdim + j
-            delta = [
-                float(abs(src[k] - src[k - 1])),
-                float(abs(src[k] - jdiv(src[k - 1] + src[k - xdim - 1], 2))),
-                float(abs(src[k] - src[k - xdim - 1])),
-                float(abs(src[k] - jdiv(src[k - xdim - 1] + src[k - xdim + 1], 2))),
-                float(abs(src[k] - src[k - xdim + 1])),
-                float(abs(src[k] - jdiv(src[k - 1] + src[k - xdim + 1], 2))),
-            ]
-
-            addend = 0.00000001
-            delta_table = {}
-            key_list = []
-            key_list.append(delta[0])
-            delta_table[delta[0]] = 0
-            for kk in range(1, 6):
-                if delta[kk] in key_list:
-                    delta[kk] += addend
-                    addend *= 2.0
-                key_list.append(delta[kk])
-                delta_table[delta[kk]] = kk
-            key_list.sort()
-            map_[m] = delta_table[key_list[0]]
-            m += 1
-
-    k = 0
-    m = 0
-    total_sum = 0
-    for i in range(ydim):
-        if i == 0:
-            dst[k] = 0
-            k += 1
-            for j in range(1, xdim):
-                delta = src[k] - src[k - 1]
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-        else:
-            delta = src[k] - src[k - xdim]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-            for j in range(1, xdim - 1):
-                n = map_[m]
-                m += 1
-                if n == 0:
-                    delta = src[k] - src[k - 1]
-                elif n == 1:
-                    delta = src[k] - jdiv(src[k - 1] + src[k - xdim - 1], 2)
-                elif n == 2:
-                    delta = src[k] - src[k - xdim - 1]
-                elif n == 3:
-                    delta = src[k] - jdiv(src[k - xdim - 1] + src[k - xdim + 1], 2)
-                elif n == 4:
-                    delta = src[k] - src[k - xdim + 1]
-                else:
-                    delta = src[k] - jdiv(src[k - 1] + src[k - xdim + 1], 2)
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-            delta = src[k] - src[k - 1]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-
-    return [total_sum, dst, map_, init_value]
-
-
-def get_values_from_ideal_deltas6(src: List[int], xdim: int, ydim: int, init_value: int, map_: List[int]) -> List[int]:
-    dst = [0] * (xdim * ydim)
-    k = 0
-    dst[k] = init_value
-    k += 1
-    for i in range(1, xdim):
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-
-    m = 0
-    for i in range(1, ydim):
-        init_value += src[k]
-        dst[k] = init_value
-        k += 1
-        for j in range(1, xdim - 1):
-            n = map_[m]
-            m += 1
-            if n == 0:
-                dst[k] = dst[k - 1] + src[k]
-            elif n == 1:
-                dst[k] = jdiv(dst[k - 1] + dst[k - xdim - 1], 2) + src[k]
-            elif n == 2:
-                dst[k] = dst[k - xdim - 1] + src[k]
-            elif n == 3:
-                dst[k] = jdiv(dst[k - xdim - 1] + dst[k - xdim + 1], 2) + src[k]
-            elif n == 4:
-                dst[k] = dst[k - xdim + 1] + src[k]
-            else:
-                dst[k] = jdiv(dst[k - 1] + dst[k - xdim + 1], 2) + src[k]
-            k += 1
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-    return dst
-
-
-def get_ideal_deltas_from_values8(src: List[int], xdim: int, ydim: int) -> list:
-    dst = [0] * (xdim * ydim)
-    map_ = [0] * ((xdim - 2) * (ydim - 1))
-    init_value = src[0]
-
-    m = 0
-    for i in range(1, ydim - 1):
-        for j in range(1, xdim - 1):
-            k = i * xdim + j
-            delta = [
-                float(abs(src[k] - src[k - 1])),
-                float(abs(src[k] - jdiv(src[k - 1] + src[k - xdim - 1], 2))),
-                float(abs(src[k] - src[k - xdim - 1])),
-                float(abs(src[k] - jdiv(src[k - xdim - 1] + src[k - xdim], 2))),
-                float(abs(src[k] - src[k - xdim])),
-                float(abs(src[k] - jdiv(src[k - xdim] + src[k - xdim + 1], 2))),
-                float(abs(src[k] - src[k - xdim + 1])),
-                float(abs(src[k] - jdiv(src[k - xdim + 1] + src[k - 1], 2))),
-            ]
-
-            addend = 0.00000001
-            delta_table = {}
-            key_list = []
-            key_list.append(delta[0])
-            delta_table[delta[0]] = 0
-            for kk in range(1, 8):
-                if delta[kk] in key_list:
-                    delta[kk] += addend
-                    addend *= 2.0
-                key_list.append(delta[kk])
-                delta_table[delta[kk]] = kk
-            key_list.sort()
-            map_[m] = delta_table[key_list[0]]
-            m += 1
-
-    k = 0
-    m = 0
-    total_sum = 0
-    for i in range(ydim):
-        if i == 0:
-            dst[k] = 0
-            k += 1
-            for j in range(1, xdim):
-                delta = src[k] - src[k - 1]
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-        else:
-            delta = src[k] - src[k - xdim]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-            for j in range(1, xdim - 1):
-                n = map_[m]
-                m += 1
-                if n == 0:
-                    delta = src[k] - src[k - 1]
-                elif n == 1:
-                    delta = src[k] - jdiv(src[k - 1] + src[k - xdim - 1], 2)
-                elif n == 2:
-                    delta = src[k] - src[k - xdim - 1]
-                elif n == 3:
-                    delta = src[k] - jdiv(src[k - xdim - 1] + src[k - xdim], 2)
-                elif n == 4:
-                    delta = src[k] - src[k - xdim]
-                elif n == 5:
-                    delta = src[k] - jdiv(src[k - xdim] + src[k - xdim + 1], 2)
-                elif n == 6:
-                    delta = src[k] - src[k - xdim + 1]
-                else:
-                    delta = src[k] - jdiv(src[k - xdim + 1] + src[k - 1], 2)
-                dst[k] = delta
-                k += 1
-                total_sum += abs(delta)
-            delta = src[k] - src[k - 1]
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-
-    return [total_sum, dst, map_, init_value]
-
-
-def get_values_from_ideal_deltas8(src: List[int], xdim: int, ydim: int, init_value: int, map_: List[int]) -> List[int]:
-    dst = [0] * (xdim * ydim)
-    k = 0
-    dst[k] = init_value
-    k += 1
-    for i in range(1, xdim):
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-
-    m = 0
-    for i in range(1, ydim):
-        init_value += src[k]
-        dst[k] = init_value
-        k += 1
-        for j in range(1, xdim - 1):
-            n = map_[m]
-            m += 1
-            if n == 0:
-                dst[k] = dst[k - 1] + src[k]
-            elif n == 1:
-                dst[k] = jdiv(dst[k - 1] + dst[k - xdim - 1], 2) + src[k]
-            elif n == 2:
-                dst[k] = dst[k - xdim - 1] + src[k]
-            elif n == 3:
-                dst[k] = jdiv(dst[k - xdim - 1] + dst[k - xdim], 2) + src[k]
-            elif n == 4:
-                dst[k] = dst[k - xdim] + src[k]
-            elif n == 5:
-                dst[k] = jdiv(dst[k - xdim] + dst[k - xdim + 1], 2) + src[k]
-            elif n == 6:
-                dst[k] = dst[k - xdim + 1] + src[k]
-            else:
-                dst[k] = jdiv(dst[k - xdim + 1] + dst[k - 1], 2) + src[k]
-            k += 1
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-    return dst
-
-
-# ---------------------------------------------------------------------------
-# 16-option ideal delta encoder/decoder -- all predictors are causal.
-#
-# Predictor set (a=left, b=above, c=above-left, d=above-right):
-#
-#   0  a                    8  (a+b)>>1
-#   1  c                    9  (c+d)>>1
-#   2  b                   10  (a+b+c+d)>>2
-#   3  d                   11  MED(a,b,c)
-#   4  (a+c)>>1            12  (a+b+c)>>2
-#   5  (c+b)>>1            13  (a+b+d)>>2
-#   6  (b+d)>>1            14  (a+c+d)>>2
-#   7  (d+a)>>1            15  (b+c+d)>>2
-#
-# Map covers rows 1..ydim-1, cols 1..xdim-2.
-# Map entries stored as raw ints (value 0-15).
-# ---------------------------------------------------------------------------
-
-def get_ideal_deltas_from_values16(src: List[int], xdim: int, ydim: int) -> list:
-    dst = [0] * (xdim * ydim)
-    map_ = [0] * ((xdim - 2) * (ydim - 1))
-    init_value = src[0]
-    total_sum = 0
-    m = 0
-
-    # Pass 1: choose best of 16 causal predictors for each map pixel.
-    for i in range(1, ydim):
-        for j in range(1, xdim - 1):
-            k = i * xdim + j
-            a = src[k - 1]
-            b = src[k - xdim]
-            c = src[k - xdim - 1]
-            d = src[k - xdim + 1]
-            e = src[k]
-
-            if c >= max(a, b):
-                med = min(a, b)
-            elif c <= min(a, b):
-                med = max(a, b)
-            else:
-                med = a + b - c
-
-            pred = [
-                a, c, b, d,
-                (a + c) >> 1, (c + b) >> 1, (b + d) >> 1, (d + a) >> 1,
-                (a + b) >> 1, (c + d) >> 1,
-                (a + b + c + d) >> 2, med,
-                (a + b + c) >> 2, (a + b + d) >> 2, (a + c + d) >> 2, (b + c + d) >> 2,
-            ]
-
-            best_abs = None
-            best_idx = 0
-            for n in range(16):
-                abs_delta = abs(e - pred[n])
-                if best_abs is None or abs_delta < best_abs:
-                    best_abs = abs_delta
-                    best_idx = n
-            map_[m] = best_idx
-            m += 1
-
-    # Pass 2: compute deltas.
-    k = 0
-    m = 0
-
-    # Row 0: horizontal deltas.
-    dst[k] = 0
-    k += 1
-    for j in range(1, xdim):
-        delta = src[k] - src[k - 1]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-    # Rows 1..ydim-1: col 0 vertical, interior map-driven, last col horizontal.
-    for i in range(1, ydim):
-        delta = src[k] - src[k - xdim]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-        for j in range(1, xdim - 1):
-            n = map_[m] & 0xFF
-            m += 1
-            a = src[k - 1]
-            b = src[k - xdim]
-            c = src[k - xdim - 1]
-            d = src[k - xdim + 1]
-
-            if c >= max(a, b):
-                med = min(a, b)
-            elif c <= min(a, b):
-                med = max(a, b)
-            else:
-                med = a + b - c
-
-            if n == 0:
-                pred_val = a
-            elif n == 1:
-                pred_val = c
-            elif n == 2:
-                pred_val = b
-            elif n == 3:
-                pred_val = d
-            elif n == 4:
-                pred_val = (a + c) >> 1
-            elif n == 5:
-                pred_val = (c + b) >> 1
-            elif n == 6:
-                pred_val = (b + d) >> 1
-            elif n == 7:
-                pred_val = (d + a) >> 1
-            elif n == 8:
-                pred_val = (a + b) >> 1
-            elif n == 9:
-                pred_val = (c + d) >> 1
-            elif n == 10:
-                pred_val = (a + b + c + d) >> 2
-            elif n == 11:
-                pred_val = med
-            elif n == 12:
-                pred_val = (a + b + c) >> 2
-            elif n == 13:
-                pred_val = (a + b + d) >> 2
-            elif n == 14:
-                pred_val = (a + c + d) >> 2
-            else:
-                pred_val = (b + c + d) >> 2  # 15
-
-            delta = src[k] - pred_val
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-
-        delta2 = src[k] - src[k - 1]
-        dst[k] = delta2
-        k += 1
-        total_sum += abs(delta2)
-
-    return [total_sum, dst, map_, init_value]
-
-
-def get_values_from_ideal_deltas16(src: List[int], xdim: int, ydim: int, init_value: int, map_: List[int]) -> List[int]:
-    dst = [0] * (xdim * ydim)
-    k = 0
-    m = 0
-
-    dst[k] = init_value
-    k += 1
-    for j in range(1, xdim):
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-
-    for i in range(1, ydim):
-        dst[k] = dst[k - xdim] + src[k]
-        k += 1
-
-        for j in range(1, xdim - 1):
-            n = map_[m] & 0xFF
-            m += 1
-            a = dst[k - 1]
-            b = dst[k - xdim]
-            c = dst[k - xdim - 1]
-            d = dst[k - xdim + 1]
-
-            if c >= max(a, b):
-                med = min(a, b)
-            elif c <= min(a, b):
-                med = max(a, b)
-            else:
-                med = a + b - c
-
-            if n == 0:
-                pred_val = a
-            elif n == 1:
-                pred_val = c
-            elif n == 2:
-                pred_val = b
-            elif n == 3:
-                pred_val = d
-            elif n == 4:
-                pred_val = (a + c) >> 1
-            elif n == 5:
-                pred_val = (c + b) >> 1
-            elif n == 6:
-                pred_val = (b + d) >> 1
-            elif n == 7:
-                pred_val = (d + a) >> 1
-            elif n == 8:
-                pred_val = (a + b) >> 1
-            elif n == 9:
-                pred_val = (c + d) >> 1
-            elif n == 10:
-                pred_val = (a + b + c + d) >> 2
-            elif n == 11:
-                pred_val = med
-            elif n == 12:
-                pred_val = (a + b + c) >> 2
-            elif n == 13:
-                pred_val = (a + b + d) >> 2
-            elif n == 14:
-                pred_val = (a + c + d) >> 2
-            else:
-                pred_val = (b + c + d) >> 2  # 15
-
-            dst[k] = pred_val + src[k]
-            k += 1
-
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-
-    return dst
-
-
-# ---------------------------------------------------------------------------
-# Adaptive predictor -- no map, deterministic from causal neighbors.
-# ---------------------------------------------------------------------------
-
-@njit
-def _adaptive_pred(a: int, b: int, c: int, d: int) -> int:
-    pa = abs(b - c)  # vertical gradient at above-left corner
-    pb = abs(a - c)  # horizontal gradient at above-left corner
-    if pb > pa * 2:
-        return a  # strong horizontal edge -> left
-    if pa > pb * 2:
-        return b  # strong vertical edge -> above
+def _med(a, b, c):
     if c >= max(a, b):
         return min(a, b)
     if c <= min(a, b):
@@ -3732,377 +228,995 @@ def _adaptive_pred(a: int, b: int, c: int, d: int) -> int:
 
 
 @njit
-def _adaptive_deltas_from_values_core(src, xdim, ydim):
-    dst = np.zeros(xdim * ydim, dtype=np.int64)
-    total_sum = 0
-    k = 0
-
-    dst[k] = 0
-    k += 1
-    for j in range(1, xdim):
-        delta = src[k] - src[k - 1]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-    for i in range(1, ydim):
-        delta = src[k] - src[k - xdim]
-        dst[k] = delta
-        k += 1
-        total_sum += abs(delta)
-
-        for j in range(1, xdim - 1):
-            a = src[k - 1]
-            b = src[k - xdim]
-            c = src[k - xdim - 1]
-            d = src[k - xdim + 1]
-            delta = src[k] - _adaptive_pred(a, b, c, d)
-            dst[k] = delta
-            k += 1
-            total_sum += abs(delta)
-
-        delta2 = src[k] - src[k - 1]
-        dst[k] = delta2
-        k += 1
-        total_sum += abs(delta2)
-
-    return total_sum, dst
-
-
-def get_adaptive_deltas_from_values(src: List[int], xdim: int, ydim: int) -> list:
-    src_arr = np.asarray(src, dtype=np.int64)
-    total_sum, dst = _adaptive_deltas_from_values_core(src_arr, xdim, ydim)
-    return [int(total_sum), dst.tolist(), int(src_arr[0])]
+def _directional(a, b, c, d):
+    h = abs(b - c) + abs(b - d)
+    v = abs(a - c) + abs(a - b)
+    dl = abs(c - d)
+    dr = abs(a - d)
+    if h >= v and h >= dl and h >= dr:
+        return b
+    if v >= dl and v >= dr:
+        return a
+    if dl >= dr:
+        return d
+    return c
 
 
 @njit
-def get_values_from_adaptive_deltas(src, xdim: int, ydim: int, init_value: int) -> List[int]:
-    src = np.asarray(src, dtype=np.int64)
+def _adaptive_pred(a, b, c, d):
+    pa = abs(b - c)
+    pb = abs(a - c)
+    if pb > pa * 2:
+        return a
+    if pa > pb * 2:
+        return b
+    return _med(a, b, c)
+
+
+@njit
+def _pred16(a, b, c, d, p):
+    if p == 0: return a
+    if p == 1: return b
+    if p == 2: return c
+    if p == 3: return d
+    if p == 4: return (a + b) >> 1
+    if p == 5: return (b + c) >> 1
+    if p == 6: return (a + c) >> 1
+    if p == 7: return (b + d) >> 1
+    if p == 8: return (c + d) >> 1
+    if p == 9: return (a + b + c + d + 2) >> 2
+    if p == 10: return a + b - c
+    if p == 11: return _med(a, b, c)
+    if p == 12: return (a * 3 + b + 2) >> 2
+    if p == 13: return (a + b * 3 + 2) >> 2
+    if p == 14: return (a * 3 + d + 2) >> 2
+    if p == 15: return (b * 3 + a + 2) >> 2
+    return a
+
+
+FILTER_SETS_8 = np.array([[0, 1, 2, 3, 4, 10, 9, 5],
+                          [0, 1, 4, 9, 10, 11, 12, 13],
+                          [0, 1, 4, 9, 10, 11, 12, 7]], dtype=np.int64)
+
+
+@njit
+def _block_predictor(p, a, b, c, d):
+    if p < 16: return _pred16(a, b, c, d, p)
+    if p == 16: return (a + d) >> 1
+    if p == 17: return a + ((b - c) >> 1)
+    if p == 18: return b + ((a - c) >> 1)
+    if p == 19: return a + d - b
+    if p == 20: return jdiv(a + b + d + 1, 3)
+    return b + ((d - c) >> 1)
+
+
+@njit
+def _set_predictor(entry, a, b, c, d):
+    if entry < 32:
+        return _block_predictor(entry, a, b, c, d)
+    return (_block_predictor(entry // 32 - 1, a, b, c, d) + _block_predictor(entry % 32, a, b, c, d) + 1) >> 1
+
+
+# =============================================================================
+# Delta types 0-5 (no map)
+# =============================================================================
+
+@njit
+def _horizontal(src, xdim, ydim):
     dst = np.zeros(xdim * ydim, dtype=np.int64)
+    init = src[0]
+    value = init
     k = 0
-
-    dst[k] = init_value
-    k += 1
-    for j in range(1, xdim):
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-
-    for i in range(1, ydim):
-        dst[k] = dst[k - xdim] + src[k]
-        k += 1
-
-        for j in range(1, xdim - 1):
-            a = dst[k - 1]
-            b = dst[k - xdim]
-            c = dst[k - xdim - 1]
-            d = dst[k - xdim + 1]
-            dst[k] = _adaptive_pred(a, b, c, d) + src[k]
+    for i in range(ydim):
+        if i == 0:
+            dst[k] = 0
             k += 1
-
-        dst[k] = dst[k - 1] + src[k]
-        k += 1
-
+        else:
+            delta = src[k] - init
+            dst[k] = delta
+            k += 1
+            init += delta
+            value = init
+        for j in range(1, xdim):
+            delta = src[k] - value
+            value += delta
+            dst[k] = delta
+            k += 1
     return dst
 
 
 @njit
-def _adaptive_frequency_core(src, xdim, ydim):
-    n = xdim * ydim - 1
-    delta_list = np.empty(n, dtype=np.int64)
-    idx = 0
-    k = 1  # skip pixel 0 (delta = 0)
-
-    for j in range(1, xdim):
-        delta_list[idx] = src[k] - src[k - 1]
-        idx += 1
-        k += 1
-
-    for i in range(1, ydim):
-        delta_list[idx] = src[k] - src[k - xdim]
-        idx += 1
-        k += 1
-        for j in range(1, xdim - 1):
-            a = src[k - 1]
-            b = src[k - xdim]
-            c = src[k - xdim - 1]
-            d = src[k - xdim + 1]
-            delta_list[idx] = src[k] - _adaptive_pred(a, b, c, d)
-            idx += 1
-            k += 1
-        delta_list[idx] = src[k] - src[k - 1]
-        idx += 1
-        k += 1
-
-    mn = delta_list.min()
-    mx = delta_list.max()
-    freq = np.zeros(mx - mn + 1, dtype=np.int64)
-    for i in range(n):
-        freq[delta_list[i] - mn] += 1
-    return freq
-
-
-def get_adaptive_frequency(src: List[int], xdim: int, ydim: int) -> List[int]:
-    src_arr = np.asarray(src, dtype=np.int64)
-    return _adaptive_frequency_core(src_arr, xdim, ydim).tolist()
-
-
-# ---------------------------------------------------------------------------
-# Delta list utilities
-# ---------------------------------------------------------------------------
-
-def get_delta_list_from_values(src: List[int], xdim: int, ydim: int) -> list:
-    delta_list = []
-
+def _from_horizontal(src, xdim, ydim, init):
+    dst = np.zeros(xdim * ydim, dtype=np.int64)
     k = 0
+    value = init
     for i in range(ydim):
-        for j in range(xdim):
-            if i == 0 or i == ydim - 1:
-                size = 3 if (j == 0 or j == xdim - 1) else 5
-            else:
-                size = 5 if (j == 0 or j == xdim - 1) else 8
-
-            value = [0] * size
-            location = [0] * size
-
-            if i == 0:
-                if j == 0:
-                    value[0] = src[k] - src[k + 1]; location[0] = 4
-                    value[1] = src[k + xdim];       location[1] = 6
-                    value[2] = src[k + xdim + 1];   location[2] = 7
-                elif j == xdim - 1:
-                    value[0] = src[k] - src[k - 1];     location[0] = 3
-                    value[1] = src[k + xdim - 1];       location[1] = 5
-                    value[2] = src[k + xdim];           location[2] = 6
-                else:
-                    value[0] = src[k] - src[k - 1];       location[0] = 3
-                    value[1] = src[k] - src[k + 1];       location[1] = 4
-                    value[2] = src[k] - src[k + xdim - 1]; location[2] = 5
-                    value[3] = src[k] - src[k + xdim];     location[3] = 6
-                    value[4] = src[k] - src[k + xdim + 1]; location[4] = 7
-            elif i == ydim - 1:
-                if j == 0:
-                    value[0] = src[k] - src[k - xdim];   location[0] = 1
-                    value[1] = src[k - xdim + 1];        location[1] = 2
-                    value[2] = src[k + 1];                location[2] = 4
-                elif j == xdim - 1:
-                    value[0] = src[k] - src[k - xdim - 1]; location[0] = 0
-                    value[1] = src[k - xdim];              location[1] = 1
-                    value[2] = src[k - 1];                  location[2] = 3
-                else:
-                    value[0] = src[k] - src[k - xdim - 1]; location[0] = 0
-                    value[1] = src[k] - src[k - xdim];     location[1] = 1
-                    value[2] = src[k] - src[k - xdim + 1]; location[2] = 2
-                    value[3] = src[k] - src[k - 1];        location[3] = 3
-                    value[4] = src[k] - src[k + 1];        location[4] = 4
-            else:
-                if j == 0:
-                    value[0] = src[k] - src[k - xdim];      location[0] = 1
-                    value[1] = src[k] - src[k - xdim + 1];  location[1] = 2
-                    value[2] = src[k] - src[k + 1];         location[2] = 4
-                    value[3] = src[k] - src[k + xdim];      location[3] = 6
-                    value[4] = src[k] - src[k + xdim + 1];  location[4] = 7
-                elif j == xdim - 1:
-                    value[0] = src[k] - src[k - xdim - 1];  location[0] = 0
-                    value[1] = src[k] - src[k - xdim];      location[1] = 1
-                    value[2] = src[k] - src[k - 1];         location[2] = 3
-                    value[3] = src[k] - src[k + xdim - 1];  location[3] = 5
-                    value[4] = src[k] - src[k + xdim];      location[4] = 6
-                else:
-                    value[0] = src[k] - src[k - xdim - 1];  location[0] = 0
-                    value[1] = src[k] - src[k - xdim];      location[1] = 1
-                    value[2] = src[k] - src[k - xdim + 1];  location[2] = 2
-                    value[3] = src[k] - src[k - 1];         location[3] = 3
-                    value[4] = src[k] - src[k + 1];         location[4] = 4
-                    value[5] = src[k] - src[k + xdim - 1];  location[5] = 5
-                    value[6] = src[k] - src[k + xdim];      location[6] = 6
-                    value[7] = src[k] - src[k + xdim + 1];  location[7] = 7
-
-            delta = [float(abs(value[m])) for m in range(size)]
-
-            addend = 0.00000001
-            delta_table = {}
-            key_list = []
-
-            for m in range(size):
-                if delta[m] in key_list:
-                    delta[m] += addend
-                    addend *= 2
-                key_list.append(delta[m])
-                delta_table[delta[m]] = [value[m], location[m]]
-
-            key_list.sort()
-            table = [[0, 0] for _ in range(size)]
-            for m in range(size):
-                key = key_list[m]
-                current = delta_table[key]
-                table[m][0] = current[0]
-                table[m][1] = current[1]
-
-            delta_list.append(table)
+        if i != 0:
+            value += src[k]
+        cur = value
+        dst[k] = cur
+        k += 1
+        for j in range(1, xdim):
+            cur += src[k]
+            dst[k] = cur
             k += 1
-
-    return delta_list
-
-
-def get_ideal_deltas_from_list(delta_list: list) -> List[int]:
-    ideal_delta = [0] * len(delta_list)
-    for i in range(len(delta_list)):
-        table = delta_list[i]
-        ideal_delta[i] = table[0][0]
-    return ideal_delta
+    return dst
 
 
-def get_ideal_delta_sum(delta_list: list) -> int:
-    total = 0
-    for i in range(len(delta_list)):
-        table = delta_list[i]
-        total += abs(table[0][0])
-    return total
+@njit
+def _vertical(src, xdim, ydim):
+    dst = np.zeros(xdim * ydim, dtype=np.int64)
+    value = src[0]
+    for x in range(1, xdim):
+        dst[x] = src[x] - value
+        value = src[x]
+    for k in range(xdim, xdim * ydim):
+        dst[k] = src[k] - src[k - xdim]
+    return dst
 
 
-def get_worstl_delta_sum(delta_list: list) -> int:
-    total = 0
-    for i in range(len(delta_list)):
-        table = delta_list[i]
-        total += abs(table[len(table) - 1][0])
-    return total
+@njit
+def _from_vertical(src, xdim, ydim, init):
+    dst = np.zeros(xdim * ydim, dtype=np.int64)
+    dst[0] = init
+    value = init
+    for i in range(1, xdim):
+        value += src[i]
+        dst[i] = value
+    for k in range(xdim, xdim * ydim):
+        dst[k] = dst[k - xdim] + src[k]
+    return dst
 
 
-# ---------------------------------------------------------------------------
-# Spatial helpers
-# ---------------------------------------------------------------------------
+@njit
+def _average(src, xdim, ydim):
+    dst = np.zeros(xdim * ydim, dtype=np.int64)
+    for k in range(1, xdim):
+        dst[k] = src[k] - src[k - 1]
+    for i in range(1, ydim):
+        k = i * xdim
+        dst[k] = src[k] - src[k - xdim]
+        for j in range(1, xdim):
+            k = i * xdim + j
+            dst[k] = src[k] - jdiv(src[k - 1] + src[k - xdim], 2)
+    return dst
 
-def get_neighbors(src: List[int], x: int, y: int, xdim: int, ydim: int) -> List[int]:
-    neighbors = []
-    if y > 0:
-        if x > 0:
-            neighbors.append(src[(y - 1) * xdim + x - 1])
-        neighbors.append(src[(y - 1) * xdim + x])
-        if x < xdim - 1:
-            neighbors.append(src[(y - 1) * xdim + x + 1])
+
+@njit
+def _from_average(src, xdim, ydim, init):
+    dst = np.zeros(xdim * ydim, dtype=np.int64)
+    dst[0] = init
+    for k in range(1, xdim):
+        dst[k] = dst[k - 1] + src[k]
+    for i in range(1, ydim):
+        k = i * xdim
+        dst[k] = dst[k - xdim] + src[k]
+        for j in range(1, xdim):
+            k = i * xdim + j
+            dst[k] = jdiv(dst[k - 1] + dst[k - xdim], 2) + src[k]
+    return dst
+
+
+@njit
+def _neighbour_deltas(src, xdim, ydim, kind):
+    """MED (kind 3), directional (4) and adaptive (5): row 0 horizontal,
+    column 0 vertical; the last column is MED (4), horizontal (5), or the
+    predictor itself (3)."""
+    dst = np.zeros(xdim * ydim, dtype=np.int64)
+    for k in range(1, xdim):
+        dst[k] = src[k] - src[k - 1]
+    for i in range(1, ydim):
+        k = i * xdim
+        dst[k] = src[k] - src[k - xdim]
+        last = xdim if kind == 3 else xdim - 1
+        for j in range(1, last):
+            k = i * xdim + j
+            a = src[k - 1]; b = src[k - xdim]; c = src[k - xdim - 1]
+            if kind == 3:
+                p = _med(a, b, c)
+            elif kind == 4:
+                p = _directional(a, b, c, src[k - xdim + 1])
+            else:
+                p = _adaptive_pred(a, b, c, src[k - xdim + 1])
+            dst[k] = src[k] - p
+        if kind != 3:
+            k = i * xdim + xdim - 1
+            if kind == 4:
+                dst[k] = src[k] - _med(src[k - 1], src[k - xdim], src[k - xdim - 1])
+            else:
+                dst[k] = src[k] - src[k - 1]
+    return dst
+
+
+@njit
+def _from_neighbour_deltas(src, xdim, ydim, init, kind):
+    dst = np.zeros(xdim * ydim, dtype=np.int64)
+    dst[0] = init
+    for k in range(1, xdim):
+        dst[k] = dst[k - 1] + src[k]
+    for i in range(1, ydim):
+        k = i * xdim
+        dst[k] = dst[k - xdim] + src[k]
+        last = xdim if kind == 3 else xdim - 1
+        for j in range(1, last):
+            k = i * xdim + j
+            a = dst[k - 1]; b = dst[k - xdim]; c = dst[k - xdim - 1]
+            if kind == 3:
+                p = _med(a, b, c)
+            elif kind == 4:
+                p = _directional(a, b, c, dst[k - xdim + 1])
+            else:
+                p = _adaptive_pred(a, b, c, dst[k - xdim + 1])
+            dst[k] = p + src[k]
+        if kind != 3:
+            k = i * xdim + xdim - 1
+            if kind == 4:
+                dst[k] = _med(dst[k - 1], dst[k - xdim], dst[k - xdim - 1]) + src[k]
+            else:
+                dst[k] = dst[k - 1] + src[k]
+    return dst
+
+
+# =============================================================================
+# Scanline (1), (2), (3): one of four predictors per row
+# =============================================================================
+
+@njit
+def _row_limit(row):
+    lo = row.min()
+    hi = row.max()
+    freq = np.zeros(hi - lo + 1, dtype=np.int64)
+    for v in row:
+        freq[v - lo] += 1
+    return int(math.floor(_shannon_limit(freq)))
+
+
+@njit
+def _scanline_pred(src, k, xdim, m, kind):
+    """Row predictor m of scanline (1) (kind 1: left, above, average, MED)
+    or scanline (3) (kind 3: left, average, MED, directional)."""
+    a = src[k - 1]; b = src[k - xdim]
+    if kind == 1:
+        if m == 0: return a
+        if m == 1: return b
+        if m == 2: return jdiv(a + b, 2)
+        return _med(a, b, src[k - xdim - 1])
+    if m == 0: return a
+    if m == 1: return jdiv(a + b, 2)
+    if m == 2: return _med(a, b, src[k - xdim - 1])
+    return _directional(a, b, src[k - xdim - 1], src[k - xdim + 1])
+
+
+@njit
+def _scanline13(src, xdim, ydim, kind):
+    n = xdim - 2
+    mp = np.zeros(ydim - 1, dtype=np.uint8)
+    row = np.zeros(n, dtype=np.int64)
+    for i in range(1, ydim):
+        best = 0
+        best_limit = 0
+        for m in range(4):
+            for j in range(1, xdim - 1):
+                k = i * xdim + j
+                row[j - 1] = src[k] - _scanline_pred(src, k, xdim, m, kind)
+            limit = _row_limit(row)
+            if m == 0 or limit < best_limit:
+                best_limit = limit
+                best = m
+        mp[i - 1] = best
+    dst = np.zeros(xdim * ydim, dtype=np.int64)
+    for k in range(1, xdim):
+        dst[k] = src[k] - src[k - 1]
+    for i in range(1, ydim):
+        k = i * xdim
+        dst[k] = src[k] - src[k - xdim]
+        m = mp[i - 1]
+        for j in range(1, xdim - 1):
+            k = i * xdim + j
+            dst[k] = src[k] - _scanline_pred(src, k, xdim, m, kind)
+        k = i * xdim + xdim - 1
+        if kind == 3 and m == 3:
+            dst[k] = src[k] - _med(src[k - 1], src[k - xdim], src[k - xdim - 1])
+        else:
+            dst[k] = src[k] - src[k - 1]
+    return dst, mp
+
+
+@njit
+def _from_scanline13(src, xdim, ydim, init, mp, kind):
+    dst = np.zeros(xdim * ydim, dtype=np.int64)
+    dst[0] = init
+    for k in range(1, xdim):
+        dst[k] = dst[k - 1] + src[k]
+    for i in range(1, ydim):
+        k = i * xdim
+        dst[k] = dst[k - xdim] + src[k]
+        m = mp[i - 1]
+        for j in range(1, xdim - 1):
+            k = i * xdim + j
+            dst[k] = _scanline_pred(dst, k, xdim, m, kind) + src[k]
+        k = i * xdim + xdim - 1
+        if kind == 3 and m == 3:
+            dst[k] = _med(dst[k - 1], dst[k - xdim], dst[k - xdim - 1]) + src[k]
+        else:
+            dst[k] = dst[k - 1] + src[k]
+    return dst
+
+
+@njit
+def _scanline2_pred(src, k, xdim, m):
+    if m == 0: return src[k - 1]
+    if m == 1: return src[k - xdim]
+    if m == 2: return jdiv(src[k - 1] + src[k - xdim], 2)
+    return jdiv(src[k - 1] + src[k - xdim + 1], 2)
+
+
+@njit
+def _scanline2(src, xdim, ydim):
+    mp = np.zeros(ydim - 1, dtype=np.uint8)
+    for i in range(1, ydim):
+        s = np.zeros(4, dtype=np.int64)
+        for j in range(1, xdim - 1):
+            k = i * xdim + j
+            for m in range(4):
+                s[m] += abs(src[k] - _scanline2_pred(src, k, xdim, m))
+        best = 0
+        for m in range(1, 4):
+            if s[m] < s[best]:
+                best = m
+        mp[i - 1] = best
+    dst = np.zeros(xdim * ydim, dtype=np.int64)
+    for k in range(1, xdim):
+        dst[k] = src[k] - src[k - 1]
+    for i in range(1, ydim):
+        k = i * xdim
+        dst[k] = src[k] - src[k - xdim]
+        for j in range(1, xdim - 1):
+            k = i * xdim + j
+            dst[k] = src[k] - _scanline2_pred(src, k, xdim, mp[i - 1])
+        k = i * xdim + xdim - 1
+        dst[k] = src[k] - src[k - 1]
+    return dst, mp
+
+
+@njit
+def _from_scanline2(src, xdim, ydim, init, mp):
+    dst = np.zeros(xdim * ydim, dtype=np.int64)
+    dst[0] = init
+    for k in range(1, xdim):
+        dst[k] = dst[k - 1] + src[k]
+    for i in range(1, ydim):
+        k = i * xdim
+        dst[k] = dst[k - xdim] + src[k]
+        for j in range(1, xdim - 1):
+            k = i * xdim + j
+            dst[k] = _scanline2_pred(dst, k, xdim, mp[i - 1]) + src[k]
+        k = i * xdim + xdim - 1
+        dst[k] = dst[k - 1] + src[k]
+    return dst
+
+
+# =============================================================================
+# Scanline (4) and (5): one of 16 (or 8) predictors per row
+# =============================================================================
+
+@njit
+def _row_pred(src, row, col, xdim, p, variant, eight):
+    k = row * xdim + col
+    a = src[k - 1] if col > 0 else 0
+    b = src[k - xdim] if row > 0 else 0
+    c = src[k - xdim - 1] if (row > 0 and col > 0) else 0
+    d = src[k - xdim + 1] if (row > 0 and col < xdim - 1) else 0
+    if eight:
+        p = FILTER_SETS_8[variant, p]
+    return _pred16(a, b, c, d, p)
+
+
+@njit
+def _scanline45(src, xdim, ydim, n_pred, variant):
+    eight = n_pred == 8
+    dst = np.zeros(xdim * ydim, dtype=np.int64)
+    mp = np.zeros(ydim, dtype=np.uint8)
+    for row in range(ydim):
+        best = 0
+        best_sad = 1 << 62
+        for p in range(n_pred):
+            sad = 0
+            for col in range(xdim):
+                k = row * xdim + col
+                if k == 0:
+                    continue
+                sad += abs(src[k] - _row_pred(src, row, col, xdim, p, variant, eight))
+            if sad < best_sad:
+                best_sad = sad
+                best = p
+        mp[row] = best
+        for col in range(xdim):
+            k = row * xdim + col
+            if k == 0:
+                continue
+            dst[k] = src[k] - _row_pred(src, row, col, xdim, best, variant, eight)
+    return dst, mp
+
+
+@njit
+def _from_scanline45(src, xdim, ydim, init, mp, n_pred, variant):
+    eight = n_pred == 8
+    dst = np.zeros(xdim * ydim, dtype=np.int64)
+    dst[0] = init
+    for row in range(ydim):
+        p = mp[row] & (0x7 if eight else 0xF)
+        for col in range(xdim):
+            k = row * xdim + col
+            if k == 0:
+                continue
+            dst[k] = src[k] + _row_pred(dst, row, col, xdim, p, variant, eight)
+    return dst
+
+
+# =============================================================================
+# Frame maps: one of 8 (1) or 16 (2) predictors per interior pixel
+# =============================================================================
+
+@njit
+def _ideal8_pred(src, k, xdim, n):
+    a = src[k - 1]; b = src[k - xdim]; c = src[k - xdim - 1]; d = src[k - xdim + 1]
+    if n == 0: return a
+    if n == 1: return jdiv(a + c, 2)
+    if n == 2: return c
+    if n == 3: return jdiv(c + b, 2)
+    if n == 4: return b
+    if n == 5: return jdiv(b + d, 2)
+    if n == 6: return d
+    return jdiv(d + a, 2)
+
+
+@njit
+def _ideal16_pred(a, b, c, d, n):
+    if n == 0: return a
+    if n == 1: return c
+    if n == 2: return b
+    if n == 3: return d
+    if n == 4: return (a + c) >> 1
+    if n == 5: return (c + b) >> 1
+    if n == 6: return (b + d) >> 1
+    if n == 7: return (d + a) >> 1
+    if n == 8: return (a + b) >> 1
+    if n == 9: return (c + d) >> 1
+    if n == 10: return (a + b + c + d) >> 2
+    if n == 11: return _med(a, b, c)
+    if n == 12: return (a + b + c) >> 2
+    if n == 13: return (a + b + d) >> 2
+    if n == 14: return (a + c + d) >> 2
+    return (b + c + d) >> 2
+
+
+@njit
+def _frame(src, xdim, ydim, n_pred):
+    mp = np.zeros((xdim - 2) * (ydim - 1), dtype=np.uint8)
+    # Frame map (1) leaves its last row at 0 (left), as the Java does.
+    rows = ydim - 1 if n_pred == 8 else ydim
+    m = 0
+    for i in range(1, rows):
+        for j in range(1, xdim - 1):
+            k = i * xdim + j
+            best = 0
+            best_abs = 1 << 62
+            for n in range(n_pred):
+                if n_pred == 8:
+                    p = _ideal8_pred(src, k, xdim, n)
+                else:
+                    p = _ideal16_pred(src[k - 1], src[k - xdim], src[k - xdim - 1], src[k - xdim + 1], n)
+                e = abs(src[k] - p)
+                if e < best_abs:
+                    best_abs = e
+                    best = n
+            mp[m] = best
+            m += 1
+    dst = np.zeros(xdim * ydim, dtype=np.int64)
+    for k in range(1, xdim):
+        dst[k] = src[k] - src[k - 1]
+    m = 0
+    for i in range(1, ydim):
+        k = i * xdim
+        dst[k] = src[k] - src[k - xdim]
+        for j in range(1, xdim - 1):
+            k = i * xdim + j
+            n = mp[m]
+            m += 1
+            if n_pred == 8:
+                p = _ideal8_pred(src, k, xdim, n)
+            else:
+                p = _ideal16_pred(src[k - 1], src[k - xdim], src[k - xdim - 1], src[k - xdim + 1], n)
+            dst[k] = src[k] - p
+        k = i * xdim + xdim - 1
+        dst[k] = src[k] - src[k - 1]
+    return dst, mp
+
+
+@njit
+def _from_frame(src, xdim, ydim, init, mp, n_pred):
+    dst = np.zeros(xdim * ydim, dtype=np.int64)
+    dst[0] = init
+    for k in range(1, xdim):
+        dst[k] = dst[k - 1] + src[k]
+    m = 0
+    for i in range(1, ydim):
+        k = i * xdim
+        dst[k] = dst[k - xdim] + src[k]
+        for j in range(1, xdim - 1):
+            k = i * xdim + j
+            n = mp[m]
+            m += 1
+            if n_pred == 8:
+                p = _ideal8_pred(dst, k, xdim, n)
+            else:
+                p = _ideal16_pred(dst[k - 1], dst[k - xdim], dst[k - xdim - 1], dst[k - xdim + 1], n)
+            dst[k] = p + src[k]
+        k = i * xdim + xdim - 1
+        dst[k] = dst[k - 1] + src[k]
+    return dst
+
+
+# =============================================================================
+# Block map (delta type 13)
+# =============================================================================
+
+BLOCK_MIN, BLOCK_MAX, BLOCK_DEFAULT = 4, 32, 8
+BLOCK_SET_NAMES = ["Scanline 16", "No Neighbours 16", "Neighbours 8", "Basic 4", "Blends 32"]
+BLOCK_SETS = [
+    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+    [0, 1, 2, 3, 11, 4, 10, 9],
+    [11, 10, 4, 9],
+    [11, 564, 37, 275, 1, 165, 46, 267, 102, 169, 368, 7, 178, 3, 0, 176,
+     66, 75, 6, 145, 50, 69, 168, 403, 307, 181, 101, 38, 80, 561, 231, 4]]
+_BLOCK_SETS = [np.array(s, dtype=np.int64) for s in BLOCK_SETS]
+BLOCK_SEARCH_SIZES = [4, 6, 8, 12, 16, 24, 32]
+
+
+def blocks_across(xdim, block):
+    return (xdim - 2 + block - 1) // block
+
+
+@njit
+def _edges(src, dst, xdim, ydim):
+    for x in range(1, xdim):
+        dst[x] = src[x] - src[x - 1]
+    for y in range(1, ydim):
+        dst[y * xdim] = src[y * xdim] - src[(y - 1) * xdim]
+        dst[y * xdim + xdim - 1] = src[y * xdim + xdim - 1] - src[y * xdim + xdim - 2]
+
+
+@njit
+def _block(src, xdim, ydim, block, ids, set_id):
+    dst = np.zeros(xdim * ydim, dtype=np.int64)
+    bw = (xdim - 2 + block - 1) // block
+    bh = (ydim - 1 + block - 1) // block
+    mp = np.zeros(2 + bw * bh, dtype=np.uint8)
+    mp[0] = block
+    mp[1] = set_id
+    P = ids.shape[0]
+    _edges(src, dst, xdim, ydim)
+    sums = np.zeros(P, dtype=np.int64)
+    prim = np.zeros(22, dtype=np.int64)
+    for by in range(bh):
+        for bx in range(bw):
+            y0 = 1 + by * block; y1 = min(ydim, y0 + block)
+            x0 = 1 + bx * block; x1 = min(xdim - 1, x0 + block)
+            sums[:] = 0
+            for y in range(y0, y1):
+                for x in range(x0, x1):
+                    k = y * xdim + x
+                    a = src[k - 1]; b = src[k - xdim]; c = src[k - xdim - 1]; d = src[k - xdim + 1]
+                    for q in range(22):
+                        prim[q] = _block_predictor(q, a, b, c, d)
+                    for p in range(P):
+                        e = ids[p]
+                        v = prim[e] if e < 32 else (prim[e // 32 - 1] + prim[e % 32] + 1) >> 1
+                        sums[p] += abs(src[k] - v)
+            best = 0
+            for p in range(1, P):
+                if sums[p] < sums[best]:
+                    best = p
+            mp[2 + by * bw + bx] = best
+            for y in range(y0, y1):
+                for x in range(x0, x1):
+                    k = y * xdim + x
+                    dst[k] = src[k] - _set_predictor(ids[best], src[k - 1], src[k - xdim], src[k - xdim - 1], src[k - xdim + 1])
+    return dst, mp
+
+
+@njit
+def _from_block(delta, xdim, ydim, init, mp, ids):
+    block = np.int64(mp[0])
+    bw = (xdim - 2 + block - 1) // block
+    dst = np.zeros(xdim * ydim, dtype=np.int64)
+    dst[0] = init
+    for x in range(1, xdim):
+        dst[x] = dst[x - 1] + delta[x]
+    for y in range(1, ydim):
+        k = y * xdim
+        dst[k] = dst[k - xdim] + delta[k]
+        row = 2 + (y - 1) // block * bw
+        for x in range(1, xdim - 1):
+            k += 1
+            e = ids[mp[row + (x - 1) // block]]
+            dst[k] = delta[k] + _set_predictor(e, dst[k - 1], dst[k - xdim], dst[k - xdim - 1], dst[k - xdim + 1])
+        k += 1
+        dst[k] = dst[k - 1] + delta[k]
+    return dst
+
+
+# =============================================================================
+# Dispatch
+# =============================================================================
+
+def get_deltas(src, xdim, ydim, delta_type, variant=0, block=BLOCK_DEFAULT, block_set=0):
+    """(deltas, map or None, init value) for delta_type 0-13."""
+    src = np.asarray(src, dtype=np.int64)
+    init = int(src[0])
+    t = delta_type
+    if t == 0: return _horizontal(src, xdim, ydim), None, init
+    if t == 1: return _vertical(src, xdim, ydim), None, init
+    if t == 2: return _average(src, xdim, ydim), None, init
+    if t in (3, 4, 5): return _neighbour_deltas(src, xdim, ydim, t), None, init
+    if t == 6: d, m = _scanline13(src, xdim, ydim, 1)
+    elif t == 7: d, m = _scanline2(src, xdim, ydim)
+    elif t == 8: d, m = _scanline13(src, xdim, ydim, 3)
+    elif t == 9: d, m = _scanline45(src, xdim, ydim, 16, 0)
+    elif t == 10: d, m = _scanline45(src, xdim, ydim, 8, variant)
+    elif t == 11: d, m = _frame(src, xdim, ydim, 8)
+    elif t == 12: d, m = _frame(src, xdim, ydim, 16)
+    elif t == 13: d, m = _block(src, xdim, ydim, block, _BLOCK_SETS[block_set], block_set)
+    else: raise ValueError("delta_type %d" % t)
+    return d, m, init
+
+
+def get_values_from_deltas(delta, xdim, ydim, init, delta_type, mp=None, variant=0):
+    delta = np.asarray(delta, dtype=np.int64)
+    t = delta_type
+    if t == 0: return _from_horizontal(delta, xdim, ydim, init)
+    if t == 1: return _from_vertical(delta, xdim, ydim, init)
+    if t == 2: return _from_average(delta, xdim, ydim, init)
+    if t in (3, 4, 5): return _from_neighbour_deltas(delta, xdim, ydim, init, t)
+    mp = np.asarray(mp, dtype=np.uint8)
+    if t == 6: return _from_scanline13(delta, xdim, ydim, init, mp, 1)
+    if t == 7: return _from_scanline2(delta, xdim, ydim, init, mp)
+    if t == 8: return _from_scanline13(delta, xdim, ydim, init, mp, 3)
+    if t == 9: return _from_scanline45(delta, xdim, ydim, init, mp, 16, 0)
+    if t == 10: return _from_scanline45(delta, xdim, ydim, init, mp, 8, variant)
+    if t == 11: return _from_frame(delta, xdim, ydim, init, mp, 8)
+    if t == 12: return _from_frame(delta, xdim, ydim, init, mp, 16)
+    if t == 13: return _from_block(delta, xdim, ydim, init, mp, _BLOCK_SETS[int(mp[1])])
+    raise ValueError("delta_type %d" % t)
+
+
+# =============================================================================
+# Tables and maps on disk
+# =============================================================================
+
+def write_table(out, table):
+    """short length, then one unsigned byte per entry (length <= 255) or one
+    short per entry."""
+    table = np.asarray(table)
+    out.write_short(len(table))
+    if len(table) <= 255:
+        out.write(table.astype(np.uint8).tobytes())
+    else:
+        out.write(table.astype(">u2").tobytes())
+
+
+def read_table(inp):
+    n = inp.read_short()
+    if n <= 255:
+        return np.frombuffer(inp.read_fully(n), dtype=np.uint8).astype(np.int64)
+    return np.frombuffer(inp.read_fully(2 * n), dtype=">i2").astype(np.int64)
+
+
+def _map_width(delta_type, xdim):
+    return 1 if delta_type <= 10 else xdim - 2
+
+
+@njit
+def _map_contexts(m, previous, has_previous, width, K):
+    n = m.shape[0]
+    ctx = np.zeros(n, dtype=np.int64)
+    for k in range(n):
+        x = k % width
+        left = np.int64(m[k - 1]) if x > 0 else 0
+        up = np.int64(m[k - width]) if k >= width else 0
+        ul = np.int64(m[k - width - 1]) if (x > 0 and k >= width) else 0
+        prev = np.int64(previous[k]) if has_previous else 0
+        shape = 0 if ul == left else (1 if ul == up else 2)
+        ctx[k] = ((left * K + up) * K + prev) * 3 + shape
+    return ctx
+
+
+@njit
+def _decode_map_context(data, n, K, previous, has_previous, width, top):
+    n_contexts = K * K * K * 3
+    f, bit, total, dt = am.context_decoder_init(data, n_contexts, K)
+    m = np.zeros(n, dtype=np.uint8)
+    for k in range(n):
+        x = k % width
+        left = np.int64(m[k - 1]) if x > 0 else 0
+        up = np.int64(m[k - width]) if k >= width else 0
+        ul = np.int64(m[k - width - 1]) if (x > 0 and k >= width) else 0
+        prev = np.int64(previous[k]) if has_previous else 0
+        shape = 0 if ul == left else (1 if ul == up else 2)
+        c = ((left * K + up) * K + prev) * 3 + shape
+        m[k] = am.context_decode_one(data, dt, f, bit, total, c, K, top)
+    return m
+
+
+def _prev_array(previous, n):
+    if previous is None:
+        return np.zeros(n, dtype=np.uint8), False
+    return np.asarray(previous, dtype=np.uint8), True
+
+
+def _map_to_string(m):
+    lo, bits, table, string = sm.get_string_list(m.astype(np.int64), False)
+    bits = sm.get_bitlength(string)
+    out = DataOutput()
+    out.write_int(len(m)); write_table(out, table); out.write_int(lo); out.write_int(bits)
+    out.write_byte(m[0]); out.write(string[:sm.get_bytelength(bits)].tobytes())
+    return out.to_bytes()
+
+
+def _map_to_arithmetic(m):
+    freq = np.bincount(m, minlength=256)
+    used = np.nonzero(freq)[0]
+    out = DataOutput()
+    out.write_int(len(m)); out.write_short(len(used))
+    for v in used:
+        out.write_byte(v); out.write_int(freq[v])
+    if len(used) <= 1:
+        out.write_int(0)
+    else:
+        coded = am.get_interval_value_fast_fenwick(m, freq)
+        out.write_int(len(coded)); out.write(coded.tobytes())
+    return out.to_bytes()
+
+
+def _map_to_context(m, previous, width):
+    K = max(1, int(m.max()) + 1 if len(m) else 1)
+    if previous is not None and len(previous):
+        K = max(K, int(np.max(previous)) + 1)
+    prev, has = _prev_array(previous, len(m))
+    ctx = _map_contexts(m, prev, has, width, K)
+    coded = am.get_interval_value_context(m.astype(np.int64), K, ctx, K * K * K * 3)
+    out = DataOutput()
+    out.write_int(len(m)); out.write_byte(K); out.write_int(len(coded)); out.write(coded.tobytes())
+    return out.to_bytes()
+
+
+def write_map(out, delta_type, mp, previous, xdim):
+    """A delta-type map. Types 6-8 (values 0-3): int length, int packed
+    length, 4 values per byte, low bits first. Types 9-13: a flag byte and
+    the smallest of three forms -- 0 unary string, 1 arithmetic, 2 context
+    coded (contexts use the previous channel's map). A block map (13) starts
+    with its block size and predictor set bytes."""
+    mp = np.asarray(mp, dtype=np.uint8)
+    if delta_type <= 8:
+        packed = np.zeros((len(mp) + 3) // 4, dtype=np.uint8)
+        for r in range(4):
+            part = mp[r::4] & 3
+            packed[:len(part)] |= (part << (2 * r)).astype(np.uint8)
+        out.write_int(len(mp)); out.write_int(len(packed)); out.write(packed.tobytes())
+        return
+    width = _map_width(delta_type, xdim)
+    if delta_type == 13:
+        out.write_byte(mp[0]); out.write_byte(mp[1])
+        width = blocks_across(xdim, int(mp[0]))
+        mp = mp[2:]
+        previous = None if previous is None else np.asarray(previous, dtype=np.uint8)[2:]
+    forms = [_map_to_string(mp), _map_to_arithmetic(mp), _map_to_context(mp, previous, width)]
+    best = min(range(3), key=lambda f: (len(forms[f]), f))
+    out.write_byte(best)
+    out.write(forms[best])
+
+
+def map_bytes(delta_type, mp, previous, xdim):
+    out = DataOutput()
+    write_map(out, delta_type, mp, previous, xdim)
+    return out.size()
+
+
+def _read_map_forms(inp, previous, width):
+    coding = inp.read_byte()
+    n = inp.read_int()
+    if coding == 2:
+        K = inp.read_unsigned_byte()
+        coded = np.frombuffer(inp.read_fully(inp.read_int()), dtype=np.uint8)
+        prev, has = _prev_array(previous, n)
+        return _decode_map_context(coded, n, K, prev, has, width, am._highest_one_bit(K))
+    if coding == 1:
+        K = inp.read_short()
+        freq = np.zeros(256, dtype=np.int64)
+        only = 0
+        for _ in range(K):
+            only = inp.read_unsigned_byte()
+            freq[only] = inp.read_int()
+        coded = np.frombuffer(inp.read_fully(inp.read_int()), dtype=np.uint8)
+        if K > 1:
+            return am.get_arithmetic_values_fast_fenwick(coded, freq, n)
+        return np.full(n, only, dtype=np.uint8)
+    table = read_table(inp)
+    lo = inp.read_int()
+    bits = inp.read_int()
+    first = inp.read_unsigned_byte()
+    string = np.frombuffer(inp.read_fully(sm.get_bytelength(bits)), dtype=np.uint8)
+    unpacked = sm.decompress_strings(string)
+    value = sm.unpack_strings(unpacked, table, n, sm.get_bitlength(unpacked))
+    mp = ((value + lo) & 0xFF).astype(np.uint8)
+    mp[0] = first
+    return mp
+
+
+def read_map(inp, delta_type, previous, xdim):
+    if delta_type <= 8:
+        n = inp.read_int()
+        packed = np.frombuffer(inp.read_fully(inp.read_int()), dtype=np.uint8)
+        q = np.arange(n)
+        return ((packed[q >> 2] >> ((q & 3) << 1)) & 3).astype(np.uint8)
+    if delta_type == 13:
+        block = inp.read_byte()
+        set_id = inp.read_byte()
+        if not (0 <= set_id < len(BLOCK_SET_NAMES)) or not (BLOCK_MIN <= block <= BLOCK_MAX):
+            raise IOError("Block map with predictor set %d and block size %d: not one this version reads." % (set_id, block))
+        prev = None if previous is None else np.asarray(previous, dtype=np.uint8)[2:]
+        body = _read_map_forms(inp, prev, blocks_across(xdim, block))
+        return np.concatenate([np.array([block, set_id], dtype=np.uint8), body])
+    return _read_map_forms(inp, previous, _map_width(delta_type, xdim))
+
+
+# =============================================================================
+# Context coding of deltas (the Context entropy type)
+#
+# Deltas are coded as ranks (most frequent value = 0). Context: activity =
+# |left| + |above| + |above-left| + |above-right| of the deltas already
+# coded, in 12 buckets, times 5 buckets of the deltas at the same pixel in
+# the channels coded before (so channels decode in order).
+# =============================================================================
+
+ACTIVITY_LIMIT = np.array([0, 1, 2, 3, 5, 7, 10, 14, 20, 28, 40, 60], dtype=np.int64)
+CROSS_LIMIT = np.array([0, 1, 3, 6, 12], dtype=np.int64)
+CONTEXTS = len(ACTIVITY_LIMIT) * len(CROSS_LIMIT)
+
+
+@njit
+def _bucket(v, limit):
+    b = 0
+    while b + 1 < limit.shape[0] and v >= limit[b + 1]:
+        b += 1
+    return b
+
+
+@njit
+def _delta_context(d, previous, k, xdim, act_limit, cross_limit):
+    x = k % xdim
+    activity = 0
+    cross = 0
     if x > 0:
-        neighbors.append(src[y * xdim + x - 1])
-    if x < xdim - 1:
-        neighbors.append(src[y * xdim + x + 1])
-    if y < ydim - 1:
+        activity += abs(d[k - 1])
+    if k >= xdim:
+        activity += abs(d[k - xdim])
         if x > 0:
-            neighbors.append(src[(y + 1) * xdim + x - 1])
-        neighbors.append(src[(y + 1) * xdim + x])
+            activity += abs(d[k - xdim - 1])
         if x < xdim - 1:
-            neighbors.append(src[(y + 1) * xdim + x + 1])
-    return neighbors
+            activity += abs(d[k - xdim + 1])
+    for p in range(previous.shape[0]):
+        cross += abs(previous[p, k])
+    return _bucket(activity, act_limit) * cross_limit.shape[0] + _bucket(cross, cross_limit)
 
 
-def get_location_type(x: int, y: int, xdim: int, ydim: int) -> int:
-    if y == 0:
-        if x == 0:
-            return 1
-        if x < xdim - 1:
-            return 2
-        return 3
-    if y < ydim - 1:
-        if x == 0:
-            return 4
-        if x < xdim - 1:
-            return 5
-        return 6
-    if x == 0:
-        return 7
-    if x < xdim - 1:
-        return 8
-    return 9
+@njit
+def _delta_contexts(d, previous, xdim, act_limit, cross_limit):
+    ctx = np.zeros(d.shape[0], dtype=np.int64)
+    for k in range(d.shape[0]):
+        ctx[k] = _delta_context(d, previous, k, xdim, act_limit, cross_limit)
+    return ctx
 
 
-def get_location_index(location_type: int, location: int) -> int:
-    if location_type == 1:
-        if location == 4: return 0
-        if location == 6: return 1
-        if location == 7: return 2
-    elif location_type == 2:
-        if location == 3: return 0
-        if location == 4: return 1
-        if location == 5: return 2
-        if location == 6: return 3
-        if location == 7: return 4
-    elif location_type == 3:
-        if location == 3: return 0
-        if location == 5: return 1
-        if location == 6: return 2
-    elif location_type == 4:
-        if location == 1: return 0
-        if location == 2: return 1
-        if location == 4: return 2
-        if location == 6: return 3
-        if location == 7: return 4
-    elif location_type == 5:
-        if location == 0: return 0
-        if location == 1: return 1
-        if location == 2: return 2
-        if location == 3: return 3
-        if location == 4: return 4
-        if location == 5: return 5
-        if location == 6: return 6
-        if location == 7: return 7
-    elif location_type == 6:
-        if location == 0: return 0
-        if location == 1: return 1
-        if location == 3: return 2
-        if location == 5: return 3
-        if location == 6: return 4
-    elif location_type == 7:
-        if location == 1: return 0
-        if location == 2: return 1
-        if location == 4: return 2
-    elif location_type == 8:
-        if location == 0: return 0
-        if location == 1: return 1
-        if location == 2: return 2
-        if location == 3: return 3
-        if location == 4: return 4
-    elif location_type == 9:
-        if location == 0: return 0
-        if location == 1: return 1
-        if location == 3: return 2
-    return -1
+@njit
+def _decode_context_deltas(data, n, value, previous, xdim, act_limit, cross_limit, top):
+    n_symbols = value.shape[0]
+    f, bit, total, dt = am.context_decoder_init(data, act_limit.shape[0] * cross_limit.shape[0], n_symbols)
+    d = np.zeros(n, dtype=np.int64)
+    for k in range(n):
+        c = _delta_context(d, previous, k, xdim, act_limit, cross_limit)
+        d[k] = value[am.context_decode_one(data, dt, f, bit, total, c, n_symbols, top)]
+    return d
 
 
-def get_neighbor_index(x: int, y: int, xdim: int, location: int) -> int:
-    k = y * xdim + x
-    if location == 0: return k - xdim - 1
-    if location == 1: return k - xdim
-    if location == 2: return k - xdim + 1
-    if location == 3: return k - 1
-    if location == 4: return k + 1
-    if location == 5: return k + xdim - 1
-    if location == 6: return k + xdim
-    if location == 7: return k + xdim + 1
-    return k
+def _previous_2d(previous, n):
+    if not previous:
+        return np.zeros((0, n), dtype=np.int64)
+    return np.stack([np.asarray(p, dtype=np.int64) for p in previous])
 
 
-def get_inverse_location(location: int) -> int:
-    return 7 - location
+def pack_context_deltas(delta, previous, xdim):
+    """int min, the rank table (value -> rank, see write_table), int coded
+    length, coded bytes. previous: the deltas of the channels before."""
+    delta = np.asarray(delta, dtype=np.int64)
+    lo = int(delta.min())
+    count = np.bincount(delta - lo)
+    order = sorted(range(len(count)), key=lambda v: (-count[v], v))
+    rank = np.zeros(len(count), dtype=np.int64)
+    rank[order] = np.arange(len(count))
+    symbol = rank[delta - lo]
+    ctx = _delta_contexts(delta, _previous_2d(previous, len(delta)), xdim, ACTIVITY_LIMIT, CROSS_LIMIT)
+    coded = am.get_interval_value_context(symbol, len(rank), ctx, CONTEXTS)
+    out = DataOutput()
+    out.write_int(lo); write_table(out, rank); out.write_int(len(coded)); out.write(coded.tobytes())
+    return out.to_bytes()
 
 
-def get_channels(set_id: int) -> List[int]:
-    channel = [0, 0, 0]
-    if set_id == 0:
-        channel[0], channel[1], channel[2] = 0, 1, 2
-    elif set_id == 1:
-        channel[0], channel[1], channel[2] = 0, 2, 4
-    elif set_id == 2:
-        channel[0], channel[1], channel[2] = 0, 2, 3
-    elif set_id == 3:
-        channel[0], channel[1], channel[2] = 0, 3, 4
-    elif set_id == 4:
-        channel[0], channel[1], channel[2] = 0, 3, 5
-    elif set_id == 5:
-        channel[0], channel[1], channel[2] = 1, 2, 3
-    elif set_id == 6:
-        channel[0], channel[1], channel[2] = 2, 3, 4
-    elif set_id == 7:
-        channel[0], channel[1], channel[2] = 1, 3, 4
-    elif set_id == 8:
-        channel[0], channel[1], channel[2] = 1, 4, 5
-    elif set_id == 9:
-        channel[0], channel[1], channel[2] = 2, 4, 5
-    return channel
+def read_context_deltas(inp, n, previous, xdim):
+    lo = inp.read_int()
+    rank = read_table(inp)
+    coded = np.frombuffer(inp.read_fully(inp.read_int()), dtype=np.uint8)
+    value = np.zeros(len(rank), dtype=np.int64)
+    value[rank] = np.arange(len(rank)) + lo
+    return _decode_context_deltas(coded, n, value, _previous_2d(previous, n), xdim,
+                                  ACTIVITY_LIMIT, CROSS_LIMIT, am._highest_one_bit(len(rank)))
+
+
+# =============================================================================
+# Block-map settings search
+# =============================================================================
+
+def get_block_map_bytes(channel, xdim, ydim, block, block_set):
+    """Bytes the three channels take as block-map deltas (Context coded)
+    plus their maps, as the writers save them."""
+    d, m = [], []
+    for c in channel:
+        delta, mp, _ = get_deltas(c, xdim, ydim, 13, 0, block, block_set)
+        d.append(delta); m.append(mp)
+    total = 0
+    for i in range(3):
+        total += len(pack_context_deltas(d[i], d[:i], xdim))
+        total += map_bytes(13, m[i], m[i - 1] if i > 0 else None, xdim)
+    return total
+
+
+def find_best_block(channel, xdim, ydim, workers=None):
+    """The block size and predictor set that code the three channels
+    smallest: every set at sizes 4, 8 and 16, then the best set at the
+    untried sizes next to its best. Returns ((block, set), bytes) where
+    bytes[set][size index] is -1 for sizes not tried."""
+    n_sets = len(BLOCK_SET_NAMES)
+    first = [0, 2, 4]
+    table = [[-1] * len(BLOCK_SEARCH_SIZES) for _ in range(n_sets)]
+    jobs = [(s, i) for s in range(n_sets) for i in first]
+    with ThreadPoolExecutor(workers) as pool:
+        for (s, i), v in zip(jobs, pool.map(lambda j: get_block_map_bytes(channel, xdim, ydim, BLOCK_SEARCH_SIZES[j[1]], j[0]), jobs)):
+            table[s][i] = v
+    best_set, best_i = 0, first[0]
+    for s in range(n_sets):
+        for i in first:
+            if table[s][i] < table[best_set][best_i]:
+                best_set, best_i = s, i
+    more = [i for i in (best_i - 1, best_i + 1) if 0 <= i < len(BLOCK_SEARCH_SIZES) and table[best_set][i] < 0]
+    with ThreadPoolExecutor(workers) as pool:
+        for i, v in zip(more, pool.map(lambda i: get_block_map_bytes(channel, xdim, ydim, BLOCK_SEARCH_SIZES[i], best_set), more)):
+            table[best_set][i] = v
+    for i in range(len(BLOCK_SEARCH_SIZES)):
+        if 0 <= table[best_set][i] < table[best_set][best_i]:
+            best_i = i
+    return (BLOCK_SEARCH_SIZES[best_i], best_set), table
+
+
+def get_block_table(table, best):
+    lines = ["Block map, bytes coded (Context-coded deltas + maps, 3 channels):",
+             "  %-18s" % "set \\ block" + "".join(" %9d " % b for b in BLOCK_SEARCH_SIZES)]
+    for s, name in enumerate(BLOCK_SET_NAMES):
+        row = "  %-18s" % name
+        for i, b in enumerate(BLOCK_SEARCH_SIZES):
+            v = table[s][i]
+            chosen = s == best[1] and b == best[0]
+            row += " %9s " % "-" if v < 0 else " %9d" % v + ("*" if chosen else " ")
+        lines.append(row)
+    return "\n".join(lines) + "\n"

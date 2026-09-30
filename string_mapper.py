@@ -1,195 +1,147 @@
 """
-string_mapper.py — translation of StringMapper.java.
+string_mapper.py -- StringMapper.java: unary ("string") coding of integers,
+plus the zero-bit / one-bit run compression applied to those strings.
 
-BYTE REPRESENTATION: this module represents "byte arrays" as plain Python
-lists/bytearrays of UNSIGNED 0..255 ints throughout, not Java's signed
--128..127 byte. This is safe here (verified by hand for every bit
-operation in this file before translating): every place Java relies on a
-byte's *sign* is either (a) explicitly converting signed-to-unsigned
-already (e.g. `if (src[i]<0) src[i]+=256`), which becomes a no-op when our
-representation is already unsigned, or (b) a bit-test/shift-then-mask
-pattern (`x & (1<<j)`, `(x>>5)&7`) whose result is identical whether x is
-treated as signed (sign-extended) or unsigned (zero-extended), because the
-mask never has any of the bits above bit 7 set. No custom signed-byte
-emulation is used anywhere below.
+Only what the Delta programs use. A "string" is a numpy uint8 array whose
+last byte holds metadata: bits 0-4 the iteration count (+16 for the one-bit
+transform), bits 5-7 the number of unused bits in the last data byte.
 
-EXTERNAL DEPENDENCY (RESOLVED): setIterations() calls SegmentMapper.get_leading_mask(3).
-SegmentMapper has since been translated (segment_mapper.py) and this was
-verified against real Java: getLeadingMask(3) == 0xE0. LEADING_MASK_3 below
-reflects that verified value. (An earlier version of this file inferred
-0x1F from context, backwards from the real value -- setIterations was not
-on DeltaWriter.java's call path, so this had no effect until now.)
-
-VERIFICATION: every function below was checked against the real compiled
-Java on 300 randomized test cases spanning the full pipeline (histogram ->
-rank table -> pack -> compress -> decompress -> unpack), matching at every
-intermediate stage, not just final output. set_iterations() specifically
-was verified once SegmentMapper.get_leading_mask() was translated and
-confirmed (see segment_mapper.py). See the self-test at the bottom for a
-runnable (smaller-scale) version of the same check.
+Byte-for-byte compatible with the Java; the bit loops are Numba-compiled.
 """
 
-
-# =============================================================================
-# Histogram
-# =============================================================================
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# Optional Numba acceleration (see delta_mapper.py's module docstring for
-# the full rationale) -- a no-op fallback decorator if numba isn't
-# installed, so correctness never depends on it, only speed.
-try:
-    from numba import njit as _njit
-    NUMBA_AVAILABLE = True
+from numba_support import njit
 
-    def njit(*args, **kwargs):
-        kwargs.setdefault("cache", True)
-        kwargs.setdefault("nogil", True)
-        return _njit(*args, **kwargs)
-except ImportError:
-    NUMBA_AVAILABLE = False
-
-    def njit(*args, **kwargs):
-        if len(args) == 1 and callable(args[0]) and not kwargs:
-            return args[0]
-
-        def _wrap(fn):
-            return fn
-        return _wrap
+_MASK = np.array([1, 3, 7, 15, 31, 63, 127, 255], dtype=np.int64)
 
 
-def _to_int64_array(x):
-    """Converts a src/table argument to an int64 numpy array regardless
-    of whether the caller passed a numpy array, a plain Python list, or a
-    bytes/bytearray object -- numba's nopython mode can't run
-    np.asarray() on a raw bytes object directly (only on already-typed
-    arrays/lists), so that conversion happens here, in plain Python,
-    before entering any numba-compiled core."""
-    if isinstance(x, np.ndarray):
-        return x if x.dtype == np.int64 else x.astype(np.int64)
-    if isinstance(x, (bytes, bytearray)):
-        return np.frombuffer(bytes(x), dtype=np.uint8).astype(np.int64)
-    return np.asarray(list(x), dtype=np.int64)
+def _u8(a):
+    if isinstance(a, np.ndarray) and a.dtype == np.uint8:
+        return a
+    if isinstance(a, (bytes, bytearray)):
+        return np.frombuffer(bytes(a), dtype=np.uint8).copy()
+    return np.asarray(a, dtype=np.uint8)
 
 
-def _to_uint8_array(x):
-    """Same as _to_int64_array but for uint8 (raw byte-string) data."""
-    if isinstance(x, np.ndarray):
-        return x if x.dtype == np.uint8 else x.astype(np.uint8)
-    if isinstance(x, (bytes, bytearray)):
-        return np.frombuffer(bytes(x), dtype=np.uint8)
-    return np.asarray(list(x), dtype=np.uint8)
+# ---- Metadata byte ----------------------------------------------------------
+
+def get_bitlength(string):
+    last = int(string[-1])
+    return (len(string) - 1) * 8 - ((last >> 5) & 7)
+
+
+def get_iterations(string):
+    return int(string[-1]) & 31
+
+
+def get_type(string):
+    return 1 if (int(string[-1]) & 31) > 15 else 0
+
+
+def get_bytelength(bitlength):
+    n = bitlength // 8
+    if bitlength % 8 != 0:
+        n += 1
+    return n + 1
 
 
 @njit
-def _histogram_core(src):
-    min_v = src[0]
-    max_v = src[0]
-    for i in range(1, src.shape[0]):
-        if src[i] < min_v:
-            min_v = src[i]
-        elif src[i] > max_v:
-            max_v = src[i]
-    rng = max_v - min_v + 1
-    histogram = np.zeros(rng, dtype=np.int64)
-    for i in range(src.shape[0]):
-        histogram[src[i] - min_v] += 1
-    return min_v, histogram, rng
+def _set_data(type_, iterations, bitlength, string):
+    if type_ == 1:
+        iterations += 16
+    odd = bitlength % 8
+    extra = 0
+    if odd != 0:
+        extra = 8 - odd
+    string[string.shape[0] - 1] = (iterations | (extra << 5)) & 0xFF
 
 
-def get_histogram(src):
-    """Java overload: getHistogram(int[]). This is the one DeltaWriter.java
-    actually calls. Returns [min_value, histogram, range]."""
-    src_arr = np.asarray(src, dtype=np.int64)
-    min_v, histogram, rng = _histogram_core(src_arr)
-    return [int(min_v), histogram.tolist(), int(rng)]
+def set_data(type_, iterations, bitlength, string):
+    _set_data(type_, iterations, bitlength, string)
 
 
-def get_histogram_bytes(src):
-    """Java overload: getHistogram(byte[]). `src` should already be
-    unsigned 0..255 (see module docstring) -- Java's explicit sign-to-
-    unsigned conversion is a no-op here for that reason."""
-    return get_histogram(list(src))
+# ---- Histogram and rank table -------------------------------------------------
+
+def get_histogram(values):
+    """[min, histogram, range] of an int array."""
+    v = np.asarray(values, dtype=np.int64)
+    lo, hi = int(v.min()), int(v.max())
+    hist = np.bincount(v - lo, minlength=hi - lo + 1).astype(np.int64)
+    return lo, hist, hi - lo + 1
 
 
-# =============================================================================
-# Rank table
-# =============================================================================
-def get_rank_table(src):
-    """src: a histogram (list of counts). Returns rank[i] = the rank of
-    bin i (0 = most frequent).
+def get_rank_table(histogram):
+    """rank[i] of each histogram bin, 0 = most frequent.
 
-    NOTE: this is a literal, structural replication of Java's algorithm
-    (Hashtable<Double,Integer> + repeated +0.001 tie-breaking), not a
-    'cleaner' reimplementation. An earlier version of this function used a
-    stable sort on (value, index) instead, reasoning that later-original-
-    index ties should win -- correct for a *handful* of ties, but wrong at
-    scale: with thousands of tied bins (e.g. a histogram with far more
-    possible bins than input values, so most bins tie at count 0), Java's
-    repeated +0.001 increments can drift far enough to collide with a
-    *different* base count entirely (crossing into a neighboring integer),
-    which a clean re-derivation doesn't reproduce. Since Python floats are
-    also IEEE-754 doubles, replicating the exact same sequence of
-    operations reproduces Java's behavior bit-for-bit, quirks included.
-    Confirmed against real Java output at n=500 with a ~4000-bin histogram
-    (a case the earlier stable-sort version got wrong)."""
-    n = len(src)
-    table = {}   # key(float) -> original index
-    keys = []    # keys in insertion order
-
-    for i in range(n):
-        key = float(src[i])
+    Replicates the Java exactly, including its tie-breaking: equal counts
+    are made distinct by adding .001 repeatedly (Java Hashtable of Double
+    keys), then sorted. With many ties the nudged keys can drift into the
+    next integer, which changes the order -- so this is done literally, not
+    with a stable sort. Python floats are the same IEEE doubles."""
+    table = {}
+    keys = []
+    for i, c in enumerate(np.asarray(histogram).tolist()):
+        key = float(c)
         while key in table:
-            key += 0.001
+            key += .001
         table[key] = i
         keys.append(key)
-
-    keys_sorted = sorted(keys)  # ascending, matches Collections.sort
-
-    rank = [0] * n
+    keys.sort()
+    n = len(keys)
+    rank = np.zeros(n, dtype=np.int64)
     k = -1
     for i in range(n - 1, -1, -1):
-        key = keys_sorted[i]
-        j = table[key]
         k += 1
-        rank[j] = k
+        rank[table[keys[i]]] = k
     return rank
 
 
-# =============================================================================
-# packStrings / unpackStrings
-# =============================================================================
-_PACK_MASK = np.array([1, 3, 7, 15, 31, 63, 127, 255], dtype=np.int64)
+# ---- Packing ----------------------------------------------------------------
+
+@njit
+def _zero_ratio(string, bit_length):
+    byte_length = bit_length // 8
+    zeros = 0
+    ones = 0
+    for i in range(byte_length):
+        b = string[i]
+        for j in range(8):
+            if (b >> j) & 1:
+                ones += 1
+            else:
+                zeros += 1
+    for i in range(bit_length % 8):
+        if (string[byte_length] >> i) & 1:
+            ones += 1
+        else:
+            zeros += 1
+    if zeros + ones == 0:
+        return np.nan
+    return zeros / (zeros + ones)
 
 
 @njit
-def _pack_strings_core(src, table):
-    max_length = table.shape[0] - 1
-
+def _pack_strings(src, table, mask):
+    n = table.shape[0]
+    max_length = n - 1
     bitlength = 0
     for i in range(src.shape[0]):
-        v = src[i]
-        if table[v] != max_length:
-            bitlength += table[v] + 1
+        t = table[src[i]]
+        if t != max_length:
+            bitlength += t + 1
         else:
             bitlength += max_length
-
     bytelength = bitlength // 8
     if bitlength % 8 != 0:
         bytelength += 1
-
-    dst = np.zeros(bytelength + 1, dtype=np.uint8)  # +1 for the trailing metadata byte
-
-    mask = _PACK_MASK
+    dst = np.zeros(bytelength + 1, dtype=np.uint8)
 
     start = 0
     stop = 0
     j = 0
-
     for i in range(src.shape[0]):
-        val = src[i]
-        k = table[val]
+        k = table[src[i]]
         if k == 0:
             start += 1
             if start == 8:
@@ -199,7 +151,6 @@ def _pack_strings_core(src, table):
             stop = (start + k + 1) % 8
             if k == max_length:
                 stop = stop - 1 if stop > 0 else 7
-
             if k <= 7:
                 dst[j] = (dst[j] | (mask[k - 1] << start)) & 0xFF
                 if stop <= start:
@@ -209,9 +160,9 @@ def _pack_strings_core(src, table):
             else:
                 dst[j] = (dst[j] | (mask[7] << start)) & 0xFF
                 m = (k - 8) // 8
-                for _n in range(m):
+                for _ in range(m):
                     j += 1
-                    dst[j] = mask[7] & 0xFF
+                    dst[j] = 255
                 j += 1
                 if start != 0:
                     dst[j] = (dst[j] | (mask[7] >> (8 - start))) & 0xFF
@@ -226,50 +177,39 @@ def _pack_strings_core(src, table):
                     j += 1
             start = stop
 
-    return dst, bitlength
+    ratio = _zero_ratio(dst, bitlength)
+    type_ = 1 if ratio < .5 else 0          # NaN (empty) compares false, as in Java
+    _set_data(type_, 0, bitlength, dst)
+    return dst
 
 
-def pack_strings(src, table):
-    """src: list of ints, each usable as an index into `table` (i.e.
-    table must be indexable by every value in src -- matching Java's
-    `table[src[i]]` direct indexing)."""
-    src_arr = _to_int64_array(src)
-    table_arr = _to_int64_array(table)
-    dst, bitlength = _pack_strings_core(src_arr, table_arr)
-
-    dst_list = bytearray(dst.tobytes())
-    zero_ratio = get_zero_ratio(dst_list, bitlength)
-    type_ = 1 if zero_ratio < 0.5 else 0
-    set_data(type_, 0, bitlength, dst_list)
-    return dst_list
+def pack_strings(values, table):
+    return _pack_strings(np.asarray(values, dtype=np.int64), np.asarray(table, dtype=np.int64), _MASK)
 
 
 @njit
-def _unpack_strings_core(src, table, dst, bitlength):
+def _unpack_strings(src, table, size, bitlength):
     n = table.shape[0]
     max_length = n - 1
-    size = dst.shape[0]
-
-    inverse_table = np.zeros(n, dtype=np.int64)
+    dst = np.zeros(size, dtype=np.int64)
+    inverse = np.zeros(n, dtype=np.int64)
     for i in range(n):
-        inverse_table[table[i]] = i
-
+        inverse[table[i]] = i
     length = 1
     src_byte = 0
     dst_byte = 0
     bit = 0
     bits_read = 0
-
-    while dst_byte < size and bits_read < bitlength:
-        non_zero = src[src_byte] & (1 << bit)
+    while dst_byte < size and bits_read < bitlength and src_byte < src.shape[0]:
+        non_zero = (src[src_byte] >> bit) & 1
         if non_zero != 0 and length < max_length:
             length += 1
         elif non_zero == 0:
-            dst[dst_byte] = inverse_table[length - 1]
+            dst[dst_byte] = inverse[length - 1]
             dst_byte += 1
             length = 1
         elif length == max_length:
-            dst[dst_byte] = inverse_table[length]
+            dst[dst_byte] = inverse[length]
             dst_byte += 1
             length = 1
         bit += 1
@@ -277,600 +217,241 @@ def _unpack_strings_core(src, table, dst, bitlength):
         if bit == 8:
             bit = 0
             src_byte += 1
-
-
-def unpack_strings(src, table, size, bitlength):
-    src_arr = _to_uint8_array(src)
-    table_arr = _to_int64_array(table)
-    dst = np.zeros(size, dtype=np.int64)
-
-    bitlength = min(bitlength, get_bitlength(src))
-
-    try:
-        _unpack_strings_core(src_arr, table_arr, dst, bitlength)
-    except (IndexError, KeyError) as e:
-        # dst keeps whatever _unpack_strings_core already wrote in place
-        # before raising -- same recovery behavior as the original
-        # (mutating a shared list/array in place, not building up a
-        # result only returned on success), matching Java's own
-        # catch-and-continue here.
-        print(e)
-        print("Exiting unpackStrings with an exception.")
-        import traceback
-        traceback.print_exc()
-    return dst.tolist()
-
-
-# =============================================================================
-# Zero-bit compression (stop bits = zeros)
-#
-# TRANSLATION NOTE: Java's `for (i = 0; i < size; i++) { ...; i++; ... }`
-# manually increments `i` an extra time inside the loop body in one branch
-# (consuming 2 input bits in that iteration instead of 1). Python's
-# `for i in range(size)` can't be mutated mid-loop to skip an iteration --
-# assigning to the loop variable has no effect on the next value range()
-# yields -- so this is translated as a `while` loop instead, with the
-# extra increment applied explicitly where Java's code applies it, plus
-# the loop's own unconditional per-iteration increment at the end,
-# matching Java's automatic `i++` from the for-statement.
-# =============================================================================
-def compress_zero_bits(src, size, dst):
-    for idx in range(len(dst)):
-        dst[idx] = 0
-    current_byte = 0
-    current_bit = 0
-    dst[0] = 0
-
-    i = 0
-    j = 0
-    k = 0
-    result1 = 0
-    try:
-        while i < size:
-            if (src[k] & (1 << j)) == 0 and i < size - 1:
-                i += 1
-                j += 1
-                if j == 8:
-                    j = 0
-                    k += 1
-                if (src[k] & (1 << j)) == 0:
-                    current_bit += 1
-                    if current_bit == 8:
-                        current_byte += 1
-                        current_bit = 0
-                else:
-                    dst[current_byte] = (dst[current_byte] | (1 << current_bit)) & 0xFF
-                    current_bit += 1
-                    if current_bit == 8:
-                        current_byte += 1
-                        current_bit = 0
-                        dst[current_byte] = 0
-                    dst[current_byte] = (dst[current_byte] | (1 << current_bit)) & 0xFF
-                    current_bit += 1
-                    if current_bit == 8:
-                        current_byte += 1
-                        current_bit = 0
-            elif (src[k] & (1 << j)) == 0 and i == size - 1:
-                dst[current_byte] = (dst[current_byte] | (1 << current_bit)) & 0xFF
-                current_bit += 1
-                if current_bit == 8:
-                    current_byte += 1
-                    current_bit = 0
-                result1 = 1
-            else:
-                dst[current_byte] = (dst[current_byte] | (1 << current_bit)) & 0xFF
-                current_bit += 1
-                if current_bit == 8:
-                    current_byte += 1
-                    current_bit = 0
-                current_bit += 1
-                if current_bit == 8:
-                    current_byte += 1
-                    current_bit = 0
-            j += 1
-            if j == 8:
-                j = 0
-                k += 1
-            i += 1  # the Java for-loop's own automatic increment
-    except IndexError as e:
-        print(e)
-        print("Exiting compressZeroBits with an exception.")
-        import traceback
-        traceback.print_exc()
-
-    return [current_byte * 8 + current_bit, result1]
-
-
-def decompress_zero_bits(src, size, dst):
-    for idx in range(len(dst)):
-        dst[idx] = 0
-    current_byte = 0
-    current_bit = 0
-
-    i = 0
-    j = 0
-    k = 0
-    while i < size:
-        if (src[k] & (1 << j)) != 0 and i < size - 1:
-            i += 1
-            j += 1
-            if j == 8:
-                j = 0
-                k += 1
-            if (src[k] & (1 << j)) != 0:
-                # "11" -> "01"
-                current_bit += 1
-                if current_bit == 8:
-                    current_byte += 1
-                    current_bit = 0
-                if current_byte >= len(dst) - 1:
-                    break
-                dst[current_byte] = (dst[current_byte] | (1 << current_bit)) & 0xFF
-                current_bit += 1
-                if current_bit == 8:
-                    current_byte += 1
-                    current_bit = 0
-            else:
-                # "10" -> "1"
-                if current_byte >= len(dst) - 1:
-                    break
-                dst[current_byte] = (dst[current_byte] | (1 << current_bit)) & 0xFF
-                current_bit += 1
-                if current_bit == 8:
-                    current_byte += 1
-                    current_bit = 0
-        elif (src[k] & (1 << j)) != 0 and i == size - 1:
-            # "1" at end -> "0"
-            current_bit += 1
-            if current_bit == 8:
-                current_byte += 1
-                current_bit = 0
-        else:
-            # "0" -> "00"
-            current_bit += 1
-            if current_bit == 8:
-                current_byte += 1
-                current_bit = 0
-            current_bit += 1
-            if current_bit == 8:
-                current_byte += 1
-                current_bit = 0
-        j += 1
-        if j == 8:
-            j = 0
-            k += 1
-        i += 1
-
-    return current_byte * 8 + current_bit
-
-
-# =============================================================================
-# One-bit compression (run bits = ones) -- mirror of the zero-bit functions.
-# =============================================================================
-def compress_one_bits(src, size, dst):
-    for idx in range(len(dst)):
-        dst[idx] = 0
-    current_byte = 0
-    current_bit = 0
-
-    i = 0
-    j = 0
-    k = 0
-    result1 = 0
-    while i < size:
-        if (src[k] & (1 << j)) != 0 and i < size - 1:
-            i += 1
-            j += 1
-            if j == 8:
-                j = 0
-                k += 1
-            if (src[k] & (1 << j)) != 0:
-                dst[current_byte] = (dst[current_byte] | (1 << current_bit)) & 0xFF
-                current_bit += 1
-                if current_bit == 8:
-                    current_byte += 1
-                    current_bit = 0
-            else:
-                current_bit += 1
-                if current_bit == 8:
-                    current_byte += 1
-                    current_bit = 0
-                dst[current_byte] = (dst[current_byte] | (1 << current_bit)) & 0xFF
-                current_bit += 1
-                if current_bit == 8:
-                    current_byte += 1
-                    current_bit = 0
-        elif (src[k] & (1 << j)) != 0 and i == size - 1:
-            current_bit += 1
-            if current_bit == 8:
-                current_byte += 1
-                current_bit = 0
-            result1 = 1
-        else:
-            current_bit += 1
-            if current_bit == 8:
-                current_byte += 1
-                current_bit = 0
-            current_bit += 1
-            if current_bit == 8:
-                current_byte += 1
-                current_bit = 0
-        j += 1
-        if j == 8:
-            j = 0
-            k += 1
-        i += 1
-
-    return [current_byte * 8 + current_bit, result1]
-
-
-def decompress_one_bits(src, size, dst):
-    for idx in range(len(dst)):
-        dst[idx] = 0
-    current_byte = 0
-    current_bit = 0
-
-    i = 0
-    j = 0
-    k = 0
-    while i < size:
-        if (src[k] & (1 << j)) == 0 and i < size - 1:
-            i += 1
-            j += 1
-            if j == 8:
-                j = 0
-                k += 1
-            if (src[k] & (1 << j)) == 0:
-                # "00" -> "0"
-                current_bit += 1
-                if current_bit == 8:
-                    current_byte += 1
-                    current_bit = 0
-            else:
-                # "01" -> "10"
-                if current_byte >= len(dst) - 1:
-                    break
-                dst[current_byte] = (dst[current_byte] | (1 << current_bit)) & 0xFF
-                current_bit += 1
-                if current_bit == 8:
-                    current_byte += 1
-                    current_bit = 0
-                current_bit += 1
-                if current_bit == 8:
-                    current_byte += 1
-                    current_bit = 0
-        elif (src[k] & (1 << j)) == 0 and i == size - 1:
-            # "0" at end -> "1"
-            if current_byte >= len(dst) - 1:
-                break
-            dst[current_byte] = (dst[current_byte] | (1 << current_bit)) & 0xFF
-            current_bit += 1
-            if current_bit == 8:
-                current_byte += 1
-                current_bit = 0
-        else:
-            # "1" -> "11"
-            if current_byte >= len(dst) - 1:
-                break
-            dst[current_byte] = (dst[current_byte] | (1 << current_bit)) & 0xFF
-            current_bit += 1
-            if current_bit == 8:
-                current_byte += 1
-                current_bit = 0
-            if current_byte >= len(dst) - 1:
-                break
-            dst[current_byte] = (dst[current_byte] | (1 << current_bit)) & 0xFF
-            current_bit += 1
-            if current_bit == 8:
-                current_byte += 1
-                current_bit = 0
-        j += 1
-        if j == 8:
-            j = 0
-            k += 1
-        i += 1
-
-    return current_byte * 8 + current_bit
-
-
-# =============================================================================
-# High-level compress / decompress
-# =============================================================================
-compress_threshold = 0.10  # default 10% savings required (module-level, matches Java's static field)
-
-
-def compress_strings(src):
-    global compress_threshold
-    src = bytearray(src)
-    bit_length = get_bitlength(src)
-    zero_amount = get_compression_amount(src, bit_length, 0)
-    one_amount = get_compression_amount(src, bit_length, 1)
-    limit = 15
-
-    transform_type = 0 if zero_amount <= one_amount else 1
-
-    if transform_type == 0 and zero_amount >= 0:
-        return bytearray(src)
-    if transform_type == 1 and one_amount >= 0:
-        return bytearray(src)
-
-    buffer1 = bytearray(len(src) * 2 + 16)
-    buffer2 = bytearray(len(src) * 2 + 16)
-
-    if transform_type == 0:
-        result = compress_zero_bits(src, bit_length, buffer1)
-        compressed_length = result[0]
-        amount = get_compression_amount(buffer1, compressed_length, 0)
-    else:
-        result = compress_one_bits(src, bit_length, buffer1)
-        compressed_length = result[0]
-        amount = get_compression_amount(buffer1, compressed_length, 1)
-
-    iterations = 1
-    while amount < 0 and iterations < limit:
-        previous_length = compressed_length
-        if iterations % 2 == 1:
-            if transform_type == 0:
-                result = compress_zero_bits(buffer1, previous_length, buffer2)
-            else:
-                result = compress_one_bits(buffer1, previous_length, buffer2)
-            compressed_length = result[0]
-            iterations += 1
-            amount = get_compression_amount(buffer2, compressed_length, transform_type)
-        else:
-            if transform_type == 0:
-                result = compress_zero_bits(buffer2, previous_length, buffer1)
-            else:
-                result = compress_one_bits(buffer2, previous_length, buffer1)
-            compressed_length = result[0]
-            iterations += 1
-            amount = get_compression_amount(buffer1, compressed_length, transform_type)
-
-    bytelength = get_bytelength(compressed_length)
-    dst = bytearray(bytelength)
-    src_buf = buffer2 if iterations % 2 == 0 else buffer1
-    dst[0:bytelength - 1] = src_buf[0:bytelength - 1]
-    set_data(transform_type, iterations, compressed_length, dst)
-
-    if compressed_length < bit_length - int(bit_length * compress_threshold):
-        return dst
-    else:
-        return bytearray(src)
-
-
-def decompress_strings(string):
-    string = bytearray(string)
-    iterations = get_iterations(string)
-    if iterations == 0 or iterations == 16:
-        return string
-
-    bitlength = get_bitlength(string)
-    type_ = get_type(string)
-    bytelength = get_bytelength(bitlength)
-
-    iterations = iterations & 15
-
-    buffer1 = bytearray(bytelength * 2 + 16)
-    buffer2 = bytearray(bytelength * 2 + 16)
-
-    if type_ == 0:
-        uncompressed_length = decompress_zero_bits(string, bitlength, buffer1)
-    else:
-        uncompressed_length = decompress_one_bits(string, bitlength, buffer1)
-
-    in_buffer1 = True
-    iterations -= 1
-    while iterations > 0:
-        previous_length = uncompressed_length
-        need = get_bytelength(previous_length * 2 + 16)
-        if in_buffer1:
-            if len(buffer2) < need:
-                buffer2 = bytearray(need)
-            if type_ == 0:
-                uncompressed_length = decompress_zero_bits(buffer1, previous_length, buffer2)
-            else:
-                uncompressed_length = decompress_one_bits(buffer1, previous_length, buffer2)
-        else:
-            if len(buffer1) < need:
-                buffer1 = bytearray(need)
-            if type_ == 0:
-                uncompressed_length = decompress_zero_bits(buffer2, previous_length, buffer1)
-            else:
-                uncompressed_length = decompress_one_bits(buffer2, previous_length, buffer1)
-        in_buffer1 = not in_buffer1
-        iterations -= 1
-
-    out_bytelength = get_bytelength(uncompressed_length)
-    dst = bytearray(out_bytelength)
-    src_buf = buffer1 if in_buffer1 else buffer2
-    dst[0:out_bytelength - 1] = src_buf[0:out_bytelength - 1]
-    set_data(type_, 0, uncompressed_length, dst)
     return dst
 
 
-# =============================================================================
-# getStringList
-#
-# NOTE: like the Java, this MUTATES its `value` input in place:
-# value[0] is overwritten with value_range//2 (not preserved!), and
-# value[1:] each have min_value subtracted. Callers relying on the
-# original value array afterward need their own copy beforehand -- same
-# requirement as the Java.
-# =============================================================================
-def get_string_list(value, compress=None):
-    """Matches both Java overloads: getStringList(value) [no compress arg]
-    and getStringList(value, compress). Pass compress=None for the first
-    form (packs but does NOT run compress_strings), or True/False for the
-    second form."""
-    histogram_list = get_histogram(value)
-    min_value = histogram_list[0]
-    histogram = histogram_list[1]
-    value_range = histogram_list[2]
-    string_table = get_rank_table(histogram)
+def unpack_strings(src, table, size, bitlength):
+    src = _u8(src)
+    bitlength = min(bitlength, get_bitlength(src))
+    return _unpack_strings(src, np.asarray(table, dtype=np.int64), size, bitlength)
 
+
+def get_string_list(values, compress):
+    """[min, bitlength, table, string] -- StringMapper.getStringList. Unlike
+    the Java, the array passed in is not changed."""
+    value = np.array(values, dtype=np.int64)
+    lo, hist, value_range = get_histogram(value)
+    table = get_rank_table(hist)
+    value -= lo
     value[0] = value_range // 2
-    for i in range(1, len(value)):
-        value[i] -= min_value
-
-    string = pack_strings(value, string_table)
+    string = pack_strings(value, table)
     bitlength = get_bitlength(string)
-
-    if compress is None:
-        compressed_string = compress_strings(string)
-        return [min_value, bitlength, string_table, compressed_string]
-    else:
-        return [min_value, bitlength, string_table, (compress_strings(string) if compress else string)]
+    return [lo, bitlength, table, compress_strings(string) if compress else string]
 
 
-# =============================================================================
-# Utility methods
-# =============================================================================
-def get_bitlength(string):
-    last_byte = string[-1]
-    extra_bits = (last_byte >> 5) & 7
-    return (len(string) - 1) * 8 - extra_bits
+# ---- Zero-bit / one-bit compression ---------------------------------------------
 
-
-def get_iterations(string):
-    return string[-1] & 31
-
-
-LEADING_MASK_3 = 0xE0  # = SegmentMapper.getLeadingMask(3), verified against real Java
-                        # (an earlier version of this file guessed 0x1F, backwards from
-                        # the real value -- fixed once SegmentMapper was translated)
-
-
-def set_iterations(iterations, string):
-    """mask = SegmentMapper.get_leading_mask(3) -- see segment_mapper.py."""
-    mask = LEADING_MASK_3
-    string[-1] = string[-1] & mask
-    string[-1] = (string[-1] | (iterations & 0xFF)) & 0xFF
-
-
-def get_type(string):
-    iterations = string[-1] & 31
-    return 1 if iterations > 15 else 0
-
-
-def get_bytelength(bitlength):
-    bytelength = bitlength // 8
-    if bitlength % 8 != 0:
-        bytelength += 1
-    return bytelength + 1
-
-
-def set_data(type_, iterations, bitlength, string):
-    if type_ == 1:
-        iterations += 16
-    odd_bits = bitlength % 8
-    extra_bits = 0
-    if odd_bits != 0:
-        extra_bits = 8 - odd_bits
-    extra_bits = (extra_bits << 5) & 0xFF
-    string[-1] = iterations & 0xFF
-    string[-1] = (string[-1] | extra_bits) & 0xFF
-
-
-def get_bit_table():
-    """table[byte_value] = number of ZERO bits in that byte value (0-255)."""
-    table = [0] * 256
-    for value in range(256):
-        s = 0
-        for j in range(8):
-            if (value & (1 << j)) == 0:
-                s += 1
-        table[value] = s
-    return table
-
-
-_BIT_TABLE = get_bit_table()
-
-
-def get_zero_ratio(string, bit_length, table=None):
-    """Java has two overloads (with/without a precomputed bit table);
-    merged here into one function with an optional `table` param -- a
-    safe simplification since both produce identical results, only
-    differing in whether getBitTable() is recomputed each call."""
-    if table is None:
-        table = _BIT_TABLE
-    byte_length = bit_length // 8
-    zero_sum = 0
-    one_sum = 0
-    for i in range(byte_length):
-        j = string[i]
-        zero_sum += table[j]
-        one_sum += 8 - table[j]
-    remainder = bit_length % 8
-    for i in range(remainder):
-        if (string[byte_length] & (1 << i)) == 0:
-            zero_sum += 1
+@njit
+def _compress_bits(src, size, dst, one):
+    """compressZeroBits (one=0) / compressOneBits (one=1). Returns the
+    compressed bit length."""
+    for i in range(dst.shape[0]):
+        dst[i] = 0
+    cb = 0
+    cbit = 0
+    i = 0
+    j = 0
+    k = 0
+    while i < size:
+        bit = (src[k] >> j) & 1
+        run = (bit == 0) if one == 0 else (bit != 0)
+        if run and i < size - 1:
+            i += 1
+            j += 1
+            if j == 8:
+                j = 0
+                k += 1
+            bit2 = (src[k] >> j) & 1
+            same = (bit2 == 0) if one == 0 else (bit2 != 0)
+            if one == 0:
+                if same:
+                    cbit += 1
+                    if cbit == 8:
+                        cb += 1
+                        cbit = 0
+                else:
+                    dst[cb] |= 1 << cbit
+                    cbit += 1
+                    if cbit == 8:
+                        cb += 1
+                        cbit = 0
+                        dst[cb] = 0
+                    dst[cb] |= 1 << cbit
+                    cbit += 1
+                    if cbit == 8:
+                        cb += 1
+                        cbit = 0
+            else:
+                if same:
+                    dst[cb] |= 1 << cbit
+                    cbit += 1
+                    if cbit == 8:
+                        cb += 1
+                        cbit = 0
+                else:
+                    cbit += 1
+                    if cbit == 8:
+                        cb += 1
+                        cbit = 0
+                    dst[cb] |= 1 << cbit
+                    cbit += 1
+                    if cbit == 8:
+                        cb += 1
+                        cbit = 0
+        elif run and i == size - 1:
+            if one == 0:
+                dst[cb] |= 1 << cbit
+            cbit += 1
+            if cbit == 8:
+                cb += 1
+                cbit = 0
         else:
-            one_sum += 1
-    total = zero_sum + one_sum
-    if total == 0:
-        # Matches Java: (double)0/0 == NaN, and `NaN < 0.5` evaluates false
-        # there (IEEE 754), which is exactly what Python's `float('nan') <
-        # 0.5` also does -- so returning NaN here (rather than raising)
-        # lets the caller's `zero_ratio < 0.5` comparison naturally resolve
-        # the same way Java's does, with no special-casing needed there.
-        return float("nan")
-    return zero_sum / total
+            if one == 0:
+                dst[cb] |= 1 << cbit
+            cbit += 1
+            if cbit == 8:
+                cb += 1
+                cbit = 0
+            cbit += 1
+            if cbit == 8:
+                cb += 1
+                cbit = 0
+        j += 1
+        if j == 8:
+            j = 0
+            k += 1
+        i += 1
+    return cb * 8 + cbit
 
 
 @njit
-def _compression_amount_core(string, bit_length, transform_type):
+def _decompress_bits(src, size, dst, one):
+    """decompressZeroBits (one=0) / decompressOneBits (one=1)."""
+    for i in range(dst.shape[0]):
+        dst[i] = 0
+    cb = 0
+    cbit = 0
+    last = dst.shape[0] - 1
+    i = 0
+    j = 0
+    k = 0
+    while i < size:
+        bit = (src[k] >> j) & 1
+        mark = (bit != 0) if one == 0 else (bit == 0)
+        if mark and i < size - 1:
+            i += 1
+            j += 1
+            if j == 8:
+                j = 0
+                k += 1
+            bit2 = (src[k] >> j) & 1
+            if one == 0:
+                if bit2 != 0:                   # "11" -> "01"
+                    cbit += 1
+                    if cbit == 8:
+                        cb += 1
+                        cbit = 0
+                    if cb >= last:
+                        break
+                    dst[cb] |= 1 << cbit
+                    cbit += 1
+                    if cbit == 8:
+                        cb += 1
+                        cbit = 0
+                else:                           # "10" -> "1"
+                    if cb >= last:
+                        break
+                    dst[cb] |= 1 << cbit
+                    cbit += 1
+                    if cbit == 8:
+                        cb += 1
+                        cbit = 0
+            else:
+                if bit2 == 0:                   # "00" -> "0"
+                    cbit += 1
+                    if cbit == 8:
+                        cb += 1
+                        cbit = 0
+                else:                           # "01" -> "10"
+                    if cb >= last:
+                        break
+                    dst[cb] |= 1 << cbit
+                    cbit += 1
+                    if cbit == 8:
+                        cb += 1
+                        cbit = 0
+                    cbit += 1
+                    if cbit == 8:
+                        cb += 1
+                        cbit = 0
+        elif mark and i == size - 1:
+            if one == 0:                        # "1" at end -> "0"
+                cbit += 1
+                if cbit == 8:
+                    cb += 1
+                    cbit = 0
+            else:                               # "0" at end -> "1"
+                if cb >= last:
+                    break
+                dst[cb] |= 1 << cbit
+                cbit += 1
+                if cbit == 8:
+                    cb += 1
+                    cbit = 0
+        else:
+            if one == 0:                        # "0" -> "00"
+                cbit += 2
+                if cbit >= 8:
+                    cb += 1
+                    cbit -= 8
+            else:                               # "1" -> "11"
+                if cb >= last:
+                    break
+                dst[cb] |= 1 << cbit
+                cbit += 1
+                if cbit == 8:
+                    cb += 1
+                    cbit = 0
+                if cb >= last:
+                    break
+                dst[cb] |= 1 << cbit
+                cbit += 1
+                if cbit == 8:
+                    cb += 1
+                    cbit = 0
+        j += 1
+        if j == 8:
+            j = 0
+            k += 1
+        i += 1
+    return cb * 8 + cbit
+
+
+@njit
+def _compression_amount(string, bit_length, transform_type):
     positive = 0
     negative = 0
     byte_length = bit_length // 8
-
-    if transform_type == 0:
-        previous = 1
-        for i in range(byte_length):
-            for j in range(8):
-                k = string[i] & (1 << j)
-                if k != 0 and previous != 0:
-                    positive += 1
-                elif k != 0:
-                    previous = 1
-                elif k == 0 and previous != 0:
-                    previous = 0
-                else:
-                    negative += 1
-                    previous = 1
-        remainder = bit_length % 8
-        for i in range(remainder):
-            j = string[byte_length] & (1 << i)
-            if j != 0 and previous != 0:
+    total = byte_length * 8 + bit_length % 8
+    previous = 1 if transform_type == 0 else 0
+    for p in range(total):
+        bit = (string[p >> 3] >> (p & 7)) & 1
+        if transform_type == 0:
+            if bit != 0 and previous != 0:
                 positive += 1
-            elif j != 0:
+            elif bit != 0:
                 previous = 1
-            elif j == 0 and previous != 0:
+            elif previous != 0:
                 previous = 0
             else:
                 negative += 1
                 previous = 1
-    else:
-        previous = 0
-        for i in range(byte_length):
-            for j in range(8):
-                k = string[i] & (1 << j)
-                if k == 0 and previous == 0:
-                    positive += 1
-                elif k == 0:
-                    previous = 0
-                elif k != 0 and previous == 0:
-                    previous = 1
-                else:
-                    negative += 1
-                    previous = 0
-        remainder = bit_length % 8
-        for i in range(remainder):
-            j = string[byte_length] & (1 << i)
-            if j == 0 and previous == 0:
+        else:
+            if bit == 0 and previous == 0:
                 positive += 1
-            elif j == 0:
+            elif bit == 0:
                 previous = 0
-            elif j != 0 and previous == 0:
+            elif previous == 0:
                 previous = 1
             else:
                 negative += 1
@@ -878,59 +459,67 @@ def _compression_amount_core(string, bit_length, transform_type):
     return positive - negative
 
 
-def get_compression_amount(string, bit_length, transform_type):
-    string_arr = np.frombuffer(bytes(string), dtype=np.uint8)
-    return int(_compression_amount_core(string_arr, bit_length, transform_type))
+compress_threshold = 0.10
 
 
-if __name__ == "__main__":
-    print("string_mapper.py self-test\n")
+def compress_strings(src):
+    src = _u8(src)
+    bit_length = get_bitlength(src)
+    zero_amount = _compression_amount(src, bit_length, 0)
+    one_amount = _compression_amount(src, bit_length, 1)
+    transform = 0 if zero_amount <= one_amount else 1
+    if (transform == 0 and zero_amount >= 0) or (transform == 1 and one_amount >= 0):
+        return src.copy()
+    buffer1 = np.zeros(len(src) * 2 + 16, dtype=np.uint8)
+    buffer2 = np.zeros(len(src) * 2 + 16, dtype=np.uint8)
+    length = _compress_bits(src, bit_length, buffer1, transform)
+    amount = _compression_amount(buffer1, length, transform)
+    iterations = 1
+    while amount < 0 and iterations < 15:
+        if iterations % 2 == 1:
+            length = _compress_bits(buffer1, length, buffer2, transform)
+            amount = _compression_amount(buffer2, length, transform)
+        else:
+            length = _compress_bits(buffer2, length, buffer1, transform)
+            amount = _compression_amount(buffer1, length, transform)
+        iterations += 1
+    bytelength = get_bytelength(length)
+    dst = np.zeros(bytelength, dtype=np.uint8)
+    dst[:bytelength - 1] = (buffer2 if iterations % 2 == 0 else buffer1)[:bytelength - 1]
+    _set_data(transform, iterations, length, dst)
+    if length < bit_length - int(bit_length * compress_threshold):
+        return dst
+    return src.copy()
 
-    # ---- 1. small hand-checkable histogram / rank table ----
-    values = [3, 1, 4, 1, 5, 9, 2, 6, 1, 1]
-    hist_min, histogram, rng = get_histogram(values)
-    assert hist_min == 1 and rng == 9, (hist_min, rng)
-    # bin counts: value 1 appears 4x, everything else 0-1x
-    assert histogram[0] == 4  # bin for value 1 (1-1=0)
-    rank_table = get_rank_table(histogram)
-    assert rank_table[0] == 0, "most frequent bin (value 1, count 4) should get rank 0"
-    print("OK: histogram / rank table on a small hand-checkable example")
 
-    # ---- 2. pack/unpack round trip ----
-    src = [0, 0, 1, 2, 0, 1, 0, 3, 0, 0, 1, 2, 2, 0]
-    h_min, h_hist, h_rng = get_histogram(src)
-    table = get_rank_table(h_hist)
-    shifted = [v - h_min for v in src]
-    packed = pack_strings(shifted, table)
-    recovered = unpack_strings(packed, table, len(src), get_bitlength(packed))
-    assert recovered == shifted, f"pack/unpack round trip failed: {recovered} != {shifted}"
-    print("OK: pack_strings/unpack_strings round trip")
-
-    # ---- 3. full getStringList + compress + decompress + unpack round trip ----
-    # (getStringList mutates its input -- see the module docstring -- so the
-    # "recovered" values match the MUTATED representation, not the raw input)
-    import random
-    random.seed(7)
-    value = [random.randint(-40, 40) for _ in range(300)]
-    min_v, bitlen, tbl, packed = get_string_list(value, True)  # mutates `value` in place
-    decompressed = decompress_strings(packed)
-    recovered = unpack_strings(decompressed, tbl, len(value), get_bitlength(decompressed))
-    assert recovered == value, "full pipeline round trip failed"
-    print(f"OK: getStringList -> compress -> decompress -> unpack round trip "
-          f"(iterations={get_iterations(packed) & 15}, type={get_type(packed)})")
-
-    # ---- 4. n=1 edge case (bitlength=0, exercises the NaN-comparison path) ----
-    v1 = [0]
-    m, bl, t, p = get_string_list(v1, True)
-    assert bl == 0
-    r1 = unpack_strings(decompress_strings(p), t, 1, get_bitlength(decompress_strings(p)))
-    assert r1 == v1
-    print("OK: n=1 edge case (bitlength=0) handled without error")
-
-    print("\nAll checks passed.")
-    print("\nNote: this module was additionally verified against the real,")
-    print("compiled Java (javac/java, not just this self-test) across 1508")
-    print("randomized + edge-case test cases spanning the full pipeline,")
-    print("matching at every intermediate stage (histogram, rank table,")
-    print("packed bytes, iteration/type metadata, and final recovered")
-    print("values) -- not just end-to-end output.")
+def decompress_strings(string):
+    string = _u8(string)
+    iterations = get_iterations(string)
+    if iterations == 0 or iterations == 16:
+        return string
+    bitlength = get_bitlength(string)
+    type_ = get_type(string)
+    bytelength = get_bytelength(bitlength)
+    iterations &= 15
+    buffer1 = np.zeros(bytelength * 2 + 16, dtype=np.uint8)
+    buffer2 = np.zeros(bytelength * 2 + 16, dtype=np.uint8)
+    length = _decompress_bits(string, bitlength, buffer1, type_)
+    in_buffer1 = True
+    iterations -= 1
+    while iterations > 0:
+        need = get_bytelength(length * 2 + 16)
+        if in_buffer1:
+            if len(buffer2) < need:
+                buffer2 = np.zeros(need, dtype=np.uint8)
+            length = _decompress_bits(buffer1, length, buffer2, type_)
+        else:
+            if len(buffer1) < need:
+                buffer1 = np.zeros(need, dtype=np.uint8)
+            length = _decompress_bits(buffer2, length, buffer1, type_)
+        in_buffer1 = not in_buffer1
+        iterations -= 1
+    out_len = get_bytelength(length)
+    dst = np.zeros(out_len, dtype=np.uint8)
+    dst[:out_len - 1] = (buffer1 if in_buffer1 else buffer2)[:out_len - 1]
+    _set_data(type_, 0, length, dst)
+    return dst

@@ -1,1430 +1,639 @@
 #!/usr/bin/env python3
 """
-delta_writer.py — PySide6 (Qt for Python) port of DeltaWriter.java.
+delta_writer.py version 1.0 -- DeltaWriter.java for Python (PySide6).
 
-This targets the newer, simplified version of DeltaWriter.java: no
-Statistics menu/tables, a flat 4-item Entropy menu (LZ77/Huffman/
-Arithmetic/Slow Arithmetic, no sub-dialog), a plain single-slider dialog
-for every Quantization item (no combined Smooth dialog, no String
-compression-threshold slider), and a new `scanline5_variant` header byte.
+Quantizes an image, codes it as deltas and saves it (to the file "foo", as
+the Java version does) in Delta format 'D' version 1: the same file layout
+as DeltaWriter.java, so either program's files open in either reader.
 
-Per the user's instruction, Java's `Deflater` (used for the LZ77 payload
-and for compressing the arithmetic-coding frequency tables) is replaced
-directly with Python's `zlib` module here in DeltaWriter itself, since
-it's a JDK utility being swapped for its Python standard-library
-equivalent, not one of the project's own external algorithm classes.
+    python3 delta_writer.py [image]
 
-External algorithm classes are imported and called directly, with no
-stubs.py facade layer in between:
-  - DeltaMapper      -> delta_mapper.py (real translation)
-  - CodeMapper       -> code_mapper.py (real translation; itself needs
-                         string_mapper.py and segment_mapper.py importable)
-  - StringMapper     -> string_mapper.py (real translation)
-  - ArithmeticMapper -> arithmetic_mapper.py (real translation)
-  - ResizeMapper     -> resize_mapper.py (real translation)
+The coding (class DeltaCoder) is separate from the window (DeltaWriter), so
+it can also be used without a display:
 
-The real modules operate on flat 1D sequences indexed by k = i*xdim + j
-(matching Java's flat int[] convention), while this file's own channel
-arrays are 2D numpy arrays. The small `_encoder`/`_decoder`/`_freq`
-wrappers and the handful of named helper functions right after the
-imports below handle that reshaping; they are not a stand-in for the
-algorithms themselves, which are called directly.
+    coder = DeltaCoder(viewer_support.read_image("photo.png"))
+    coder.survey(); coder.apply(); coder.save("photo.dlt")
 
-Run:
-    pip install PySide6 numpy opencv-python
-    python3 delta_writer.py [image_file]
+Not ported yet: the pixel pyramid ("Average" in the Java Quantization menu),
+which needs ImageMapper. Files are written without it (pixel_pyramid 0).
+
+The first run compiles the Numba code (about a minute); later runs load it
+from the cache.
 """
 
 import os
+import struct
 import sys
-import threading
-import time
-import zlib
 
 import numpy as np
-import cv2
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QImage, QPixmap, QAction, QActionGroup, QKeySequence
-from PySide6.QtWidgets import (
-    QApplication, QMainWindow, QScrollArea, QLabel, QFileDialog,
-    QDialog, QSlider, QLineEdit, QHBoxLayout, QVBoxLayout,
-    QRadioButton, QButtonGroup,
-)
-
-# Real translated modules, called directly -- no stubs.py facade layer.
-import delta_mapper as dm
-import code_mapper as cm
-import string_mapper as sm
 import arithmetic_mapper as am
+import code_mapper as cm
+import delta_mapper as dm
 import resize_mapper as rm
+import string_mapper as sm
+import viewer_support as vs
+from java_io import DataOutput
+
+FORMAT_ID = ord('D')
+FORMAT_VERSION = 1
+
+ENTROPY_NAMES = ["LZ77", "Huffman", "Arithmetic", "Adaptive", "Context"]
+DELTA_MENU_NAMES = ["H", "V", "Average", "Med", "Directional", "Adaptive", "Scanline 1", "Scanline 2",
+                    "Scanline 3", "Scanline 4", "Scanline 5", "Map 1", "Map 2", "Block Map"]
 
 
 # =============================================================================
-# Thin local adapters over the real modules above.
-#
-# These are NOT a stand-in/stub layer -- delta_mapper.py, code_mapper.py,
-# string_mapper.py and arithmetic_mapper.py are the real translations and
-# are called directly everywhere below. What lives here is purely
-# reshaping: the real functions operate on flat 1D sequences indexed by
-# k = i*xdim + j (matching the original Java's flat int[] convention),
-# while this file's own channel arrays are 2D numpy arrays (ydim x xdim).
-# Each wrapper flattens 2D input before the call and reshapes the result
-# back to 2D afterward; delta arrays (already flat by the time they reach
-# CodeMapper/StringMapper/ArithmeticMapper calls) pass through untouched.
-#
-# ResizeMapper.java has been translated to resize_mapper.py; resize_channel()
-# below just handles the flat<->2D reshaping between it and this file's own
-# 2D numpy channel arrays.
+# The coding, without the window
 # =============================================================================
-def _flat(src):
-    """Flatten a 2D array to a plain Python list (row-major, matching
-    delta_mapper's k = i*xdim + j convention); pass 1D input through as a
-    list unchanged."""
-    arr = np.asarray(src)
-    if arr.ndim > 1:
-        return arr.reshape(-1).tolist()
-    return arr.tolist() if not isinstance(src, list) else src
 
+class DeltaCoder:
+    """Holds an image and the compression settings; survey() picks the
+    channel set, delta type and datatype, apply() codes (and decodes, for
+    the preview), save() writes the file."""
+
+    def __init__(self, rgb, file_length=0):
+        self.image_ydim, self.image_xdim = rgb.shape[:2]
+        # Channel 0 is bits 16-23 of the Java pixel (red), as DeltaWriter.java
+        # reads it; the names in DeltaMapper.SET_NAMES follow the Java.
+        self.source = [rgb[:, :, c].reshape(-1).astype(np.int64) for c in range(3)]
+        self.file_length = file_length
 
-def _encoder(fn):
-    """Wrap a delta_mapper encoder (flat src in) so it also accepts a 2D
-    per-channel array, as delta_writer.py's own code passes."""
-    def wrapped(src, xdim, ydim):
-        return fn(_flat(src), xdim, ydim)
-    return wrapped
-
-
-def _decoder(fn):
-    """Wrap a delta_mapper decoder taking (src, xdim, ydim, init_value):
-    src (the delta array) is already flat by the time it reaches here, so
-    this only normalizes init_value to a plain Python int (it may arrive
-    as a numpy scalar)."""
-    def wrapped(src, xdim, ydim, init_value):
-        return fn(src, xdim, ydim, int(init_value))
-    return wrapped
-
-
-def _decoder_map(fn):
-    """Same as _decoder, for the map-using decoders (src, xdim, ydim,
-    init_value, map_)."""
-    def wrapped(src, xdim, ydim, init_value, map_):
-        return fn(src, xdim, ydim, int(init_value), map_)
-    return wrapped
-
-
-def _freq(fn):
-    """Wrap a delta_mapper frequency estimator (flat src in) so it also
-    accepts a 2D per-channel array."""
-    def wrapped(src, xdim, ydim):
-        return fn(_flat(src), xdim, ydim)
-    return wrapped
-
-
-get_ideal_frequency = _freq(dm.get_ideal_frequency)
-# get_ideal_frequency8/16, get_med_scanline_frequency, get_scanline2_frequency,
-# get_mixed_deltas4_frequency, get_mixed_deltas16_frequency used to be wrapped
-# here too, for InitWorker's old Shannon-limit-estimate shortcut on delta
-# types 6-9/11-12. Removed now that InitWorker builds and compresses a real
-# bit string for every type instead (see InitWorker.run() and
-# print_delta_type_ranking()) -- these wrappers had no other callers.
-
-
-def bilateral_smooth(src, xdim, ydim, threshold):
-    flat = dm.bilateral_smooth(_flat(src), xdim, ydim, threshold)
-    return np.asarray(flat).reshape(ydim, xdim)
-
-
-def anisotropic_smooth(src, xdim, ydim, threshold):
-    flat = dm.anisotropic_smooth(_flat(src), xdim, ydim, threshold)
-    return np.asarray(flat).reshape(ydim, xdim)
-
-
-def shift_2d(src, amount):
-    a = np.asarray(src)
-    flat = dm.shift(_flat(a), amount)
-    return np.asarray(flat).reshape(a.shape) if a.ndim > 1 else np.asarray(flat)
-
-
-def quantize_channel(ch, pixel_shift):
-    """Right-shifts ch by pixel_shift with rounding to nearest (adding
-    half a quantization step before truncating), rather than a pure
-    truncating shift.
-
-    This is a deliberate encode-side design choice, not a straight
-    port of anything -- DeltaReader.java's decode is a pure left-shift
-    with no rounding compensation (see DeltaMapper.getPixel()'s
-    blue_shift/green_shift/red_shift), so it reconstructs whatever
-    quantized value was actually stored, however that value was chosen.
-    A pure truncating right-shift here (shift_2d(ch, -pixel_shift), i.e.
-    floor division) would introduce a systematic DARKENING bias: every
-    reconstructed pixel is <= the original, never brighter, biased
-    downward by about half a quantization step on average (confirmed:
-    at pixel_shift=7 this measured ~61 levels darker on average, out of
-    a worst case of 127). Adding half a step before truncating centers
-    the quantization error around zero instead. No change to
-    delta_reader.py or the on-disk file format is needed for this --
-    the reader (and this file's own preview decode) just left-shifts
-    back whichever quantized value ends up written; only which value
-    gets written in the first place changes here.
-
-    CLAMPED at the top of the range: naively adding half a step and
-    truncating can round a near-maximum input up to a quantization index
-    whose reconstruction (index << pixel_shift) exceeds 255 -- e.g. at
-    pixel_shift=3, input 255 rounds to index 32, reconstructing to 256,
-    for every pixel_shift value from 1-7 (confirmed by direct
-    computation, not just at the boundary). This numpy pipeline clips
-    the final assembled image to 0-255 right before display, so it
-    wouldn't crash or wrap here -- but it would silently push every
-    near-white pixel to the single coarsest quantization bucket instead
-    of its properly rounded one, and if this same rounding scheme were
-    ever ported into DeltaMapper.getPixel()'s bit-packed-int assembly
-    (blue[k] << (pixel_shift+16), etc.), a value of 256 in an 8-bit-wide
-    field would overflow into the next channel's bits -- a real color
-    corruption, not just clipping. Capping the pre-shift value at 255
-    (so the chosen index can never reconstruct past the input's own
-    valid range) avoids both."""
-    arr = np.asarray(ch, dtype=np.int64)
-    half = 1 << (pixel_shift - 1)
-    return np.minimum(arr + half, 255) >> pixel_shift
-
-
-def difference_2d(src1, src2):
-    a, b = np.asarray(src1), np.asarray(src2)
-    flat = dm.get_difference(a.reshape(-1).tolist(), b.reshape(-1).tolist())
-    return np.asarray(flat).reshape(a.shape)
-
-
-def sum_2d(src1, src2):
-    a, b = np.asarray(src1), np.asarray(src2)
-    flat = dm.get_sum(a.reshape(-1).tolist(), b.reshape(-1).tolist())
-    return np.asarray(flat).reshape(a.shape)
-
-
-def resize_channel(src, old_xdim, new_xdim, new_ydim):
-    """resize_mapper.resize() operates on a flat, row-major sequence and
-    returns a plain Python list; delta_writer.py's own channel arrays are
-    2D numpy arrays, so flatten in and reshape back out here."""
-    arr = np.asarray(src)
-    dtype = arr.dtype
-    flat = rm.resize(_flat(arr), int(old_xdim), int(new_xdim), int(new_ydim))
-    return np.asarray(flat, dtype=dtype).reshape(int(new_ydim), int(new_xdim))
-
-
-def get_histogram(src):
-    # delta_writer's Huffman save path calls .tolist() on the returned
-    # histogram, so return a numpy array here rather than the plain
-    # Python list string_mapper.get_histogram() itself produces.
-    min_v, hist, _rng = sm.get_histogram(list(np.asarray(src).reshape(-1)))
-    return min_v, np.asarray(hist)
-
-
-def get_string_list(value, compress):
-    # string_mapper.get_string_list MUTATES its `value` argument in place
-    # (see that module's own docstring): value[0] is overwritten and
-    # value[1:] each have min_value subtracted. Each `delta`/map array
-    # flowing through here is used once, matching that requirement.
-    vals = list(np.asarray(value).reshape(-1).tolist()) if not isinstance(value, list) else value
-    return sm.get_string_list(vals, compress)
-
-
-def unpack_strings(src, table, size, bitlength):
-    flat = sm.unpack_strings(src, list(table), int(size), int(bitlength))
-    return np.asarray(flat)
-
-
-def pack_code(src, table, code, length):
-    """code_mapper.pack_code_byte returns [dst, bitlength, table, code,
-    length, len(src)]; delta_writer.py only needs the first two."""
-    result = cm.pack_code_byte(list(src), list(table), list(code), list(length))
-    return result[0], result[1]
-
-ZOOM_FACTOR = 1.25
-ZOOM_MIN = 0.05
-ZOOM_MAX = 32.0
-
-CHANNEL_STRINGS = ["blue", "green", "red", "blue-green", "red-green", "red-blue"]
-SET_STRINGS = [
-    "blue, green, red",
-    "blue, red, red-green",
-    "blue, red, blue-green",
-    "blue, blue-green, red-green",
-    "blue, blue-green, red-blue",
-    "green, red, blue-green",
-    "red, blue-green, red-green",
-    "green, blue-green, red-green",
-    "green, red-green, red-blue",
-    "red, red-green, red-blue",
-]
-DELTA_TYPE_STRINGS = [
-    "horizontal", "vertical", "average", "med", "directional", "adaptive",
-    "scanline (1)", "scanline (2)", "scanline (3)", "scanline (4)",
-    "scanline (5)", "frame map (1)", "frame map (2)",
-]
-
-DELTA_MENU_NAMES = ["H", "V", "Average", "Med", "Directional", "Scanline 5", "Adaptive",
-                    "Scanline 1", "Scanline 2", "Scanline 3", "Scanline 4", "Map (1)", "Map (2)"]
-DELTA_MENU_TYPES = [0, 1, 2, 3, 4, 10, 5, 6, 7, 8, 9, 11, 12]
-
-# entropy menu order -> internal entropy_type id (mirrors Java's entropy_map)
-ENTROPY_MENU_NAMES_TYPES = [("LZ77", 0), ("Huffman", 1), ("Arithmetic", 3), ("Slow Arithmetic", 2)]
-
-
-# delta_type 10 ("scanline 5") uses a per-row predictor set selected from
-# FILTER_SETS_8 by an extra `variant` byte (dm.get_mixed_deltas_from_values8_rows /
-# dm.get_values_from_mixed_deltas8_rows take one, unlike every other delta
-# type here) -- wrapped separately since it doesn't fit the plain
-# _encoder/_decoder_map signatures. The variant used is always
-# self.scanline5_variant, written to the file header, so encode and decode
-# agree; variant selection itself isn't wired to any UI (matches the
-# original "not yet wired to any UI" note on scanline5_variant).
-def _encoder_scanline5(variant):
-    def wrapped(src, xdim, ydim):
-        return dm.get_mixed_deltas_from_values8_rows(_flat(src), xdim, ydim, variant)
-    return wrapped
-
-
-def _decoder_scanline5(variant):
-    def wrapped(src, xdim, ydim, init_value, map_):
-        return dm.get_values_from_mixed_deltas8_rows(src, xdim, ydim, int(init_value), map_, variant)
-    return wrapped
-
-
-# delta_type -> (encoder, decoder, uses_map)
-_ENCODERS = {
-    0: (_encoder(dm.get_horizontal_deltas_from_values), _decoder(dm.get_values_from_horizontal_deltas), False),
-    1: (_encoder(dm.get_vertical_deltas_from_values), _decoder(dm.get_values_from_vertical_deltas), False),
-    2: (_encoder(dm.get_average_deltas_from_values), _decoder(dm.get_values_from_average_deltas), False),
-    3: (_encoder(dm.get_med_deltas_from_values), _decoder(dm.get_values_from_med_deltas), False),
-    4: (_encoder(dm.get_directional_deltas_from_values), _decoder(dm.get_values_from_directional_deltas), False),
-    5: (_encoder(dm.get_adaptive_deltas_from_values), _decoder(dm.get_values_from_adaptive_deltas), False),
-    6: (_encoder(dm.get_mixed_deltas_from_values), _decoder_map(dm.get_values_from_mixed_deltas), True),
-    7: (_encoder(dm.get_mixed_deltas_from_values2), _decoder_map(dm.get_values_from_mixed_deltas2), True),
-    8: (_encoder(dm.get_mixed_deltas_from_values4), _decoder_map(dm.get_values_from_mixed_deltas4), True),
-    9: (_encoder(dm.get_mixed_deltas_from_values16_rows), _decoder_map(dm.get_values_from_mixed_deltas16_rows), True),
-    11: (_encoder(dm.get_ideal_deltas_from_values8), _decoder_map(dm.get_values_from_ideal_deltas8), True),
-    12: (_encoder(dm.get_ideal_deltas_from_values16), _decoder_map(dm.get_values_from_ideal_deltas16), True),
-    # entry for 10 ("scanline 5") is added below once self.scanline5_variant's
-    # default (0) is known -- see _make_encoders_for_variant().
-}
-
-
-def _make_encoders_for_variant(variant):
-    """Returns a full _ENCODERS-shaped dict with entry 10 bound to the
-    given scanline5_variant. delta_writer.py doesn't currently expose a
-    way to change scanline5_variant from the UI, so this is called once
-    with variant=0 below; re-call it if that ever changes."""
-    encoders = dict(_ENCODERS)
-    encoders[10] = (_encoder_scanline5(variant), _decoder_scanline5(variant), True)
-    return encoders
-
-
-_ENCODERS = _make_encoders_for_variant(0)
-
-
-def numpy_bgr_to_qpixmap(arr_bgr: np.ndarray) -> QPixmap:
-    """cv2 images are BGR-ordered; Qt's Format_RGB888 wants RGB, so convert."""
-    arr_bgr = np.ascontiguousarray(arr_bgr.clip(0, 255).astype(np.uint8))
-    rgb = cv2.cvtColor(arr_bgr, cv2.COLOR_BGR2RGB)
-    h, w, _ = rgb.shape
-    qimg = QImage(rgb.data, w, h, w * 3, QImage.Format_RGB888).copy()
-    return QPixmap.fromImage(qimg)
-
-
-# =============================================================================
-# Background "init()" worker -- auto-picks channel set / delta type /
-# compress type, mirroring the Java SwingWorker in showInitialImage().
-# =============================================================================
-def print_channel_set_ranking(channel_sum, set_sum, selected_set_id):
-    """Prints the ranked channel-set table (rank, set composition, per-
-    channel entropy estimate, total), marking the set that was actually
-    selected. Mirrors DeltaWriter.java's printChannelSetRanking()."""
-    order = sorted(range(10), key=lambda i: set_sum[i])
-    print("Channel sets (ranked):")
-    for r, idx in enumerate(order):
-        c = dm.get_channels(idx)
-        sel = " **" if idx == selected_set_id else ""
-        print(f"  {r+1:2d}. {SET_STRINGS[idx]:<32s} {channel_sum[c[0]]:10d} {channel_sum[c[1]]:10d} "
-              f"{channel_sum[c[2]]:10d} {set_sum[idx]:12d}{sel}")
-    print()
-
-
-def print_delta_type_ranking(delta_bits, map_bits, delta_compressed, map_compressed, total_delta_sum, selected_dt):
-    """Prints the ranked delta-type table: rank, name, delta bits (with its
-    own compression marker), map bits for the types that have one (with its
-    own marker), and the combined total used for selection -- marking the
-    type that was actually selected. Mirrors DeltaWriter.java's version:
-    types without a map print with the map column blank rather than a
-    misleading 0, so the delta/total columns stay aligned either way.
-
-    A compression marker (*) means compress_strings() ran on that specific
-    bit string (delta or map) and its iterations count indicated real
-    compression, not just a pass-through.
-    """
-    order = sorted(range(13), key=lambda i: total_delta_sum[i])
-    print("Delta types (ranked):")
-    for r, idx in enumerate(order):
-        dc = "*" if delta_compressed[idx] else " "
-        sel = " **" if idx == selected_dt else ""
-        if _ENCODERS[idx][2]:  # has_map
-            mc = "*" if map_compressed[idx] else " "
-            print(f"  {r+1:2d}. {DELTA_TYPE_STRINGS[idx]:<16s} delta: {delta_bits[idx]:12d}{dc}      "
-                  f"map: {map_bits[idx]:12d}{mc}      total: {total_delta_sum[idx]:12d}{sel}")
-        else:
-            print(f"  {r+1:2d}. {DELTA_TYPE_STRINGS[idx]:<16s} delta: {delta_bits[idx]:12d}{dc}                              "
-                  f"total: {total_delta_sum[idx]:12d}{sel}")
-    print()
-
-
-class InitWorker(QThread):
-    finished_with = Signal(int, int, int)  # min_set_id, delta_type, compress_type
-
-    def __init__(self, window):
-        super().__init__()
-        self.window = window
-
-    def run(self):
-        w = self.window
-        print(f"[InitWorker] analyzing '{w.filename}' in background thread...")
-        qcl6 = w._build_quantized_channels()
-        # FIX: was DeltaMapper.getIdealFrequency(qcl6[i], 0, 0) -- passing
-        # literal 0 for both xdim and ydim instead of qcl6[i]'s actual
-        # dimensions. get_ideal_frequency's loop is `for i in range(1,
-        # ydim)`, so ydim=0 makes that loop never run, leaving its
-        # internal delta_list empty, and min()/max() on an empty list
-        # raises ValueError -- crashing this background QThread every
-        # time (visible as "Error calling Python override of
-        # QThread::run()" with a ValueError: min() iterable argument is
-        # empty traceback). Reading xdim/ydim directly off qcl6[i]'s own
-        # shape guarantees they match what _build_quantized_channels()
-        # actually produced, the same way _apply_preview_impl already
-        # does via new_xdim, new_ydim from _quantized_dims().
-        qc_ydim, qc_xdim = qcl6[0].shape
-        channel_sum = [int(cm.get_shannon_limit(get_ideal_frequency(qcl6[i], qc_xdim, qc_ydim))) for i in range(6)]
-        set_sum = w._compute_set_sums(channel_sum)
-        min_set_id = int(np.argmin(set_sum))
-        print_channel_set_ranking(channel_sum, set_sum, min_set_id)
-        channel_id = dm.get_channels(min_set_id)
-
-        # ---- pick the best delta type: build a REAL delta (and, where
-        # applicable, map) bit string for every one of the 13 candidates
-        # and actually compress it, rather than using a Shannon-limit
-        # estimate for types 6-9/11-12 (matching DeltaWriter.java's most
-        # recent change). This also fixes a pre-existing gap where type
-        # 10's map cost wasn't tracked at all -- it only ever contributed
-        # its delta cost to total_delta_sum. _ENCODERS already uniformly
-        # wraps every type's real value-computing function plus a has_map
-        # flag, so this loop needs no type-specific branches at all,
-        # unlike the old version (which special-cased 0-5, 10, 11-12, and
-        # 6-9 separately).
-        delta_bits       = [0] * 13
-        map_bits         = [0] * 13
-        delta_compressed = [False] * 13
-        map_compressed   = [False] * 13
-        for ci in channel_id:
-            qc = qcl6[ci]
-            xdim, ydim = qc.shape[1], qc.shape[0]
-            for t in range(13):
-                encode_fn, _, has_map = _ENCODERS[t]
-                result = encode_fn(qc, xdim, ydim)
-                delta = result[1]
-                packed = get_string_list(delta, False)[3]
-                compressed = sm.compress_strings(packed)
-                delta_bits[t] += sm.get_bitlength(compressed)
-                if (sm.get_iterations(compressed) & 15) > 0:
-                    delta_compressed[t] = True
-
-                if has_map:
-                    map_ = result[2]
-                    map_packed = get_string_list(map_, False)[3]
-                    map_compressed_bytes = sm.compress_strings(map_packed)
-                    map_bits[t] += sm.get_bitlength(map_compressed_bytes)
-                    if (sm.get_iterations(map_compressed_bytes) & 15) > 0:
-                        map_compressed[t] = True
-
-        total_delta_sum = [delta_bits[t] + map_bits[t] for t in range(13)]
-        best_dt = int(np.argmin(total_delta_sum))
-        print_delta_type_ranking(delta_bits, map_bits, delta_compressed, map_compressed, total_delta_sum, best_dt)
-
-        # ---- pick compress_type (String vs String*) ----
-        str_bits = star_bits = 0
-        for ci in channel_id:
-            qc = qcl6[ci]
-            delta = _ENCODERS[best_dt][0](qc, qc.shape[1], qc.shape[0])[1]
-            str_bits += sm.get_bitlength(get_string_list(delta, False)[3])
-            star_bits += sm.get_bitlength(get_string_list(delta, True)[3])
-        compress_type = 2 if star_bits < str_bits else 1
-
-        time.sleep(0.05)  # keep the async nature visible/testable
-        self.finished_with.emit(min_set_id, best_dt, compress_type)
-
-
-# =============================================================================
-# Scroll area with Ctrl+wheel zoom anchored at the cursor.
-# =============================================================================
-class ZoomScrollArea(QScrollArea):
-    def __init__(self, owner):
-        super().__init__()
-        self.owner = owner
-
-    def wheelEvent(self, event):
-        if event.modifiers() & Qt.ControlModifier:
-            pos = event.position().toPoint()
-            h_bar, v_bar = self.horizontalScrollBar(), self.verticalScrollBar()
-            mcx, mcy = pos.x() + h_bar.value(), pos.y() + v_bar.value()
-            old = self.owner.zoom_scale
-            new = old * ZOOM_FACTOR if event.angleDelta().y() > 0 else old / ZOOM_FACTOR
-            new = max(ZOOM_MIN, min(ZOOM_MAX, new))
-            if new == old:
-                return
-            self.owner.zoom_scale = new
-            self.owner.update_display_image()
-            r = new / old
-            h_bar.setValue(max(0, int(mcx * r) - pos.x()))
-            v_bar.setValue(max(0, int(mcy * r) - pos.y()))
-            self.owner.update_title()
-            event.accept()
-        else:
-            super().wheelEvent(event)
-
-
-# =============================================================================
-# One slider + numeric readout in a small popup QDialog (every Quantization
-# menu item uses this now -- no more special-cased combined dialogs).
-# =============================================================================
-def make_slider_dialog(parent, title, lo, hi, init, on_change):
-    dialog = QDialog(parent)
-    dialog.setWindowTitle(title)
-    slider = QSlider(Qt.Horizontal)
-    slider.setMinimum(lo)
-    slider.setMaximum(hi)
-    slider.setValue(init)
-    slider.setTickInterval(1)
-    slider.setTickPosition(QSlider.TicksBelow)
-    slider.setMinimumWidth(220)
-    field = QLineEdit(str(init))
-    field.setFixedWidth(40)
-    field.setReadOnly(True)
-
-    def _changed(v):
-        field.setText(str(v))
-        on_change(v)
-
-    slider.valueChanged.connect(_changed)
-    layout = QHBoxLayout(dialog)
-    layout.addWidget(slider)
-    layout.addWidget(field)
-
-    action = QAction(title, parent)
-
-    def _open():
-        p = parent.pos()
-        dialog.move(p.x(), max(0, p.y() - 60))
-        dialog.show()
-
-    action.triggered.connect(_open)
-    return action, dialog, slider
-
-
-# =============================================================================
-# Main per-image window.
-# =============================================================================
-def open_image_dialog(parent=None):
-    try:
-        path, _ = QFileDialog.getOpenFileName(
-            parent, "Open Image", "", "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp)")
-        if path:
-            DeltaWriterWindow(path)
-    except Exception:
-        # Qt can silently swallow exceptions raised inside a signal-connected
-        # callback (this runs from the File > Open action's triggered
-        # signal), so make sure a real failure here is actually visible
-        # instead of just "nothing happens."
-        import traceback
-        print("open_image_dialog failed:")
-        traceback.print_exc()
-
-
-class DeltaWriterWindow(QMainWindow):
-    open_window_count = 0
-    next_window_offset = 0
-
-    def __init__(self, filename: str):
-        super().__init__()
-        self.filename = filename
         self.pixel_quant = 4
         self.pixel_shift = 3
-        # arithmetic entropy coding segment size (0-10, slider in the
-        # Entropy menu). 0 is a DELIBERATE, benchmarked default, not an
-        # arbitrary starting point -- see the conversation this was
-        # produced in for the full measurement, but in short: Slow
-        # Arithmetic's per-symbol cost grows worse than quadratically
-        # with segment size (measured: a 500-symbol segment took ~30ms;
-        # 750 symbols, only 1.5x more data, took ~117ms -- 3.9x longer).
-        # pixel_segment=0 maps to _segment_payload's smallest possible
-        # segment (500 symbols, the floor of its `500 + pixel_segment*500`
-        # formula), which is the fastest setting this slider can reach --
-        # confirmed to already take ~8s end-to-end for a full 640x480
-        # image with Slow Arithmetic selected. Any higher setting (larger,
-        # fewer segments) costs dramatically more; there's no headroom to
-        # trade for Slow Arithmetic's theoretical compression benefit
-        # (a wider per-segment interval gives simplest_fraction_in_interval
-        # more room to find a low-denominator fraction) without a much
-        # longer save. If you want a genuinely SMALLER floor than 500 for
-        # very large images, that needs a change to _segment_payload's own
-        # formula, not just this default -- ask if you want that explored.
-        self.pixel_segment = 0
-        self.correction = 0
+        self.pixel_segment = 10     # Arithmetic blocks: 10 = one block per channel; lower = blocks of 500+500*pixel_segment bytes
+        self.correction = 0         # preview only: blends back toward the original by correction/10
         self.min_set_id = 0
         self.delta_type = 5
-        self.compress_type = 1
+        self.compress_type = 1      # 0 Integer, 1 String, 2 String*
         self.entropy_type = 0
         self.smooth_level = 0
         self.smooth2_level = 0
-        self.scanline5_variant = 0   # written to file header, not yet wired to any UI
+        self.scanline5_variant = 0
+        self.block_size = dm.BLOCK_DEFAULT
+        self.block_set = 0
 
-        self.initialized = False
+        self.channel_sum = [0] * 6
+        self.set_sum = [0] * 10
+        self.channel_min = [0] * 6
+        self.channel_init = [0] * 6
+        self.channel_delta_min = [0] * 6
+        self.channel_length = [0] * 6
+        self.channel_compressed_length = [0] * 6
+        self.channel_iterations = [0] * 3
+        self.int_allowed = True
+        self.applied = False
 
-        self._load_image()
+    # ---- Channels -------------------------------------------------------------
 
-        # zoom_scale is set once here from screen size, matching Java's
-        # Toolkit.getScreenSize()-based calculation in the constructor --
-        # showInitialImage() in this version no longer refits it.
-        screen = QApplication.primaryScreen().size()
-        self.screen_xdim, self.screen_ydim = screen.width(), screen.height()
-        mw = int(self.screen_xdim * 0.70) - 40
-        mh = int(self.screen_ydim * 0.70) - 80
-        self.fit_scale = min(1.0, min(mw / self.image_xdim, mh / self.image_ydim))
-        self.zoom_scale = self.fit_scale
+    def quantized_channels(self, size, smooth):
+        """The six candidate channels after smoothing (if asked), resizing and
+        quantizing; sets channel_min and channel_init."""
+        q = [None] * 3
 
-        self._build_ui()
-
-        DeltaWriterWindow.open_window_count += 1
-        off = DeltaWriterWindow.next_window_offset
-        DeltaWriterWindow.next_window_offset = (off + 30) % 270
-        w = min(self.image_xdim + 40, int(self.screen_xdim * 0.70))
-        h = min(self.image_ydim + 80, int(self.screen_ydim * 0.70))
-        self.resize(w, h)
-        self.move((self.screen_xdim - w) // 2 + off, (self.screen_ydim - h) // 2 + off)
-        self.update_display_image()
-        self.update_title()
-        self.show()
-
-        QTimer.singleShot(0, self._show_initial_image)
-
-    # ------------------------------------------------------------------ IO
-    def _load_image(self):
-        img_bgr = cv2.imread(self.filename, cv2.IMREAD_COLOR)
-        if img_bgr is None:
-            raise FileNotFoundError(f"cv2 could not read image file: {self.filename}")
-        self.image_ydim, self.image_xdim = img_bgr.shape[0], img_bgr.shape[1]
-        self.file_length = os.path.getsize(self.filename)
-        # cv2 loads BGR-ordered, so channel_list[0..2] are genuinely
-        # blue/green/red (matching the Java field names exactly).
-        self.channel_list = [img_bgr[:, :, 0].astype(np.int32),
-                              img_bgr[:, :, 1].astype(np.int32),
-                              img_bgr[:, :, 2].astype(np.int32)]
-        self.working_bgr = img_bgr.copy()
-        print(f"Loaded file: {self.filename}")
-        print(f"Image xdim = {self.image_xdim}, ydim = {self.image_ydim}\n")
-
-    # -------------------------------------------------------------- UI build
-    def _build_ui(self):
-        self.canvas = QLabel()
-        self.canvas.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.scroll = ZoomScrollArea(self)
-        self.scroll.setWidget(self.canvas)
-        self.scroll.setWidgetResizable(False)
-        self.setCentralWidget(self.scroll)
-
-        menu_bar = self.menuBar()
-        self._build_file_menu(menu_bar)
-        self._build_view_menu(menu_bar)
-        self._build_quantization_menu(menu_bar)
-        self._build_delta_menu(menu_bar)
-        self._build_datatype_menu(menu_bar)
-        self._build_entropy_menu(menu_bar)
-
-    def _build_file_menu(self, menu_bar):
-        m = menu_bar.addMenu("File")
-
-        open_act = QAction("Open...", self, shortcut=QKeySequence("Ctrl+O"))
-        open_act.triggered.connect(lambda: open_image_dialog(self))
-        m.addAction(open_act)
-        m.addSeparator()
-
-        reset_act = QAction("Reset", self)
-        reset_act.triggered.connect(self._reset)
-        m.addAction(reset_act)
-
-        save_act = QAction("Save", self)
-        save_act.triggered.connect(self._save)
-        m.addAction(save_act)
-
-    def _build_view_menu(self, menu_bar):
-        m = menu_bar.addMenu("View")
-        zi = QAction("Zoom In", self, shortcut=QKeySequence("Ctrl+="))
-        zi.triggered.connect(lambda: self._zoom_by(ZOOM_FACTOR))
-        zo = QAction("Zoom Out", self, shortcut=QKeySequence("Ctrl+-"))
-        zo.triggered.connect(lambda: self._zoom_by(1.0 / ZOOM_FACTOR))
-        zf = QAction("Fit", self, shortcut=QKeySequence("Ctrl+0"))
-        zf.triggered.connect(self._fit_to_window)
-        za = QAction("100%", self, shortcut=QKeySequence("Ctrl+1"))
-        za.triggered.connect(self._actual_size)
-        for a in (zi, zo, zf, za):
-            m.addAction(a)
-
-    def _build_quantization_menu(self, menu_bar):
-        m = menu_bar.addMenu("Quantization")
-        act, _d, self.smooth_slider = make_slider_dialog(self, "Smooth", 0, 10, self.smooth_level, self._set_smooth)
-        m.addAction(act)
-        act, _d, self.smooth2_slider = make_slider_dialog(self, "Smooth2", 0, 10, self.smooth2_level, self._set_smooth2)
-        m.addAction(act)
-        act, _d, self.pquant_slider = make_slider_dialog(self, "Pixel Resolution", 0, 10, self.pixel_quant, self._set_pixel_quant)
-        m.addAction(act)
-        act, _d, self.pshift_slider = make_slider_dialog(self, "Color Resolution", 0, 7, self.pixel_shift, self._set_pixel_shift)
-        m.addAction(act)
-        act, _d, self.corr_slider = make_slider_dialog(self, "Error Correction", 0, 10, self.correction, self._set_correction)
-        m.addAction(act)
-
-    def _set_smooth(self, v):
-        self.smooth_level = v; self._apply_preview()
-
-    def _set_smooth2(self, v):
-        self.smooth2_level = v; self._apply_preview()
-
-    def _set_pixel_quant(self, v):
-        self.pixel_quant = v; self._apply_preview()
-
-    def _set_pixel_shift(self, v):
-        self.pixel_shift = v; self._apply_preview()
-
-    def _set_correction(self, v):
-        self.correction = v; self._apply_preview()
-
-    def _build_delta_menu(self, menu_bar):
-        m = menu_bar.addMenu("Delta")
-        group = QActionGroup(self)
-        group.setExclusive(True)
-        self.delta_actions = []
-        for name, dt in zip(DELTA_MENU_NAMES, DELTA_MENU_TYPES):
-            act = QAction(name, self, checkable=True)
-            group.addAction(act)
-            m.addAction(act)
-            act.triggered.connect(lambda checked, dt=dt: self._set_delta_type(dt))
-            self.delta_actions.append((act, dt))
-        for act, dt in self.delta_actions:
-            act.setChecked(dt == self.delta_type)
-
-    def _set_delta_type(self, dt):
-        if dt != self.delta_type:
-            self.delta_type = dt
-            self._apply_preview()
-
-    def _build_datatype_menu(self, menu_bar):
-        m = menu_bar.addMenu("Datatype")
-
-        int_a, str_a = QRadioButton("Integer"), QRadioButton("String")
-        int_b, str_b = QRadioButton("Integer"), QRadioButton("String")
-        self._compress_widgets = (int_a, str_a, int_b, str_b)
-        group_a = QButtonGroup(self); group_a.addButton(int_a); group_a.addButton(str_a)
-        group_b = QButtonGroup(self); group_b.addButton(int_b); group_b.addButton(str_b)
-        self.int_radio_btns = [int_a, int_b]
-
-        int_dialog = QDialog(self); int_dialog.setWindowTitle("Integer")
-        lay = QVBoxLayout(int_dialog)
-        lay.addWidget(int_a); lay.addWidget(str_a)
-        int_act = QAction("Integer", self)
-
-        def _open_int():
-            p = self.pos(); int_dialog.move(p.x(), max(0, p.y() - 80)); int_dialog.show()
-
-        int_act.triggered.connect(_open_int)
-        m.addAction(int_act)
-
-        str_dialog = QDialog(self); str_dialog.setWindowTitle("String")
-        lay2 = QHBoxLayout(str_dialog)
-        lay2.addWidget(int_b); lay2.addWidget(str_b)
-        str_act = QAction("String", self)
-
-        def _open_str():
-            p = self.pos(); str_dialog.move(p.x(), max(0, p.y() - 80)); str_dialog.show()
-
-        str_act.triggered.connect(_open_str)
-        m.addAction(str_act)
-
-        (int_a if self.compress_type == 0 else str_a).setChecked(True)
-        (int_b if self.compress_type == 0 else str_b).setChecked(True)
-
-        def sync_compress(new_type, checked):
-            if not checked or self.compress_type == new_type:
-                return
-            self.compress_type = new_type
-            for w in self._compress_widgets:
-                w.blockSignals(True)
-            (int_a if new_type == 0 else str_a).setChecked(True)
-            (int_b if new_type == 0 else str_b).setChecked(True)
-            for w in self._compress_widgets:
-                w.blockSignals(False)
-            self._apply_preview()
-
-        int_a.toggled.connect(lambda c: sync_compress(0, c))
-        str_a.toggled.connect(lambda c: sync_compress(1, c))
-        int_b.toggled.connect(lambda c: sync_compress(0, c))
-        str_b.toggled.connect(lambda c: sync_compress(1, c))
-
-    def _build_entropy_menu(self, menu_bar):
-        # Flat 4-item exclusive menu now -- no Arithmetic sub-dialog.
-        # Selecting an entropy type does NOT re-run the preview (matches
-        # Java: entropy only affects Save, never the on-screen image).
-        m = menu_bar.addMenu("Entropy")
-        group = QActionGroup(self)
-        group.setExclusive(True)
-        self.entropy_actions = []
-        for name, et in ENTROPY_MENU_NAMES_TYPES:
-            act = QAction(name, self, checkable=True)
-            group.addAction(act)
-            m.addAction(act)
-            act.setChecked(self.entropy_type == et)
-            act.triggered.connect(lambda checked, et=et: setattr(self, "entropy_type", et))
-            self.entropy_actions.append((act, et))
-
-        # Segment size for the Arithmetic/Slow Arithmetic entropy types
-        # (_segment_payload's `min_seg = 500 + pixel_segment*500`, up to
-        # pixel_segment=10 forcing a single unsegmented chunk). This was
-        # never wired up to any control in this version -- pixel_segment
-        # stayed permanently at 0, its hardcoded default, which is NOT
-        # "no segmentation": at 0, min_seg is still 500, so any payload
-        # over ~500 bytes gets split every ~500 bytes regardless (a real
-        # image channel easily produces hundreds of segments). Restoring
-        # a control here doesn't change that default, just makes the
-        # value actually adjustable again, matching the other sliders'
-        # pattern. Like entropy_type, this doesn't affect the preview --
-        # segmentation only happens inside _save_arithmetic() at Save time.
-        m.addSeparator()
-        act, _d, self.segment_slider = make_slider_dialog(
-            self, "Segment Size", 0, 10, self.pixel_segment, self._set_pixel_segment)
-        m.addAction(act)
-
-    def _set_pixel_segment(self, v):
-        self.pixel_segment = v
-
-    # -------------------------------------------------------------- zoom/view
-    def _zoom_by(self, factor):
-        new = max(ZOOM_MIN, min(ZOOM_MAX, self.zoom_scale * factor))
-        if new == self.zoom_scale:
-            return
-        vp = self.scroll.viewport().size()
-        h_bar, v_bar = self.scroll.horizontalScrollBar(), self.scroll.verticalScrollBar()
-        cx, cy = h_bar.value() + vp.width() / 2.0, v_bar.value() + vp.height() / 2.0
-        r = new / self.zoom_scale
-        self.zoom_scale = new
-        self.update_display_image()
-        h_bar.setValue(max(0, int(cx * r - vp.width() / 2.0)))
-        v_bar.setValue(max(0, int(cy * r - vp.height() / 2.0)))
-        self.update_title()
-
-    def _fit_to_window(self):
-        vp = self.scroll.viewport().size()
-        self.zoom_scale = min(vp.width() / self.image_xdim, vp.height() / self.image_ydim)
-        self.update_display_image()
-        self.update_title()
-
-    def _actual_size(self):
-        self.zoom_scale = 1.0
-        self.update_display_image()
-        self.update_title()
-
-    def update_display_image(self):
-        pm = numpy_bgr_to_qpixmap(self.working_bgr)
-        w = max(1, int(self.image_xdim * self.zoom_scale))
-        h = max(1, int(self.image_ydim * self.zoom_scale))
-        if self.zoom_scale != 1.0:
-            pm = pm.scaled(w, h, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
-        self.canvas.setPixmap(pm)
-        self.canvas.resize(w, h)
-
-    def update_title(self):
-        self.setWindowTitle(f"Delta Writer  {self.filename}  [{round(self.zoom_scale * 100)}%]")
-
-    # -------------------------------------------------------------- lifecycle
-    def _show_initial_image(self):
-        self.smooth_level = self.smooth2_level = 0
-        self.pixel_quant, self.pixel_shift, self.correction = 4, 3, 0
-        for slider, val in ((self.smooth_slider, 0), (self.smooth2_slider, 0),
-                            (self.pquant_slider, 4), (self.pshift_slider, 3), (self.corr_slider, 0)):
-            slider.blockSignals(True); slider.setValue(val); slider.blockSignals(False)
-
-        self._apply_preview()  # immediate preview with default parameters
-
-        self._worker = InitWorker(self)
-        self._worker.finished_with.connect(self._on_init_finished)
-        self._worker.start()
-
-    def _on_init_finished(self, min_set_id, delta_type, compress_type):
-        print(f"[InitWorker] recommendation -> set {min_set_id} "
-              f"({SET_STRINGS[min_set_id]}), delta '{DELTA_TYPE_STRINGS[delta_type]}', "
-              f"compress_type={compress_type}")
-        self.delta_type = delta_type
-        self.compress_type = compress_type
-        for act, dt in self.delta_actions:
-            act.setChecked(dt == delta_type)
-        int_a, str_a, int_b, str_b = self._compress_widgets
-        for w in self._compress_widgets:
-            w.blockSignals(True)
-        (int_a if compress_type == 0 else str_a).setChecked(True)
-        (int_b if compress_type == 0 else str_b).setChecked(True)
-        for w in self._compress_widgets:
-            w.blockSignals(False)
-        self._apply_preview()
-
-    def _reset(self):
-        self.smooth_level = self.smooth2_level = 0
-        self.pixel_quant = self.pixel_shift = self.correction = 0
-        for slider, val in ((self.smooth_slider, 0), (self.smooth2_slider, 0),
-                            (self.pquant_slider, 0), (self.pshift_slider, 0), (self.corr_slider, 0)):
-            slider.blockSignals(True); slider.setValue(val); slider.blockSignals(False)
-        self._apply_preview()
-
-    def closeEvent(self, event):
-        DeltaWriterWindow.open_window_count -= 1
-        if DeltaWriterWindow.open_window_count <= 0:
-            QApplication.quit()
-        event.accept()
-
-    # ------------------------------------------------------ core computation
-    def _build_quantized_channels(self):
-        new_xdim, new_ydim = self._quantized_dims()
-        qcl = []
-        for i in range(3):
-            ch = self.channel_list[i]
-            if self.smooth_level > 0:
-                ch = bilateral_smooth(ch, self.image_xdim, self.image_ydim, self.smooth_level)
-            if self.smooth2_level > 0:
-                ch = anisotropic_smooth(ch, self.image_xdim, self.image_ydim, self.smooth2_level)
+        def one(i):
+            ch = self.source[i]
+            if smooth and self.smooth_level > 0:
+                ch = dm.bilateral_smooth(ch, self.image_xdim, self.image_ydim, self.smooth_level)
+            if smooth and self.smooth2_level > 0:
+                ch = dm.anisotropic_smooth(ch, self.image_xdim, self.image_ydim, self.smooth2_level)
             if self.pixel_quant != 0:
-                ch = resize_channel(ch, self.image_xdim, new_xdim, new_ydim)
+                ch = rm.resize(ch, self.image_xdim, size[0], size[1])
+            q[i] = dm.quantize_channel(ch, self.pixel_shift)
+
+        vs.parallel(3, one)
+        qc, mins = dm.get_candidate_channels(q[0], q[1], q[2])
+        self.channel_min = mins
+        self.channel_init = [int(c[0]) for c in qc]
+        return qc
+
+    def compute_set_sums(self, qc, size):
+        def one(i):
+            self.channel_sum[i] = int(np.floor(cm.get_shannon_limit(dm.get_ideal_frequency2(qc[i], size[0], size[1]))))
+        vs.parallel(6, one)
+        for s in range(10):
+            c = dm.get_channels(s)
+            self.set_sum[s] = self.channel_sum[c[0]] + self.channel_sum[c[1]] + self.channel_sum[c[2]]
+        self.min_set_id = min(range(10), key=lambda s: (self.set_sum[s], s))
+
+    # ---- Survey (Java: init) -----------------------------------------------------
+
+    def survey(self):
+        """Picks the channel set, ranks the 14 delta types by the compressed
+        size of their deltas plus their map, then picks String or String*."""
+        size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
+        w, h = size
+        qc = self.quantized_channels(size, False)
+        self.compute_set_sums(qc, size)
+        self.print_channel_set_ranking()
+        ids = dm.get_channels(self.min_set_id)
+
+        T = dm.DELTA_TYPES
+        delta_bits = [[0] * T for _ in range(3)]
+        maps = [[None] * T for _ in range(3)]
+
+        def channel(i):
+            for t in range(T):
+                d, m, _ = dm.get_deltas(qc[ids[i]], w, h, t, self.scanline5_variant, self.block_size, self.block_set)
+                delta_bits[i][t] = sm.get_bitlength(pack_and_compress(d))
+                maps[i][t] = m
+
+        vs.parallel(3, channel)
+
+        # Maps are ranked on what Save writes; the context form uses the
+        # previous channel's map, so they are sized once all three exist.
+        map_bits = [[0] * T for _ in range(3)]
+
+        def map_type(t):
+            if dm.has_map(t):
+                for i in range(3):
+                    map_bits[i][t] = 8 * dm.map_bytes(t, maps[i][t], maps[i - 1][t] if i > 0 else None, w)
+
+        vs.parallel(T, map_type)
+
+        dbits = [sum(delta_bits[i][t] for i in range(3)) for t in range(T)]
+        mbits = [sum(map_bits[i][t] for i in range(3)) for t in range(T)]
+        total = [dbits[t] + mbits[t] for t in range(T)]
+        self.delta_type = min(range(T), key=lambda t: (total[t], t))
+        self.print_delta_type_ranking(dbits, mbits, total)
+
+        # String or String*, whichever is smaller for the selected type.
+        s_bits = [0] * 3
+        star_bits = [0] * 3
+
+        def strings(i):
+            d, _, _ = dm.get_deltas(qc[ids[i]], w, h, self.delta_type, self.scanline5_variant, self.block_size, self.block_set)
+            s = sm.get_string_list(d, False)[3]
+            s_bits[i] = sm.get_bitlength(s)
+            star_bits[i] = sm.get_bitlength(sm.compress_strings(s))
+
+        vs.parallel(3, strings)
+        self.compress_type = 2 if sum(star_bits) < sum(s_bits) else 1
+        if self.delta_type == 13:
+            self.search_block_settings(qc, size, ids)
+
+    def search_block_settings(self, qc=None, size=None, ids=None):
+        """Picks block_size and block_set by coding with each candidate."""
+        timer = vs.Timer()
+        if qc is None:
+            size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
+            qc = self.quantized_channels(size, True)
+            ids = dm.get_channels(self.min_set_id)
+        best, table = dm.find_best_block([qc[i] for i in ids], size[0], size[1])
+        self.block_size, self.block_set = best
+        print(dm.get_block_table(table, best), end="")
+        print("Block search took " + timer.elapsed())
+        print()
+
+    def print_channel_set_ranking(self):
+        order = sorted(range(10), key=lambda s: (self.set_sum[s], s))
+        print("Channel sets, smallest first: estimated bytes for each channel's deltas")
+        print("(entropy estimate, before real coding), and the set's total. <= marks the set used.")
+        print("      %-32s %10s %10s %10s %12s" % ("channel set", "1st", "2nd", "3rd", "total"))
+        for r, s in enumerate(order):
+            c = dm.get_channels(s)
+            print("  %2d. %-32s %10d %10d %10d %12d%s" % (r + 1, dm.SET_NAMES[s], self.channel_sum[c[0]] // 8,
+                  self.channel_sum[c[1]] // 8, self.channel_sum[c[2]] // 8, self.set_sum[s] // 8,
+                  "  <=" if s == self.min_set_id else ""))
+        print()
+
+    def print_delta_type_ranking(self, dbits, mbits, total):
+        order = sorted(range(dm.DELTA_TYPES), key=lambda t: (total[t], t))
+        print("Delta types, smallest first: bytes for the deltas and, for types that have one, the")
+        print("predictor map, all 3 channels. <= marks the type chosen.")
+        print("      %-16s %12s %12s %12s" % ("delta type", "deltas", "map", "total"))
+        for r, t in enumerate(order):
+            print("  %2d. %-16s %12d %12s %12d%s" % (r + 1, dm.DELTA_TYPE_NAMES[t], dbits[t] // 8,
+                  str(mbits[t] // 8) if dm.has_map(t) else "", total[t] // 8, "  <=" if t == self.delta_type else ""))
+        print()
+
+    # ---- Apply --------------------------------------------------------------------
+
+    def apply(self):
+        """Quantizes, picks the channel set, codes the deltas (what Save
+        writes), then decodes them the way DeltaReader does. Returns the
+        preview as an (ydim, xdim, 3) uint8 array."""
+        self.applied = False
+        size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
+        w, h = size
+        qc = self.quantized_channels(size, True)
+        self.compute_set_sums(qc, size)
+        ids = dm.get_channels(self.min_set_id)
+
+        # Integer needs every delta - delta_min to fit in a byte.
+        self.int_allowed = all((int(qc[j].max()) - int(qc[j].min())) * 2 <= 255 for j in ids)
+        if not self.int_allowed and self.compress_type == 0:
+            self.compress_type = 1
+
+        table, payload, maps, deltas, decoded = [None] * 3, [None] * 3, [None] * 3, [None] * 3, [None] * 3
+
+        def channel(i):
+            j = ids[i]
+            d, m, _ = dm.get_deltas(qc[j], w, h, self.delta_type, self.scanline5_variant, self.block_size, self.block_set)
+            deltas[i] = d
+            maps[i] = m
+            if self.compress_type == 0:
+                # One byte per delta, delta - delta_min. The string fields
+                # aren't used and keep their last values, as in the Java.
+                self.channel_delta_min[j] = int(d.min())
+                b = ((d - self.channel_delta_min[j]) & 0xFF).astype(np.uint8)
+                b[0] = 0
+                payload[i] = b
+                d2 = b.astype(np.int64) + self.channel_delta_min[j]
+                d2[0] = 0
+            else:
+                lo, bits, tbl, s = sm.get_string_list(d, self.compress_type == 2)
+                self.channel_delta_min[j], self.channel_length[j] = lo, bits
+                table[i], payload[i] = tbl, s
+                self.channel_compressed_length[j] = sm.get_bitlength(s)
+                self.channel_iterations[i] = sm.get_iterations(s)
+                d2 = sm.unpack_strings(sm.decompress_strings(s), tbl, w * h, bits)
+                d2[0] = 0
+                d2[1:] += lo
+            ch = dm.get_values_from_deltas(d2, w, h, self.channel_init[j], self.delta_type, m, self.scanline5_variant)
+            if j > 2:
+                ch = ch + self.channel_min[j]
+            decoded[i] = ch
+
+        vs.parallel(3, channel)
+        self.table, self.payload, self.map, self.delta_list, self.delta_xdim = table, payload, maps, deltas, w
+
+        # As the reader: recombine the channel set first, then resize, then shift.
+        bgr = dm.get_blue_green_red(self.min_set_id, *decoded)
+
+        def restore(c):
+            v = bgr[c]
+            if self.pixel_quant != 0:
+                v = rm.resize(v, w, self.image_xdim, self.image_ydim)
             if self.pixel_shift != 0:
-                ch = quantize_channel(ch, self.pixel_shift)
-            qcl.append(ch)
-        qcl.append(difference_2d(qcl[0], qcl[1]))
-        qcl.append(difference_2d(qcl[2], qcl[1]))
-        qcl.append(difference_2d(qcl[2], qcl[0]))
-        return qcl
+                v = dm.shift(v, self.pixel_shift)
+            if self.correction != 0:
+                f = self.correction / 10.0
+                v = v + ((self.source[c] - v) * f).astype(np.int64)     # (int) truncates toward zero
+            bgr[c] = v
 
-    def _quantized_dims(self):
-        if self.pixel_quant == 0:
-            return self.image_xdim, self.image_ydim
-        f = self.pixel_quant / 10.0
-        # Integer division here (matching DeltaReader.java's `xdim/2` on a
-        # declared-int xdim, which truncates) is required so this file's
-        # own encode-time dims agree with what DeltaReader.java's decode
-        # independently recomputes from just xdim/ydim/pixel_quant -- it
-        # never reads new_xdim/new_ydim from the file. Plain Python `/2`
-        # would disagree by up to one pixel whenever xdim/ydim are odd.
-        new_xdim = self.image_xdim - int(f * (self.image_xdim // 2 - 2))
-        new_ydim = self.image_ydim - int(f * (self.image_ydim // 2 - 2))
-        return new_xdim, new_ydim
+        vs.parallel(3, restore)
+        rgb = np.stack([np.clip(v, 0, 255).reshape(self.image_ydim, self.image_xdim) for v in bgr], axis=2).astype(np.uint8)
+        self.applied = True
+        return rgb
 
-    @staticmethod
-    def _compute_set_sums(channel_sum):
-        cs = channel_sum
-        return [
-            cs[0] + cs[1] + cs[2], cs[0] + cs[4] + cs[2], cs[0] + cs[3] + cs[2],
-            cs[0] + cs[1] + cs[4], cs[0] + cs[3] + cs[5], cs[3] + cs[1] + cs[2],
-            cs[3] + cs[4] + cs[2], cs[3] + cs[1] + cs[4], cs[5] + cs[1] + cs[4],
-            cs[5] + cs[4] + cs[2],
-        ]
+    # ---- Save -------------------------------------------------------------------------
 
-    def _apply_preview(self):
+    def save(self, filename="foo"):
+        """Header, then per channel: min, init, delta min, bit lengths,
+        iterations, map (types 6-13), string table (String and String*, not
+        Context), then the entropy-coded payload."""
+        ids = dm.get_channels(self.min_set_id)
+        out = DataOutput()
+        out.write_byte(FORMAT_ID); out.write_byte(FORMAT_VERSION)
+        out.write_short(self.image_xdim); out.write_short(self.image_ydim)
+        for v in (self.pixel_shift, self.pixel_quant, self.min_set_id, self.delta_type, self.compress_type,
+                  self.entropy_type, self.scanline5_variant, 0, 0):       # last two: pixel pyramid levels, saddle
+            out.write_byte(v)
+
+        timer = vs.Timer()
+        if self.entropy_type == 4:
+            coded = context_code(self.delta_list, self.delta_xdim)
+        else:
+            coded = entropy_code(self.payload, self.entropy_type, self.pixel_segment)
+        print("Entropy coding [%s] took %s" % (ENTROPY_NAMES[self.entropy_type], timer.elapsed()))
+
+        for i in range(3):
+            j = ids[i]
+            for v in (self.channel_min[j], self.channel_init[j], self.channel_delta_min[j],
+                      self.channel_length[j], self.channel_compressed_length[j]):
+                out.write_int(v)
+            out.write_byte(self.channel_iterations[i])
+            if dm.has_map(self.delta_type):
+                dm.write_map(out, self.delta_type, self.map[i], self.map[i - 1] if i > 0 else None, self.delta_xdim)
+            if self.compress_type > 0 and self.entropy_type != 4:
+                dm.write_table(out, self.table[i])
+            out.write(coded[i])
+
+        with open(filename, "wb") as f:
+            f.write(out.to_bytes())
+        raw = self.image_xdim * self.image_ydim * 3
+        print("Original compression rate: %.4f" % (self.file_length / raw))
+        print("Output  compression rate:  %.4f" % (out.size() / raw))
+        return out.size()
+
+
+def pack_and_compress(values):
+    """A StringMapper bit string of values, compressed."""
+    return sm.compress_strings(sm.get_string_list(values, False)[3])
+
+
+def context_code(delta, xdim):
+    """Context entropy type: each channel's deltas context coded, channel i's
+    contexts using channels 0..i-1. Checks each decodes back."""
+    from java_io import DataInput
+    coded = [None] * 3
+
+    def one(i):
+        coded[i] = dm.pack_context_deltas(delta[i], delta[:i], xdim)
+        back = dm.read_context_deltas(DataInput(coded[i]), len(delta[i]), delta[:i], xdim)
+        if not np.array_equal(back, delta[i]):
+            print("WARNING: channel %d context-coded deltas do not decode back." % i)
+
+    vs.parallel(3, one)
+    return coded
+
+
+def entropy_code(payload, entropy_type, pixel_segment):
+    """Each result is what follows the channel's table in the file:
+      LZ77:       int payload length, int Deflated length, Deflated payload;
+      Huffman:    int length + the 256 code lengths (Deflated), int length + the code;
+      Arithmetic: the frequency tables, then each block's int length and coded bytes;
+      Adaptive:   int length + the coded bytes."""
+    coded = [None] * 3
+    if entropy_type == 0:
+        def one(i):
+            zipped = cm.deflate(payload[i], 9)
+            coded[i] = struct.pack(">ii", len(payload[i]), len(zipped)) + zipped
+        vs.parallel(3, one)
+    elif entropy_type == 1:
+        def one(i):
+            lengths = cm.get_regular_huffman_length(am.get_frequency(payload[i]))
+            code = cm.pack_regular_code(payload[i], lengths)
+            if not np.array_equal(cm.unpack_regular_code(code, lengths, len(payload[i])), payload[i]):
+                print("WARNING: channel %d Huffman payload does not decode back." % i)
+            tables = cm.pack_regular_tables([lengths], 9)
+            coded[i] = struct.pack(">i", len(tables)) + tables + struct.pack(">i", len(code)) + code.tobytes()
+        vs.parallel(3, one)
+    elif entropy_type == 2:
+        blocks, freqs = [], []
+        for i in range(3):
+            n = 1 if pixel_segment >= 10 else max(1, len(payload[i]) // (500 + pixel_segment * 500))
+            blocks.append(am.get_blocks(payload[i], n))
+            freqs.append([am.get_frequency(b) for b in blocks[i]])
+        jobs = [(i, m) for i in range(3) for m in range(len(blocks[i]))]
+        enc = {}
+
+        def block(k):
+            i, m = jobs[k]
+            enc[(i, m)] = am.get_interval_value_fast_fenwick(blocks[i][m], freqs[i][m])
+        vs.parallel(len(jobs), block)
+        for i in range(3):
+            parts = [am.pack_frequencies(freqs[i], 9)]
+            for m in range(len(blocks[i])):
+                e = enc[(i, m)]
+                parts.append(struct.pack(">i", len(e)) + e.tobytes())
+            coded[i] = b"".join(parts)
+    else:
+        def one(i):
+            code = am.get_interval_value_adaptive(payload[i])
+            if not np.array_equal(am.get_arithmetic_values_adaptive(code, len(payload[i])), payload[i]):
+                print("WARNING: channel %d adaptive payload does not decode back." % i)
+            coded[i] = struct.pack(">i", len(code)) + code.tobytes()
+        vs.parallel(3, one)
+    return coded
+
+
+# =============================================================================
+# The window
+# =============================================================================
+
+def open_image(parent=None):
+    from PySide6.QtWidgets import QFileDialog
+    path, _ = QFileDialog.getOpenFileName(parent, "Open Image", "",
+                                          "Images (*.png *.jpg *.jpeg *.bmp *.tif *.tiff *.webp *.pgm *.ppm);;All files (*)")
+    if path:
+        DeltaWriter(path)
+
+
+_open_writers = []
+
+
+class DeltaWriter:
+    def __init__(self, filename):
+        from PySide6.QtGui import QAction, QActionGroup, QKeySequence
+        from PySide6.QtWidgets import QRadioButton, QButtonGroup
+
+        self.filename = filename
         try:
-            self._apply_preview_impl()
+            rgb = vs.read_image(filename)
+        except IOError as e:
+            vs.show_error(None, str(e))
+            return
+        self.coder = c = DeltaCoder(rgb, os.path.getsize(filename))
+        self.original = rgb
+        self.updating = False
+        print("Loaded %s, %d x %d" % (filename, c.image_xdim, c.image_ydim))
+
+        self.view = view = vs.ImageWindow("Delta Writer  " + filename, c.image_xdim, c.image_ydim)
+        bar = view.menuBar()
+        _open_writers.append(self)
+        view.destroyed.connect(lambda *_: _open_writers.remove(self) if self in _open_writers else None)
+
+        # ---- File
+        file_menu = bar.addMenu("File")
+        a = QAction("Open...", view, shortcut=QKeySequence("Ctrl+O"))
+        a.triggered.connect(lambda: open_image(view))
+        file_menu.addAction(a)
+        file_menu.addSeparator()
+        a = QAction("Reset", view)
+        a.triggered.connect(self.reset)
+        file_menu.addAction(a)
+        a = QAction("Save", view)
+        a.triggered.connect(self.save)
+        file_menu.addAction(a)
+
+        view.make_view_menu()
+
+        # ---- Quantization
+        quant = bar.addMenu("Quantization")
+        self.sliders = {}
+        for key, title, lo, hi in (("smooth_level", "Smooth", 0, 10), ("smooth2_level", "Smooth2", 0, 10),
+                                   ("pixel_quant", "Pixel Resolution", 0, 10), ("pixel_shift", "Color Resolution", 0, 7)):
+            act, slider = vs.make_slider_dialog(view, title, lo, hi, getattr(c, key), self._setter(key))
+            quant.addAction(act)
+            self.sliders[key] = slider
+        # Error Correction is not a quantizing step: it blends the preview back
+        # toward the original by correction/10. Preview only.
+        quant.addSeparator()
+        act, self.sliders["correction"] = vs.make_slider_dialog(view, "Error Correction", 0, 10, c.correction, self._setter("correction"))
+        quant.addAction(act)
+
+        # ---- Delta
+        delta_menu = bar.addMenu("Delta")
+        group = QActionGroup(view)
+        self.delta_actions = []
+        for t, name in enumerate(DELTA_MENU_NAMES):
+            a = QAction(name, view, checkable=True)
+            a.setChecked(t == c.delta_type)
+            group.addAction(a)
+            delta_menu.addAction(a)
+            a.triggered.connect(lambda _=False, t=t: self.set_delta_type(t))
+            self.delta_actions.append(a)
+        delta_menu.addSeparator()
+        act, self.block_spinner = vs.make_spinner_dialog(view, "Block Size", dm.BLOCK_MIN, dm.BLOCK_MAX, c.block_size, self.set_block_size)
+        delta_menu.addAction(act)
+        act, self.block_buttons = vs.make_radio_dialog(view, "Block Predictors", dm.BLOCK_SET_NAMES, c.block_set, self.set_block_set)
+        delta_menu.addAction(act)
+        a = QAction("Find Best Block Settings", view)
+        a.triggered.connect(self.find_block_settings)
+        delta_menu.addAction(a)
+
+        # ---- Datatype: two dialogs, each with an Integer and a String button.
+        self.datatype_menu = bar.addMenu("Datatype")
+        int_a, str_a, int_b, str_b = (QRadioButton("Integer"), QRadioButton("String"),
+                                      QRadioButton("Integer"), QRadioButton("String"))
+        self.int_buttons = [int_a, int_b]
+        self.str_buttons = [str_a, str_b]
+        for pair in ((int_a, str_a), (int_b, str_b)):
+            g = QButtonGroup(view)
+            g.addButton(pair[0]); g.addButton(pair[1])
+        for b in self.int_buttons:
+            b.clicked.connect(lambda: self.set_compress_type(0))
+        for b in self.str_buttons:
+            b.clicked.connect(lambda: self.set_compress_type(1))
+        self.datatype_menu.addAction(vs.make_button_dialog(view, "Integer", [int_a, str_a]))
+        self.datatype_menu.addAction(vs.make_button_dialog(view, "String", [int_b, str_b], vertical=False))
+        self.show_compress_type()
+
+        # ---- Entropy
+        entropy_menu = bar.addMenu("Entropy")
+        group = QActionGroup(view)
+        for et, name in enumerate(ENTROPY_NAMES):
+            a = QAction(name, view, checkable=True)
+            a.setChecked(et == c.entropy_type)
+            group.addAction(a)
+            entropy_menu.addAction(a)
+            a.triggered.connect(lambda _=False, et=et: self.set_entropy_type(et))
+        entropy_menu.addSeparator()
+        act, _ = vs.make_slider_dialog(view, "Segment Size", 0, 10, c.pixel_segment, lambda v: setattr(c, "pixel_segment", v))
+        entropy_menu.addAction(act)
+
+        view.set_image(rgb)
+        view.show_window()
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(0, self.show_initial_image)
+
+    # ---- Settings -----------------------------------------------------------------
+
+    def _setter(self, key):
+        def set_value(v):
+            setattr(self.coder, key, v)
+            if not self.updating:
+                self.apply()
+        return set_value
+
+    def set_delta_type(self, t):
+        if self.coder.delta_type == t:
+            return
+        self.coder.delta_type = t
+        if t == 13:
+            self.find_block_settings()
+        else:
+            self.apply()
+
+    def set_block_size(self, v):
+        self.coder.block_size = v
+        if self.coder.delta_type == 13 and not self.updating:
+            self.apply()
+
+    def set_block_set(self, v):
+        self.coder.block_set = v
+        if self.coder.delta_type == 13 and not self.updating:
+            self.apply()
+
+    def set_compress_type(self, t):
+        if (t == 0) != (self.coder.compress_type == 0):
+            self.coder.compress_type = t
+            self.show_compress_type()
+            self.apply()
+
+    def set_entropy_type(self, et):
+        self.coder.entropy_type = et
+        self.datatype_menu.menuAction().setEnabled(et != 4)   # Context codes the deltas directly
+
+    def show_compress_type(self):
+        for b in self.int_buttons:
+            b.setChecked(self.coder.compress_type == 0)
+            b.setEnabled(self.coder.int_allowed)
+        for b in self.str_buttons:
+            b.setChecked(self.coder.compress_type != 0)
+
+    def show_settings(self):
+        """Moves the controls to the coder's settings without applying."""
+        self.updating = True
+        c = self.coder
+        self.delta_actions[c.delta_type].setChecked(True)
+        self.block_spinner.setValue(c.block_size)
+        self.block_buttons[c.block_set].setChecked(True)
+        for key, slider in self.sliders.items():
+            slider.setValue(getattr(c, key))
+        self.show_compress_type()
+        self.updating = False
+
+    def reset(self):
+        c = self.coder
+        c.smooth_level = c.smooth2_level = c.pixel_quant = c.pixel_shift = c.correction = 0
+        self.show_settings()
+        self.apply()
+
+    # ---- Work -----------------------------------------------------------------------
+
+    def apply(self):
+        try:
+            rgb = self.coder.apply()
+            self.view.set_image(rgb)
         except Exception as e:
-            print(f"apply_preview error: {e!r}")
             import traceback
             traceback.print_exc()
+            print("Apply: %r" % e)
+        self.show_compress_type()
 
-    def _apply_preview_impl(self):
-        new_xdim, new_ydim = self._quantized_dims()
-        qcl = self._build_quantized_channels()
+    def _background(self, status, job):
+        """Runs job with the menus disabled, then shows the settings and applies."""
+        self.view.set_menus_enabled(False)
+        self.view.set_status(status)
 
-        channel_min = [0] * 6
-        channel_init = [0] * 6
-        channel_sum = [0] * 6
-        for i in range(6):
-            qc = qcl[i]
-            mn = int(qc.min())
-            channel_min[i] = mn
-            if i > 2:
-                qc = qc - mn
-                qcl[i] = qc
-            channel_init[i] = int(qc.flat[0])
-            channel_sum[i] = int(cm.get_shannon_limit(get_ideal_frequency(qc, new_xdim, new_ydim)))
-        self.channel_min = channel_min
-        self.channel_init = channel_init
+        def done(result, error):
+            if error is not None:
+                print("%s: %r" % (status, error))
+            self.view.set_menus_enabled(True)
+            self.datatype_menu.menuAction().setEnabled(self.coder.entropy_type != 4)
+            self.view.set_status(None)
+            self.show_settings()
+            self.apply()
 
-        set_sum = self._compute_set_sums(channel_sum)
-        self.min_set_id = int(np.argmin(set_sum))
-        self.file_compression_rate = self.file_length / (self.image_xdim * self.image_ydim * 3)
-        channel_id = dm.get_channels(self.min_set_id)
+        vs.run_in_background(job, done)
 
-        int_allowed = True
-        for ci in channel_id:
-            qc = qcl[ci]
-            if (int(qc.max()) - int(qc.min())) * 2 > 255:
-                int_allowed = False
-                break
-        if not int_allowed and self.compress_type == 0:
-            self.compress_type = 1
-            int_a, str_a, int_b, str_b = self._compress_widgets
-            for w in self._compress_widgets:
-                w.blockSignals(True)
-            str_a.setChecked(True); str_b.setChecked(True)
-            for w in self._compress_widgets:
-                w.blockSignals(False)
-        for btn in self.int_radio_btns:
-            btn.setEnabled(int_allowed)
+    def show_initial_image(self):
+        """Applies the default quantization, then runs the survey in the
+        background so Apply and Save can't overlap it."""
+        self.apply()
+        self._background("analyzing…", self.coder.survey)
 
-        channel_delta_min = [0] * 6
-        channel_length = [0] * 6
-        channel_compressed_length = [0] * 6
-        channel_iterations = [0, 0, 0]
-        table_list, string_list, map_list, delta_list = [], [], [], []
+    def find_block_settings(self):
+        self._background("finding block settings…", self.coder.search_block_settings)
 
-        encoder, decoder, uses_map = _ENCODERS[self.delta_type]
-
-        for i, j in enumerate(channel_id):
-            qc = qcl[j]
-            result = encoder(qc, new_xdim, new_ydim)
-            delta = np.asarray(result[1])
-            if uses_map:
-                map_list.append(result[2])
-
-            if self.compress_type == 0:
-                dmin, hist = get_histogram(delta)
-                channel_delta_min[j] = dmin
-                # One signed byte per pixel here (matching DeltaReader.java's
-                # `byte[] payload`, `delta[k] = payload[k] + delta_min`) --
-                # NOT a 4-byte-per-pixel int32 array. Values are wrapped into
-                # 0-255 the same way Java's `(byte)` cast would (silently,
-                # if delta range ever exceeds what a signed byte holds --
-                # the int_allowed check above is what's meant to keep that
-                # from happening in practice).
-                db = np.zeros(len(delta), dtype=np.uint8)
-                db[1:] = (np.asarray(delta[1:], dtype=np.int64) - dmin) & 0xFF
-                delta_list.append(db)
-            else:
-                precompress = (self.compress_type == 2)
-                dmin, length, table, packed = get_string_list(delta, precompress)
-                channel_delta_min[j] = dmin
-                channel_length[j] = length
-                table_list.append(table)
-                string_list.append(packed)
-                channel_compressed_length[j] = sm.get_bitlength(packed)
-                channel_iterations[i] = sm.get_iterations(packed)
-
-        self.channel_delta_min = channel_delta_min
-        self.channel_length = channel_length
-        self.channel_compressed_length = channel_compressed_length
-        self.channel_iterations = channel_iterations
-
-        # Stash everything Save needs so it can work from the real
-        # per-channel payload instead of a stand-in.
-        self._last_channel_id = list(channel_id)
-        self._last_tables = list(table_list)
-        self._last_maps = list(map_list)
-        self._last_payloads = [
-            (delta_list[i].tobytes() if self.compress_type == 0 else bytes(string_list[i]))
-            for i in range(len(channel_id))
-        ]
-
-        # ---- decode pass (drives the live preview) ----
-        dqcl = []
-        for i, j in enumerate(channel_id):
-            n = new_xdim * new_ydim
-            if self.compress_type == 0:
-                db = delta_list[i]
-                delta = np.zeros(n, dtype=np.int64)
-                # db is uint8 (one wrapped byte per pixel, see the encode
-                # side above); reinterpret each byte as SIGNED before
-                # adding delta_min back, matching Java's `payload[k]` (a
-                # signed byte) + delta_min exactly -- an unsigned add here
-                # would silently corrupt every negative delta.
-                delta[1:] = db[1:].astype(np.int8).astype(np.int64) + channel_delta_min[j]
-            else:
-                table = table_list[i]
-                packed = sm.decompress_strings(string_list[i])
-                delta = unpack_strings(packed, table, n, channel_length[j]).astype(np.int64)
-                delta[0] = 0
-                delta[1:] = delta[1:] + channel_delta_min[j]
-
-            if uses_map:
-                ch_flat = decoder(delta, new_xdim, new_ydim, channel_init[j], map_list[i])
-            else:
-                ch_flat = decoder(delta, new_xdim, new_ydim, channel_init[j])
-            ch2d = np.asarray(ch_flat).reshape(new_ydim, new_xdim)
-            if j > 2:
-                ch2d = ch2d + channel_min[j]
-
-            dqcl.append(ch2d)
-
-        # DeltaReader.java (the authoritative on-disk format) assembles
-        # blue/green/red from the small per-channel decoded arrays FIRST
-        # (_recombine below), and only THEN resizes and shifts the
-        # resulting 3 combined channels -- not the other way around.
-        # Resize's internal averaging steps use truncating integer
-        # division, and recombination involves subtraction, so
-        # "resize each raw channel, then combine" and "combine, then
-        # resize" are NOT equivalent -- order must match the reader
-        # exactly, not just use an equivalent-looking sequence.
-        blue, green, red = self._recombine(self.min_set_id, dqcl)
-
-        if self.pixel_quant != 0:
-            blue = resize_channel(blue, new_xdim, self.image_xdim, self.image_ydim)
-            green = resize_channel(green, new_xdim, self.image_xdim, self.image_ydim)
-            red = resize_channel(red, new_xdim, self.image_xdim, self.image_ydim)
-        if self.pixel_shift != 0:
-            blue = shift_2d(blue, self.pixel_shift)
-            green = shift_2d(green, self.pixel_shift)
-            red = shift_2d(red, self.pixel_shift)
-
-        if self.correction != 0:
-            f = self.correction / 10.0
-            ob, og, orr = self.channel_list
-            blue = blue + ((ob - blue) * f).astype(np.int32)
-            green = green + ((og - green) * f).astype(np.int32)
-            red = red + ((orr - red) * f).astype(np.int32)
-
-        bgr = np.zeros((self.image_ydim, self.image_xdim, 3), dtype=np.int32)
-        bgr[:, :, 0] = blue
-        bgr[:, :, 1] = green
-        bgr[:, :, 2] = red
-        self.working_bgr = bgr.clip(0, 255).astype(np.uint8)
-
-        self.update_display_image()
-        self.initialized = True
-
-    @staticmethod
-    def _recombine(min_set_id, dqcl):
-        d = dqcl
-        if min_set_id == 0:
-            blue, green, red = d[0], d[1], d[2]
-        elif min_set_id == 1:
-            blue, red = d[0], d[1]
-            green = difference_2d(red, d[2])
-        elif min_set_id == 2:
-            blue, red = d[0], d[1]
-            green = difference_2d(blue, d[2])
-        elif min_set_id == 3:
-            blue = d[0]
-            green = difference_2d(blue, d[1])
-            red = sum_2d(d[2], green)
-        elif min_set_id == 4:
-            blue = d[0]
-            green = difference_2d(blue, d[1])
-            red = sum_2d(blue, d[2])
-        elif min_set_id == 5:
-            green, red = d[0], d[1]
-            blue = sum_2d(d[2], green)
-        elif min_set_id == 6:
-            red = d[0]
-            bg, rg = d[1], -d[2]
-            green = sum_2d(rg, red)
-            blue = sum_2d(bg, green)
-        elif min_set_id == 7:
-            green = d[0]
-            blue = sum_2d(green, d[1])
-            red = sum_2d(green, d[2])
-        elif min_set_id == 8:
-            green = d[0]
-            red = sum_2d(green, d[1])
-            blue = difference_2d(red, d[2])
-        else:  # 9
-            red = d[0]
-            green = difference_2d(red, d[1])
-            blue = difference_2d(red, d[2])
-        return blue, green, red
-
-    # ------------------------------------------------------------------ save
-    # ---- byte-level helpers mirroring Java's writeTable/writeMap/getPayload ----
-    def _write_table(self, f, table):
-        f.write(len(table).to_bytes(2, "big", signed=False))
-        if len(table) <= 255:
-            for v in table:
-                f.write((int(v) & 0xFF).to_bytes(1, "big"))
-        else:
-            for v in table:
-                f.write((int(v) & 0xFFFF).to_bytes(2, "big"))
-
-    def _write_map_raw2bit(self, f, i):
-        """delta_type 6-8 on-disk map format: no table, no compression --
-        just the raw per-pixel map values (0-3) packed 4-to-a-byte, 2 bits
-        each. Matches DeltaReader.java's expectation for these three delta
-        types exactly (map_raw[q] = (pm[q>>2] >> ((q&3)<<1)) & 0x3)."""
-        map_bytes = self._last_maps[i]
-        ml = len(map_bytes)
-        pml = (ml + 3) // 4
-        packed = bytearray(pml)
-        for q, v in enumerate(map_bytes):
-            packed[q >> 2] |= (int(v) & 0x3) << ((q & 3) << 1)
-        f.write(ml.to_bytes(4, "big", signed=True))
-        f.write(pml.to_bytes(4, "big", signed=True))
-        f.write(bytes(packed))
-
-    def _write_map_stringmapper(self, f, i):
-        """delta_type 9-12 on-disk map format: table + StringMapper-packed
-        payload, same convention as _write_table's own payload encoding.
-
-        DELIBERATE FIX: does NOT call string_mapper's get_string_list()
-        directly. That function is written for DELTA arrays, where
-        position 0 is always a meaningless placeholder (DeltaMapper's own
-        dst[0]=0 convention) and so it intentionally overwrites value[0]
-        with value_range//2 before packing -- correct and verified for
-        delta arrays (see string_mapper.py's own docstring), but a MAP
-        array's position 0 is real data (e.g. row 0's predictor choice),
-        so that overwrite would silently corrupt it every time. The logic
-        below is otherwise identical to get_string_list(compress=False),
-        minus that one overwrite -- DeltaReader.java's read side already
-        adds delta_min back onto every position uniformly with no
-        special-casing, so this alone is enough to round-trip position 0
-        correctly too."""
-        map_bytes = self._last_maps[i]
-        map_int = [int(v) for v in map_bytes]
-        min_value, histogram, value_range = sm.get_histogram(map_int)
-        string_table = sm.get_rank_table(histogram)
-        shifted = [v - min_value for v in map_int]
-        packed = sm.pack_strings(shifted, string_table)
-        bl = sm.get_bitlength(packed)
-
-        f.write(len(map_bytes).to_bytes(4, "big", signed=False))
-        self._write_table(f, string_table)
-        f.write(int(min_value).to_bytes(4, "big", signed=True))
-        f.write(int(bl).to_bytes(4, "big", signed=True))
-        f.write(bytes(packed[:sm.get_bytelength(bl)]))
-
-    def _write_map(self, f, i):
-        """Dispatches to the correct on-disk map format for self.delta_type."""
-        if self.delta_type in (6, 7, 8):
-            self._write_map_raw2bit(f, i)
-        else:
-            self._write_map_stringmapper(f, i)
-
-    def _segment_payload(self, payload: bytes):
-        """Matches Java's 500 + pixel_segment*500 minimum-segment-size split."""
-        min_seg = 500 + self.pixel_segment * 500
-        n_segs = 1 if self.pixel_segment >= 10 else max(1, len(payload) // max(1, min_seg))
-        n_segs = max(1, n_segs)
-        seg_len = max(1, len(payload) // n_segs)
-        odd_len = len(payload) - seg_len * (n_segs - 1)
-        segs, freqs = [], []
-        pos = 0
-        for m in range(n_segs):
-            length = seg_len if m < n_segs - 1 else odd_len
-            seg = payload[pos:pos + length]
-            segs.append(seg)
-            hist = [0] * 256
-            for b in seg:
-                hist[b] += 1
-            freqs.append(hist)
-            pos += length
-        return n_segs, segs, freqs
-
-    def _deflate_frequencies(self, n_segs, freqs):
-        """Replaces Java's Deflater-based deflateFrequencies() with zlib,
-        applied to the real per-segment byte-value histograms."""
-        fmax = max((v for row in freqs for v in row), default=0)
-        if fmax < 254:
-            len_type, bpe = 0, 1
-        elif fmax < 65534:
-            len_type, bpe = 1, 2
-        else:
-            len_type, bpe = 2, 4
-        fb = bytearray(n_segs * 256 * bpe)
-        for k in range(n_segs):
-            for m in range(256):
-                v = freqs[k][m]
-                base = k * 256 * bpe + m * bpe
-                for b in range(bpe):
-                    fb[base + b] = (v >> (8 * b)) & 0xFF
-        zipped = zlib.compress(bytes(fb), level=9)  # Deflater.BEST_COMPRESSION equivalent
-        return len_type, zipped
-
-    def _save(self):
-        if not self.initialized:
-            self._apply_preview()
-
-        def worker():
-            channel_id = self._last_channel_id
-            print(f"Saving (entropy_type={self.entropy_type})...")
-            try:
-                with open("foo", "wb") as f:
-                    f.write(self.image_xdim.to_bytes(2, "big"))
-                    f.write(self.image_ydim.to_bytes(2, "big"))
-                    f.write(bytes([
-                        self.pixel_shift & 0xFF, self.pixel_quant & 0xFF, self.min_set_id & 0xFF,
-                        self.delta_type & 0xFF, self.compress_type & 0xFF, self.entropy_type & 0xFF,
-                        self.scanline5_variant & 0xFF,
-                    ]))
-                    if self.entropy_type in (0, 1):
-                        self._save_lz77_or_huffman(f, channel_id)
-                    elif self.entropy_type == 2:
-                        self._save_arithmetic(f, channel_id, slow=True)
-                    else:
-                        self._save_arithmetic(f, channel_id, slow=False)
-
-                size = os.path.getsize("foo")
-                rate = size / (self.image_xdim * self.image_ydim * 3)
-                print(f"Original compression rate: {self.file_compression_rate:.4f}")
-                print(f"Output  compression rate:  {rate:.4f}\n")
-            except Exception as e:
-                print(f"Save error: {e!r}")
-                import traceback
-                traceback.print_exc()
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _save_lz77_or_huffman(self, f, channel_id):
-        results = [None] * len(channel_id)
-        threads = []
-
-        def encode_one(i):
-            payload = self._last_payloads[i]
-            if self.entropy_type == 0:
-                # LZ77: real zlib compression of the real per-channel
-                # payload -- same DEFLATE/zlib framing (RFC 1950) Java's
-                # Deflater(BEST_COMPRESSION) produces.
-                results[i] = ("lz77", zlib.compress(payload, level=9))
-            else:
-                # Huffman: exercises the real CodeMapper call shape/control
-                # flow; CodeMapper itself is still a stub (to be replaced
-                # when the real external modules are translated).
-                pi = list(payload)
-                dmin, hist = get_histogram(np.array(pi, dtype=np.int64))
-                rank_table = sm.get_rank_table(hist)
-                shifted = [v - dmin for v in pi]
-                freq_sorted = sorted(hist.tolist(), reverse=True)
-                hl2 = cm.get_huffman_length2(freq_sorted)
-                hc = cm.get_canonical_code(hl2)
-                packed_bytes, bitlen = pack_code(shifted, rank_table, hc, hl2)
-                ltn, ltinit, ltmax, ltdelta = cm.pack_length_table(hl2)
-                results[i] = ("huffman", dmin, rank_table, ltn, ltinit, ltmax, ltdelta, bitlen, packed_bytes)
-
-        for i in range(len(channel_id)):
-            t = threading.Thread(target=encode_one, args=(i,))
-            threads.append(t); t.start()
-        for t in threads:
-            t.join()
-
-        for i, j in enumerate(channel_id):
-            f.write(int(self.channel_min[j]).to_bytes(4, "big", signed=True))
-            f.write(int(self.channel_init[j]).to_bytes(4, "big", signed=True))
-            f.write(int(self.channel_delta_min[j]).to_bytes(4, "big", signed=True))
-            f.write(int(self.channel_length[j]).to_bytes(4, "big", signed=True))
-            f.write(int(self.channel_compressed_length[j]).to_bytes(4, "big", signed=True))
-            f.write(bytes([int(self.channel_iterations[i]) & 0xFF]))
-            if self.delta_type >= 6:  # all of 6-12 use a map now (10 = scanline 5)
-                self._write_map(f, i)
-            if self.compress_type > 0:
-                self._write_table(f, self._last_tables[i])
-
-            r = results[i]
-            if r[0] == "lz77":
-                compressed = r[1]
-                payload = self._last_payloads[i]
-                f.write(len(payload).to_bytes(4, "big", signed=True))
-                f.write(len(compressed).to_bytes(4, "big", signed=True))
-                f.write(compressed)
-            else:
-                _, dmin, rank_table, ltn, ltinit, ltmax, ltdelta, bitlen, packed_bytes = r
-                self._write_table(f, rank_table)
-                f.write(int(dmin).to_bytes(4, "big", signed=True))
-                f.write(int(ltn).to_bytes(4, "big", signed=True))
-                f.write(bytes([int(ltinit) & 0xFF, int(ltmax) & 0xFF, len(ltdelta) & 0xFF]))
-                f.write(bytes(ltdelta))
-                f.write(int(bitlen).to_bytes(4, "big", signed=True))
-                f.write(len(packed_bytes).to_bytes(4, "big", signed=True))
-                f.write(bytes(packed_bytes))
-
-    def _save_arithmetic(self, f, channel_id, slow: bool):
-        payloads = [self._last_payloads[i] for i in range(len(channel_id))]
-        seg_data = [self._segment_payload(p) for p in payloads]
-
-        encoded = [None] * len(channel_id)
-
-        def encode_channel(i):
-            n_segs, segs, freqs = seg_data[i]
-            out = []
-            for m in range(n_segs):
-                if slow:
-                    low, high = am.get_interval_value(segs[m], freqs[m])
-                    out.append((low, high))
-                else:
-                    # Fenwick-tree variant: confirmed to produce a
-                    # byte-identical encoded stream to get_interval_value_fast
-                    # (see the conversation this was produced in -- 28/28
-                    # cross-checks matched exactly across alphabet sizes and
-                    # lengths), while running ~1.7x faster since its
-                    # per-symbol cumulative-frequency update is O(log 256)
-                    # instead of O(256). Safe drop-in swap, no format change.
-                    out.append(am.get_interval_value_fast_fenwick(segs[m], freqs[m]))
-            encoded[i] = out
-
-        threads = [threading.Thread(target=encode_channel, args=(i,)) for i in range(len(channel_id))]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-
-        len_types = [None] * len(channel_id)
-        zipped_freqs = [None] * len(channel_id)
-        for i in range(len(channel_id)):
-            n_segs, segs, freqs = seg_data[i]
-            len_types[i], zipped_freqs[i] = self._deflate_frequencies(n_segs, freqs)
-
-        for i, j in enumerate(channel_id):
-            f.write(int(self.channel_min[j]).to_bytes(4, "big", signed=True))
-            f.write(int(self.channel_init[j]).to_bytes(4, "big", signed=True))
-            f.write(int(self.channel_delta_min[j]).to_bytes(4, "big", signed=True))
-            f.write(int(self.channel_length[j]).to_bytes(4, "big", signed=True))
-            f.write(int(self.channel_compressed_length[j]).to_bytes(4, "big", signed=True))
-            f.write(bytes([int(self.channel_iterations[i]) & 0xFF]))
-            if self.delta_type >= 6:  # all of 6-12 use a map now (10 = scanline 5)
-                self._write_map(f, i)
-            if self.compress_type > 0:
-                self._write_table(f, self._last_tables[i])
-
-            n_segs, segs, freqs = seg_data[i]
-            f.write(n_segs.to_bytes(4, "big", signed=True))
-            f.write(int(len_types[i]).to_bytes(4, "big", signed=True))
-            f.write(len(zipped_freqs[i]).to_bytes(4, "big", signed=True))
-            f.write(zipped_freqs[i])
-
-            if slow:
-                # BigInteger.toByteArray() equivalent: minimal big-endian
-                # two's-complement bytes. ArithmeticMapper itself is still
-                # a stub, so exact byte-for-byte parity isn't meaningful
-                # yet -- this just gives each interval bound a real,
-                # round-trippable byte encoding.
-                for (low, high) in encoded[i]:
-                    for val in (low, high):
-                        nbytes = max(1, (int(val).bit_length() + 8) // 8)
-                        b = int(val).to_bytes(nbytes, "big", signed=True)
-                        f.write(len(b).to_bytes(4, "big", signed=True))
-                        f.write(b)
-            else:
-                for enc in encoded[i]:
-                    f.write(len(enc).to_bytes(4, "big", signed=True))
-                    f.write(bytes(enc))
+    def save(self):
+        if not self.coder.applied:
+            self.apply()
+        if not self.coder.applied:
+            vs.show_error(self.view, "Nothing saved: the last Apply failed.")
+            return
+        try:
+            self.coder.save("foo")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            if os.path.exists("foo"):
+                os.remove("foo")
+            vs.show_error(self.view, "Save failed: %r" % e)
 
 
 def main():
+    from PySide6.QtWidgets import QApplication
     app = QApplication(sys.argv)
     if len(sys.argv) > 1:
-        DeltaWriterWindow(sys.argv[1])
+        DeltaWriter(sys.argv[1])
     else:
-        open_image_dialog(None)
-        if DeltaWriterWindow.open_window_count == 0:
-            sys.exit(0)
+        open_image()
+    if not _open_writers:
+        return
     sys.exit(app.exec())
 
 
