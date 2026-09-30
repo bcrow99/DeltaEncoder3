@@ -12,8 +12,8 @@ be used without a display:
 
     rgb = DeltaDecoder("foo").decode()      # (ydim, xdim, 3) uint8, R, G, B
 
-Files made with the pixel pyramid ("Average" in the Quantization menu)
-are expanded back to full size with the sign-bit correction, as in the Java.
+Not ported yet: files made with the pixel pyramid ("Average" in the Java
+DeltaWriter's Quantization menu) are refused with a message.
 """
 
 import sys
@@ -23,7 +23,6 @@ import numpy as np
 import arithmetic_mapper as am
 import code_mapper as cm
 import delta_mapper as dm
-import image_mapper as im
 import resize_mapper as rm
 import string_mapper as sm
 import viewer_support as vs
@@ -54,7 +53,8 @@ class DeltaDecoder:
         self.ydim = inp.read_unsigned_short()
         (self.pixel_shift, self.pixel_quant, self.set_id, self.delta_type, self.compress_type,
          self.entropy_type, self.scanline5_variant, self.pixel_pyramid, saddle) = [inp.read_byte() for _ in range(9)]
-        self.use_saddle = saddle != 0
+        if self.pixel_pyramid != 0:
+            raise IOError(self.filename + " was saved with the pixel pyramid (Average), which the Python reader doesn't support yet.")
 
         print("Image:        %d x %d" % (self.xdim, self.ydim))
         print("Channel set:  " + dm.SET_NAMES[self.set_id])
@@ -64,19 +64,15 @@ class DeltaDecoder:
         print()
 
         self.size = dm.get_quantized_size(self.xdim, self.ydim, self.pixel_quant)
-        self.top = get_pyramid_size(self.size[0], self.size[1], self.pixel_pyramid)
-        w, h = self.top                              # the deltas are coded at the top pyramid level
+        w, h = self.size
         self.min, self.init, self.delta_min, self.length, self.compressed_length = ([0] * 3 for _ in range(5))
         self.table, self.map, self.coded, self.delta, self.lengths, self.freqs, self.blocks = ([None] * 3 for _ in range(7))
-        self.sign_bit = [None] * 3                   # pyramid sign bits, one bitmap per level
 
         for i in range(3):
             self.min[i], self.init[i], self.delta_min[i], self.length[i], self.compressed_length[i] = [inp.read_int() for _ in range(5)]
             inp.read_byte()                          # iterations (the string carries them too)
             if dm.has_map(self.delta_type):
                 self.map[i] = dm.read_map(inp, self.delta_type, self.map[i - 1] if i > 0 else None, w)
-            if self.pixel_pyramid != 0:
-                self.sign_bit[i] = read_sign_bits(inp, self.pixel_pyramid)
             if self.entropy_type == 4:               # Context: decoded here, in channel order
                 self.delta[i] = dm.read_context_deltas(inp, w * h, self.delta[:i], w)
                 continue
@@ -95,9 +91,8 @@ class DeltaDecoder:
                 self.coded[i] = np.frombuffer(inp.read_fully(inp.read_int()), dtype=np.uint8)
 
     def decode_channel(self, i):
-        """Entropy decode -> deltas -> channel values, then the pyramid
-        expand if there is one."""
-        w, h = self.top
+        """Entropy decode -> deltas -> channel values."""
+        w, h = self.size
         n = w * h
         if self.entropy_type == 4:
             delta = self.delta[i]
@@ -121,13 +116,9 @@ class DeltaDecoder:
                 delta[0] = 0
                 delta[1:] += self.delta_min[i]
         channel = dm.get_values_from_deltas(delta, w, h, self.init[i], self.delta_type, self.map[i], self.scanline5_variant)
-        difference = dm.get_channels(self.set_id)[i] > 2
-        if self.pixel_pyramid != 0:
-            channel = expand_pyramid(channel, self.size[0], self.size[1], self.sign_bit[i], difference, self.use_saddle)
-        if difference:
+        if dm.get_channels(self.set_id)[i] > 2:
             channel = channel + self.min[i]
         return channel
-
 
     def decode(self):
         """The image as an (ydim, xdim, 3) uint8 array, R, G, B."""
@@ -149,46 +140,6 @@ class DeltaDecoder:
         rgb = np.stack([np.clip(dm.shift(v, self.pixel_shift), 0, 255).reshape(self.ydim, self.xdim) for v in bgr], axis=2)
         print("RGB assembled in " + timer.elapsed() + ".")
         return rgb.astype(np.uint8)
-
-
-def read_sign_bits(inp, levels):
-    """DeltaWriter's sign bits: one bitmap per pyramid level, each an int
-    length, then (length+7)/8 bytes, bit q in byte q>>3, bit q&7."""
-    sign_bits = []
-    for _ in range(levels):
-        n = inp.read_int()
-        packed = np.frombuffer(inp.read_fully((n + 7) // 8), dtype=np.uint8)
-        sign_bits.append(np.unpackbits(packed, bitorder="little")[:n].astype(np.bool_))
-    return sign_bits
-
-
-# ---- Image pyramid (see delta_writer.py) ------------------------------------
-
-def get_pyramid_size(xdim, ydim, levels):
-    """Size of the top pyramid level, the size the deltas are coded at."""
-    if levels == 0:
-        return xdim, ydim
-    mult = 1 << levels
-    return im.pad_to(xdim, mult) >> levels, im.pad_to(ydim, mult) >> levels
-
-
-def expand_pyramid(top, xdim, ydim, sign_bits, difference, saddle):
-    """Inverse of delta_writer.shrink_pyramid (the writer's preview uses it
-    too): expands the top level back to xdim x ydim with sign-bit correction
-    at each level. Difference channels are offset by their minimum but not
-    rescaled, so they range 0-510 (clamping them to 255 would corrupt
-    high-contrast areas)."""
-    levels = len(sign_bits)
-    mult = 1 << levels
-    max_value = 510 if difference else 255
-    level = np.asarray(top, dtype=np.int64)
-    level_xdim = im.pad_to(xdim, mult) >> levels
-    expand = im.expand_gradient_saddle_flat if saddle else im.expand_gradient_flat
-    for lvl in range(levels - 1, -1, -1):
-        predicted = expand(level, level_xdim, max_value)
-        level = im.refine_with_sign_bits_flat(level, predicted, sign_bits[lvl], level_xdim * 2, max_value)
-        level_xdim *= 2
-    return im.crop_flat(level, im.pad_to(xdim, mult), im.pad_to(ydim, mult), xdim, ydim)
 
 
 class DeltaReader:

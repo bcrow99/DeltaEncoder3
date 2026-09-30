@@ -14,10 +14,8 @@ it can also be used without a display:
     coder = DeltaCoder(viewer_support.read_image("photo.png"))
     coder.survey(); coder.apply(); coder.save("photo.dlt")
 
-The pixel pyramid ("Average" in the Quantization menu): after every other
-quantizing step, the 3 selected channels are averaged down 1 or 2 times and
-the deltas are coded at the top level; one sign bit per pixel per level
-restores the detail when the reader expands back (see shrink_pyramid).
+Not ported yet: the pixel pyramid ("Average" in the Java Quantization menu),
+which needs ImageMapper. Files are written without it (pixel_pyramid 0).
 
 The first run compiles the Numba code (about a minute); later runs load it
 from the cache.
@@ -32,8 +30,6 @@ import numpy as np
 import arithmetic_mapper as am
 import code_mapper as cm
 import delta_mapper as dm
-import delta_reader as dr
-import image_mapper as im
 import resize_mapper as rm
 import string_mapper as sm
 import viewer_support as vs
@@ -76,12 +72,6 @@ class DeltaCoder:
         self.scanline5_variant = 0
         self.block_size = dm.BLOCK_DEFAULT
         self.block_set = 0
-        # Pixel pyramid: number of shrink/expand levels (0 = none), capped at
-        # 2 (deeper levels produced block artifacts even with sign-bit
-        # correction). use_saddle: expand with the cross-derivative term too.
-        self.pixel_pyramid = 0
-        self.use_saddle = False
-        self.sign_bit = [None] * 3
 
         self.channel_sum = [0] * 6
         self.set_sum = [0] * 10
@@ -189,11 +179,7 @@ class DeltaCoder:
             size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
             qc = self.quantized_channels(size, True)
             ids = dm.get_channels(self.min_set_id)
-        # With a pixel pyramid the block map codes the top level, so the search does too.
-        top = dr.get_pyramid_size(size[0], size[1], self.pixel_pyramid)
-        ch = [qc[i] if self.pixel_pyramid == 0 else shrink_pyramid(qc[i], size[0], size[1], self.pixel_pyramid)[0]
-              for i in ids]
-        best, table = dm.find_best_block(ch, top[0], top[1])
+        best, table = dm.find_best_block([qc[i] for i in ids], size[0], size[1])
         self.block_size, self.block_set = best
         print(dm.get_block_table(table, best), end="")
         print("Block search took " + timer.elapsed())
@@ -239,15 +225,11 @@ class DeltaCoder:
         if not self.int_allowed and self.compress_type == 0:
             self.compress_type = 1
 
-        tw, th = dr.get_pyramid_size(w, h, self.pixel_pyramid)
-        table, payload, maps, deltas, decoded, sign_bit = ([None] * 3 for _ in range(6))
+        table, payload, maps, deltas, decoded = [None] * 3, [None] * 3, [None] * 3, [None] * 3, [None] * 3
 
         def channel(i):
             j = ids[i]
-            c = qc[j]
-            if self.pixel_pyramid != 0:
-                c, sign_bit[i] = shrink_pyramid(c, w, h, self.pixel_pyramid)
-            d, m, _ = dm.get_deltas(c, tw, th, self.delta_type, self.scanline5_variant, self.block_size, self.block_set)
+            d, m, _ = dm.get_deltas(qc[j], w, h, self.delta_type, self.scanline5_variant, self.block_size, self.block_set)
             deltas[i] = d
             maps[i] = m
             if self.compress_type == 0:
@@ -265,19 +247,16 @@ class DeltaCoder:
                 table[i], payload[i] = tbl, s
                 self.channel_compressed_length[j] = sm.get_bitlength(s)
                 self.channel_iterations[i] = sm.get_iterations(s)
-                d2 = sm.unpack_strings(sm.decompress_strings(s), tbl, tw * th, bits)
+                d2 = sm.unpack_strings(sm.decompress_strings(s), tbl, w * h, bits)
                 d2[0] = 0
                 d2[1:] += lo
-            ch = dm.get_values_from_deltas(d2, tw, th, self.channel_init[j], self.delta_type, m, self.scanline5_variant)
-            if self.pixel_pyramid != 0:
-                ch = dr.expand_pyramid(ch, w, h, sign_bit[i], j > 2, self.use_saddle)
+            ch = dm.get_values_from_deltas(d2, w, h, self.channel_init[j], self.delta_type, m, self.scanline5_variant)
             if j > 2:
                 ch = ch + self.channel_min[j]
             decoded[i] = ch
 
         vs.parallel(3, channel)
-        self.table, self.payload, self.map, self.delta_list, self.delta_xdim = table, payload, maps, deltas, tw
-        self.sign_bit = sign_bit
+        self.table, self.payload, self.map, self.delta_list, self.delta_xdim = table, payload, maps, deltas, w
 
         # As the reader: recombine the channel set first, then resize, then shift.
         bgr = dm.get_blue_green_red(self.min_set_id, *decoded)
@@ -302,14 +281,14 @@ class DeltaCoder:
 
     def save(self, filename="foo"):
         """Header, then per channel: min, init, delta min, bit lengths,
-        iterations, map (types 6-13), sign bits (pyramid), string table
-        (String and String*, not Context), then the entropy-coded payload."""
+        iterations, map (types 6-13), string table (String and String*, not
+        Context), then the entropy-coded payload."""
         ids = dm.get_channels(self.min_set_id)
         out = DataOutput()
         out.write_byte(FORMAT_ID); out.write_byte(FORMAT_VERSION)
         out.write_short(self.image_xdim); out.write_short(self.image_ydim)
         for v in (self.pixel_shift, self.pixel_quant, self.min_set_id, self.delta_type, self.compress_type,
-                  self.entropy_type, self.scanline5_variant, self.pixel_pyramid, 1 if self.use_saddle else 0):
+                  self.entropy_type, self.scanline5_variant, 0, 0):       # last two: pixel pyramid levels, saddle
             out.write_byte(v)
 
         timer = vs.Timer()
@@ -327,8 +306,6 @@ class DeltaCoder:
             out.write_byte(self.channel_iterations[i])
             if dm.has_map(self.delta_type):
                 dm.write_map(out, self.delta_type, self.map[i], self.map[i - 1] if i > 0 else None, self.delta_xdim)
-            if self.pixel_pyramid != 0:
-                write_sign_bits(out, self.sign_bit[i])
             if self.compress_type > 0 and self.entropy_type != 4:
                 dm.write_table(out, self.table[i])
             out.write(coded[i])
@@ -339,32 +316,6 @@ class DeltaCoder:
         print("Original compression rate: %.4f" % (self.file_length / raw))
         print("Output  compression rate:  %.4f" % (out.size() / raw))
         return out.size()
-
-
-def shrink_pyramid(c, xdim, ydim, levels):
-    """Pads c to a multiple of 2^levels, then shrinks it levels times.
-    Returns (top level, sign bits), where sign_bits[lvl] compares level lvl
-    with level lvl+1 (delta_reader.expand_pyramid undoes it)."""
-    mult = 1 << levels
-    padded_xdim, padded_ydim = im.pad_to(xdim, mult), im.pad_to(ydim, mult)
-    level = im.pad_edge_replicate_flat(np.asarray(c, dtype=np.int64), xdim, ydim, padded_xdim, padded_ydim)
-    level_xdim = padded_xdim
-    sign_bits = []
-    for _ in range(levels):
-        nxt = im.shrink_avg_flat(level, level_xdim)
-        sign_bits.append(im.build_geq_bits_flat(level, nxt, level_xdim))
-        level = nxt
-        level_xdim //= 2
-    return level, sign_bits
-
-
-def write_sign_bits(out, sign_bits):
-    """One bitmap per pyramid level: int length, then (length+7)/8 bytes,
-    bit q in byte q>>3, bit q&7. The reader takes the number of levels from
-    the header."""
-    for bits in sign_bits:
-        out.write_int(len(bits))
-        out.write(np.packbits(np.asarray(bits, dtype=np.uint8), bitorder="little").tobytes())
 
 
 def pack_and_compress(values):
@@ -456,7 +407,7 @@ _open_writers = []
 class DeltaWriter:
     def __init__(self, filename):
         from PySide6.QtGui import QAction, QActionGroup, QKeySequence
-        from PySide6.QtWidgets import QRadioButton, QButtonGroup, QCheckBox, QHBoxLayout, QLabel, QSpinBox, QWidget
+        from PySide6.QtWidgets import QRadioButton, QButtonGroup
 
         self.filename = filename
         try:
@@ -497,20 +448,6 @@ class DeltaWriter:
             act, slider = vs.make_slider_dialog(view, title, lo, hi, getattr(c, key), self._setter(key))
             quant.addAction(act)
             self.sliders[key] = slider
-        # Average: pyramid levels 0-2, plus the Use Saddle checkbox.
-        row = QWidget()
-        row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(0, 0, 0, 0)
-        self.pyramid_spin = QSpinBox()
-        self.pyramid_spin.setRange(0, 2)
-        self.pyramid_spin.setValue(c.pixel_pyramid)
-        self.pyramid_spin.valueChanged.connect(self._setter("pixel_pyramid"))
-        row_layout.addWidget(QLabel("Levels:"))
-        row_layout.addWidget(self.pyramid_spin)
-        self.saddle_checkbox = QCheckBox("Use Saddle")
-        self.saddle_checkbox.setChecked(c.use_saddle)
-        self.saddle_checkbox.toggled.connect(self._setter("use_saddle"))
-        quant.addAction(vs.make_button_dialog(view, "Average", [row, self.saddle_checkbox]))
         # Error Correction is not a quantizing step: it blends the preview back
         # toward the original by correction/10. Preview only.
         quant.addSeparator()
@@ -626,14 +563,12 @@ class DeltaWriter:
         self.block_buttons[c.block_set].setChecked(True)
         for key, slider in self.sliders.items():
             slider.setValue(getattr(c, key))
-        self.pyramid_spin.setValue(c.pixel_pyramid)
-        self.saddle_checkbox.setChecked(c.use_saddle)
         self.show_compress_type()
         self.updating = False
 
     def reset(self):
         c = self.coder
-        c.smooth_level = c.smooth2_level = c.pixel_quant = c.pixel_shift = c.correction = c.pixel_pyramid = 0
+        c.smooth_level = c.smooth2_level = c.pixel_quant = c.pixel_shift = c.correction = 0
         self.show_settings()
         self.apply()
 
