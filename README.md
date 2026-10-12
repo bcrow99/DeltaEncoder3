@@ -19,7 +19,15 @@ python3 simple_writer.py [image]     # Simple format 'S'
 python3 simple_reader.py foo
 python3 block_writer.py [image]      # Block format 'B'
 python3 block_reader.py foo
+python3 packet_writer.py [image]     # Packet format 'P' version 1
+python3 packet_reader.py foo
+python3 pixel_writer.py [image]      # Pixel format 'P' versions 1-3
+python3 pixel_reader.py foo
 ```
+
+The Packet and Pixel formats share the ID byte 'P' (as in the Java), so a
+reader can't tell one from the other: open a Packet file with packet_reader.py
+and a Pixel file with pixel_reader.py.
 
 Three smaller programs:
 
@@ -47,12 +55,20 @@ after that it loads from the cache in `__pycache__`.
 | `simple_reader.py` | SimpleReader | `SimpleDecoder` |
 | `block_writer.py` | BlockWriter | `BlockCoder`: block map with context-coded deltas, best block size and predictors |
 | `block_reader.py` | BlockReader | `BlockDecoder` |
+| `packet_writer.py` | PacketWriter | `PacketCoder`: unary strings split into separately compressed packets |
+| `packet_reader.py` | PacketReader | `PacketDecoder` |
+| `pixel_writer.py` | PixelWriter | `PixelCoder`: context-adaptive arithmetic coding of the pixels, block size search |
+| `pixel_reader.py` | PixelReader | `PixelDecoder` |
 | `viewer_support.py` | ViewerSupport | image window with zoom, dialogs, image loading, background jobs |
 | `delta_mapper.py` | DeltaMapper | channel sets, delta types 0–13, maps, context-coded deltas, block search |
 | `arithmetic_mapper.py` | ArithmeticMapper | range coder; static, adaptive and context coders; frequency tables |
 | `string_mapper.py` | StringMapper | unary strings and their bit-run compression |
 | `code_mapper.py` | CodeMapper | Huffman ("regular"), Shannon estimate, Deflate |
 | `resize_mapper.py` | ResizeMapper | Pixel Resolution resizing |
+| `segment_mapper.py` | SegmentMapper | the segmenting and packing the Packet programs use |
+| `pixel_mapper.py` | PixelMapper | per-block context models for the pixels or prediction errors, red/green/blue or green-difference channels |
+| `image_mapper.py` | ImageMapper | the pixel-pyramid operators, dilation, area resampling, registration |
+| `probabilistic_mapper.py` | ProbabilisticMapper | steering an exact arithmetic-coding interval, combinadic and c-sequence coders |
 | `fraction_mapper.py` | FractionMapper | `BigFraction` (exact fractions plus the wheel's infinity and bottom), repeating decimal and binary digits |
 | `comparison.py` | Comparison | rate-distortion comparison of the delta coder and JPEG |
 | `segment_steer_demo.py` | SegmentSteerDemo | races candidate targets for ProbabilisticMapper's steering, on separate processes |
@@ -67,11 +83,12 @@ versions (for functions not here) needs the old files until it is ported.
 HiDPI: Qt 6 scales the interface itself on Linux, Windows and macOS, so the Java
 version's font-scaling fallback isn't needed.
 
-## Not ported yet
+## The pixel pyramid
 
-The pixel pyramid ("Average" in the Java Quantization menu) needs ImageMapper.
-The Python writer saves without it, and the Python reader refuses files that
-use it, with a message.
+The pixel pyramid ("Average" in the old Java Quantization menu) has been taken
+out of both the Java and the Python Delta programs. Both readers refuse old
+files that used it, with a message. The pyramid operators are still in
+`image_mapper.py`.
 
 ## Compatibility testing
 
@@ -109,6 +126,17 @@ Results when this was written:
   number in both the JPEG and delta-coder tables), SegmentSteerDemo's segment
   and every target's search at 5 segment sizes, and TestGetDigits on 23
   inputs, including bad and overflowing ones.
+- **PixelMapper:** 640 random cases (sizes 1-139 in each direction, every
+  Color Resolution, block sizes 8-256, all 3 codings and both channel sets),
+  every coded channel byte-for-byte identical and decoding back in both
+  versions, and the block size search choosing the same size from the same
+  table in 160 of them.
+- **Pixel programs:** 31 files from 4 PNGs (a photo, a cat, two synthetic
+  images with odd sizes) saved by the Java and Python writers: the start-up
+  settings plus every coding and channel set and a range of Pixel and Color
+  Resolutions. All byte-for-byte identical, with identical block-size
+  tables. Both readers decode all 62 files, plus 23 version 1 and 2 copies,
+  to the same pixels.
 - **DeltaWriter2, Simple and Block programs:** 420 files from 5 PNGs (odd and
   even sizes, tiny, grey) saved by the Java and Python writers: every delta
   type each writer offers, all entropy types, a range of block sizes and
