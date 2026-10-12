@@ -21,7 +21,17 @@ python3 block_writer.py [image]      # Block format 'B'
 python3 block_reader.py foo
 ```
 
+Three smaller programs:
+
+```
+python3 comparison.py image.png [scale] [display width]   # delta coder vs JPEG, rate and distortion
+python3 segment_steer_demo.py [dimension] [budget] [workers]  # steered arithmetic coding demo
+python3 test_get_digits.py                                # repeating-decimal demo (asks for a and b)
+```
+
 Requirements: `numpy`, `PySide6`, `opencv-python` (image loading), and `numba`.
+`comparison.py` also uses `pillow` if it's installed, to make JPEGs exactly as
+Java's ImageIO does.
 Numba is optional but strongly recommended: without it everything still works,
 identically, but slowly. The first run compiles the Numba code (about a minute);
 after that it loads from the cache in `__pycache__`.
@@ -43,6 +53,10 @@ after that it loads from the cache in `__pycache__`.
 | `string_mapper.py` | StringMapper | unary strings and their bit-run compression |
 | `code_mapper.py` | CodeMapper | Huffman ("regular"), Shannon estimate, Deflate |
 | `resize_mapper.py` | ResizeMapper | Pixel Resolution resizing |
+| `fraction_mapper.py` | FractionMapper | `BigFraction` (exact fractions plus the wheel's infinity and bottom), repeating decimal and binary digits |
+| `comparison.py` | Comparison | rate-distortion comparison of the delta coder and JPEG |
+| `segment_steer_demo.py` | SegmentSteerDemo | races candidate targets for ProbabilisticMapper's steering, on separate processes |
+| `test_get_digits.py` | TestGetDigits | interactive demo of the decimal digit functions |
 | `java_io.py` | — | DataInputStream / DataOutputStream equivalents |
 | `numba_support.py` | — | the optional `@njit` and Java-style integer division |
 
@@ -85,6 +99,16 @@ Results when this was written:
   datatypes; lossless and quantized; odd image sizes; grey images.
 - **Reading:** both readers decode every file (Java, Python and DeltaWriter2)
   to the same pixels.
+- **FractionMapper (version 2.1):** 20,500 cases plus 129 rounding ties,
+  all identical, and every digit expansion checked against exact
+  arithmetic. Covered: BigFraction arithmetic and comparison including
+  infinity and bottom, to_double, and decimal and binary digit expansions
+  in both directions, including the inputs that overflowed before 2.1.
+- **Comparison, SegmentSteerDemo, TestGetDigits:** the same output as the
+  Java, line for line: Comparison on 4 images plus a half-size run (every
+  number in both the JPEG and delta-coder tables), SegmentSteerDemo's segment
+  and every target's search at 5 segment sizes, and TestGetDigits on 23
+  inputs, including bad and overflowing ones.
 - **DeltaWriter2, Simple and Block programs:** 420 files from 5 PNGs (odd and
   even sizes, tiny, grey) saved by the Java and Python writers: every delta
   type each writer offers, all entropy types, a range of block sizes and
