@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-pixel_reader.py version 1.2 -- PixelReader.java for Python (PySide6).
+pixel_reader.py version 1.3 -- PixelReader.java for Python (PySide6).
 
 Reads the Pixel format files pixel_writer.py and PixelWriter.java save
 (versions 1 to 3) and shows the image.
@@ -21,7 +21,7 @@ import pixel_mapper as px
 import viewer_support as vs
 from java_io import DataInput
 
-FORMAT_ID = ord('P')
+FORMAT_ID = ord('X')   # it was 'P' until that turned out to be the Packet format's id too
 FORMAT_VERSION = 3      # 2 added the coding byte, 3 the channels byte; older files are read with the defaults
 
 
@@ -35,6 +35,9 @@ class PixelDecoder:
 
     def _read(self, inp):
         ident, version = inp.read_unsigned_byte(), inp.read_unsigned_byte()
+        if ident == ord('P'):
+            raise IOError(self.filename + " starts with 'P': a Packet Writer file (open it with packet_reader.py), or a Pixel Writer"
+                          " file saved before the Pixel format's id changed from 'P' to 'X' (save the image again with pixel_writer.py).")
         if ident != FORMAT_ID:
             raise IOError(self.filename + " is not a Pixel Writer file.")
         if version < 1 or version > FORMAT_VERSION:

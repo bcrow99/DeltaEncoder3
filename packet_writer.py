@@ -38,7 +38,7 @@ from delta_writer import context_code
 from java_io import DataOutput
 
 FORMAT_ID = ord('P')
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2   # 2: block maps carry their predictor ids (delta_mapper.write_map)
 
 # Entropy menu, in entropy_type order. 3, 4 and 6 code every packet on its
 # own instead of all of a channel's packets as one stream (see code_packets).

@@ -39,7 +39,7 @@ from delta_writer import ENTROPY_NAMES, context_code, entropy_code, pack_and_com
 from java_io import DataOutput
 
 FORMAT_ID = ord('D')
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2   # 2: block maps carry their predictor ids (delta_mapper.write_map)
 
 # compress_type written to the header: String* (strings that don't compress
 # enough come back uncompressed from get_string_list). DeltaReader treats it like 2.

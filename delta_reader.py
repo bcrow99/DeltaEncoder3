@@ -2,7 +2,7 @@
 """
 delta_reader.py version 1.0 -- DeltaReader.java for Python (PySide6).
 
-Reads Delta format 'D' version 1 files, from delta_writer.py or
+Reads Delta format 'D' version 1 and 2 files, from delta_writer.py or
 DeltaWriter.java (or DeltaWriter2.java), and shows the image.
 
     python3 delta_reader.py file
@@ -29,7 +29,7 @@ import viewer_support as vs
 from java_io import DataInput
 
 FORMAT_ID = ord('D')
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2   # 2: block maps carry their predictor ids; version 1 files are still read
 
 ENTROPY_NAMES = ["LZ77", "Huffman", "Arithmetic", "Adaptive", "Context"]
 COMPRESS_NAMES = ["Integer", "String", "String*", "String* (DeltaWriter2)"]
@@ -47,8 +47,8 @@ class DeltaDecoder:
         ident, version = inp.read_unsigned_byte(), inp.read_unsigned_byte()
         if ident != FORMAT_ID:
             raise IOError(self.filename + " is not a Delta Writer file.")
-        if version != FORMAT_VERSION:
-            raise IOError("%s is Delta format version %d; this reader reads version %d." % (self.filename, version, FORMAT_VERSION))
+        if version < 1 or version > FORMAT_VERSION:
+            raise IOError("%s is Delta format version %d; this reader reads versions 1 to %d." % (self.filename, version, FORMAT_VERSION))
         self.xdim = inp.read_unsigned_short()
         self.ydim = inp.read_unsigned_short()
         (self.pixel_shift, self.pixel_quant, self.set_id, self.delta_type, self.compress_type,
@@ -72,7 +72,7 @@ class DeltaDecoder:
             self.min[i], self.init[i], self.delta_min[i], self.length[i], self.compressed_length[i] = [inp.read_int() for _ in range(5)]
             inp.read_byte()                          # iterations (the string carries them too)
             if dm.has_map(self.delta_type):
-                self.map[i] = dm.read_map(inp, self.delta_type, self.map[i - 1] if i > 0 else None, w)
+                self.map[i] = dm.read_map(inp, self.delta_type, self.map[i - 1] if i > 0 else None, w, version == 1)
             if self.entropy_type == 4:               # Context: decoded here, in channel order
                 self.delta[i] = dm.read_context_deltas(inp, w * h, self.delta[:i], w)
                 continue

@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
 """
-block_writer.py version 1.0 -- BlockWriter.java for Python (PySide6).
+block_writer.py version 1.3 -- BlockWriter.java for Python (PySide6).
 
 A writer with one delta type and one entropy coder: the block map (delta
-type 13) with Context-coded deltas and a context-coded map. Its startup
-analysis picks the channel set, then the block size and predictor set by
-coding with each candidate and keeping the smallest -- actual sizes, not
-estimates. Saves (to the file "foo", as the Java version does) in Block
-format 'B' version 1, read by block_reader.py and BlockReader.java.
+type 13) with Context-coded deltas and a coded map. Each block uses one
+predictor from its channel's set, and a set can be any of the 253
+predictors delta_mapper has ids for. The startup analysis (and Find Best)
+picks the channel set, then surveys the sets (delta_mapper.survey_block_sets:
+per channel, predictors added in greedy order by estimated coded bits,
+blocks assigned by the estimate, and the real coded size measured), and
+also codes with each named set (find_best_block); it keeps whichever is
+smallest -- actual sizes, not estimates. Saves (to the file
+"foo", as the Java version does) in Block format 'B' version 2, read by
+block_reader.py and BlockReader.java.
 
     python3 block_writer.py [image]
 
@@ -29,8 +34,9 @@ import viewer_support as vs
 from delta_writer import context_code
 from java_io import DataOutput
 
+SURVEYED = -1
 FORMAT_ID = ord('B')
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2   # 2: block maps carry their predictor ids (delta_mapper.write_map)
 
 
 def best_set(channel_sum):
@@ -63,7 +69,8 @@ class BlockCoder:
         self.correction = 0         # preview only
         self.min_set_id = 0
         self.block_size = dm.BLOCK_DEFAULT
-        self.block_set = 0
+        self.block_set = 0          # a named set (dm.BLOCK_SET_NAMES), or SURVEYED
+        self.survey_ids = None      # each channel's surveyed predictor ids (the last analysis)
 
         self.channel_sum = [0] * 6
         self.channel_min = [0] * 6
@@ -96,8 +103,10 @@ class BlockCoder:
 
     def survey(self):
         """Picks the channel set with the smallest entropy estimate, then the
-        block size and predictor set that code smallest (Java: init). Sets
-        and returns (block size, predictor set)."""
+        block size and predictor sets that code smallest: the surveyed sets
+        (dm.survey_block_sets, kept in survey_ids) or a named set
+        (dm.find_best_block) (Java: init). Sets and returns (block size,
+        named set or SURVEYED)."""
         timer = vs.Timer()
         size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
         qc, _, _ = self.quantized_channels(size)
@@ -106,8 +115,21 @@ class BlockCoder:
         best, table = dm.find_best_block([qc[i] for i in ids], size[0], size[1])
         print("Channel set: " + dm.SET_NAMES[set_id])
         print(dm.get_block_table(table, best), end="")
+        named = table[best[1]][dm.BLOCK_SEARCH_SIZES.index(best[0])]
+        print("Named sets took " + timer.elapsed())
+        print()
+        t = vs.Timer()
+        survey = dm.survey_block_sets([qc[i] for i in ids], size[0], size[1])
+        self.survey_ids = survey.ids
+        print(survey.report, end="")
+        print("Survey took " + t.elapsed())
+        use_survey = survey.bytes <= named
+        print("Surveyed sets %s bytes, best named set (%s, block %d) %s bytes: using the %s."
+              % (format(survey.bytes, ","), dm.BLOCK_SET_NAMES[best[1]], best[0], format(named, ","),
+                 "surveyed sets" if use_survey else "named set"))
         print("Analysis took " + timer.elapsed())
         print()
+        best = (survey.block, SURVEYED) if use_survey else best
         self.block_size, self.block_set = best
         return best
 
@@ -123,10 +145,18 @@ class BlockCoder:
         self.min_set_id = best_set(self.channel_sum)
         ids = dm.get_channels(self.min_set_id)
         deltas, maps, decoded = ([None] * 3 for _ in range(3))
+        # Surveyed sets: blocks assigned by estimated coded size, as the
+        # survey does (channels in order). Named sets: by smallest |delta|.
+        surveyed = None
+        if self.block_set == SURVEYED and self.survey_ids is not None:
+            surveyed = dm.get_block_deltas_by_cost([qc[j] for j in ids], w, h, self.block_size, self.survey_ids)
 
         def channel(i):
             j = ids[i]
-            d, m, _ = dm.get_deltas(qc[j], w, h, 13, 0, self.block_size, self.block_set)
+            if surveyed is not None:
+                d, m = surveyed[i]
+            else:
+                d, m, _ = dm.get_deltas(qc[j], w, h, 13, 0, self.block_size, max(0, self.block_set))
             deltas[i], maps[i] = d, m
             ch = dm.get_values_from_deltas(d, w, h, self.channel_init[j], 13, m, 0)
             if j > 2:
@@ -157,7 +187,7 @@ class BlockCoder:
         """Header: FORMAT_ID, FORMAT_VERSION, width, height (unsigned shorts),
         pixel_shift, pixel_quant, channel set. Then per channel: int min, int
         init, the block map (write_map, type 13; it carries the block size and
-        predictor set), then the context-coded deltas. Channels 1 and 2 use
+        the channel's predictor ids), then the context-coded deltas. Channels 1 and 2 use
         the ones before them as context, so the reader decodes in order.
         Returns the file size."""
         timer = vs.Timer()
@@ -178,7 +208,7 @@ class BlockCoder:
         with open(filename, "wb") as f:
             f.write(out.to_bytes())
         raw = self.image_xdim * self.image_ydim * 3
-        print("Block size %d, %s: %d bytes" % (self.block_size, dm.BLOCK_SET_NAMES[self.block_set], out.size()))
+        print("Block size %d, predictors %s: %d bytes" % (self.block_size, ", ".join(dm.describe_map_set(m) for m in self.map_list), out.size()))
         print("Original compression rate: %.4f" % (self.file_length / raw))
         print("Output  compression rate:  %.4f" % (out.size() / raw))
         print()
@@ -245,11 +275,16 @@ class BlockWriter:
         quant.addAction(act)
 
         # Block menu: the settings, and Find Best to rerun the analysis
-        # (worth doing after changing the quantization).
+        # (worth doing after changing the quantization: the surveyed sets are
+        # kept until then). Block Predictors offers the surveyed sets
+        # (available once an analysis has run) and the named sets.
         block_menu = bar.addMenu("Block")
         act, self.block_spinner = vs.make_spinner_dialog(view, "Block Size", dm.BLOCK_MIN, dm.BLOCK_MAX, c.block_size, self._setter("block_size"))
         block_menu.addAction(act)
-        act, self.set_buttons = vs.make_radio_dialog(view, "Block Predictors", dm.BLOCK_SET_NAMES, c.block_set, self._setter("block_set"))
+        set_names = ["Surveyed (per channel)"] + list(dm.BLOCK_SET_NAMES)
+        set_block = self._setter("block_set")
+        act, self.set_buttons = vs.make_radio_dialog(view, "Block Predictors", set_names, c.block_set + 1, lambda v: set_block(v - 1))
+        self.set_buttons[0].setEnabled(False)      # until the first analysis
         block_menu.addAction(act)
         block_menu.addSeparator()
         a = QAction("Find Best", view)
@@ -301,7 +336,8 @@ class BlockWriter:
             else:
                 self.updating = True
                 self.block_spinner.setValue(self.coder.block_size)
-                self.set_buttons[self.coder.block_set].setChecked(True)
+                self.set_buttons[self.coder.block_set + 1].setChecked(True)
+                self.set_buttons[0].setEnabled(self.coder.survey_ids is not None)
                 self.updating = False
             self.view.set_menus_enabled(True)
             self.view.set_status(None)

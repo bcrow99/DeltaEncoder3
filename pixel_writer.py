@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-pixel_writer.py version 1.2 -- PixelWriter.java for Python (PySide6).
+pixel_writer.py version 1.3 -- PixelWriter.java for Python (PySide6).
 
 Codes the red, green and blue channels block by block with context-adaptive
 arithmetic coding (see pixel_mapper.py) and saves (to the file "foo", as the
-Java version does) in Pixel format 'P' version 3: the same file layout as
+Java version does) in Pixel format 'X' version 3: the same file layout as
 PixelWriter.java, so either program's files open in either reader.
 
     python3 pixel_writer.py [image]
@@ -33,7 +33,7 @@ import resize_mapper as rm
 import viewer_support as vs
 from java_io import DataOutput
 
-FORMAT_ID = ord('P')
+FORMAT_ID = ord('X')   # it was 'P' until that turned out to be the Packet format's id too
 FORMAT_VERSION = 3      # 2 added the coding byte, 3 the channels byte
 
 

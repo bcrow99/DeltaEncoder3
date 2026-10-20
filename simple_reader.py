@@ -2,7 +2,7 @@
 """
 simple_reader.py version 1.0 -- SimpleReader.java for Python (PySide6).
 
-Reads Simple format 'S' version 1 files, from simple_writer.py or
+Reads Simple format 'S' version 1 and 2 files, from simple_writer.py or
 SimpleWriter.java, and shows the image.
 
     python3 simple_reader.py file
@@ -25,7 +25,7 @@ import viewer_support as vs
 from java_io import DataInput
 
 FORMAT_ID = ord('S')
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2   # 2: block maps carry their predictor ids; version 1 files are still read
 
 ENTROPY_NAMES = ["LZ77", "Huffman", "Arithmetic", "Adaptive", "Context"]
 
@@ -42,8 +42,8 @@ class SimpleDecoder:
         ident, version = inp.read_unsigned_byte(), inp.read_unsigned_byte()
         if ident != FORMAT_ID:
             raise IOError(self.filename + " is not a Simple Writer file.")
-        if version != FORMAT_VERSION:
-            raise IOError("%s is Simple format version %d; this reader reads version %d." % (self.filename, version, FORMAT_VERSION))
+        if version < 1 or version > FORMAT_VERSION:
+            raise IOError("%s is Simple format version %d; this reader reads versions 1 to %d." % (self.filename, version, FORMAT_VERSION))
         self.xdim = inp.read_unsigned_short()
         self.ydim = inp.read_unsigned_short()
         # There is no compress_type: the Simple writers always write unary strings.
@@ -65,7 +65,7 @@ class SimpleDecoder:
             self.min[i], self.init[i], self.delta_min[i], self.length[i], self.compressed_length[i] = [inp.read_int() for _ in range(5)]
             inp.read_byte()                          # iterations (the string carries them too)
             if dm.has_map(self.delta_type):
-                self.map[i] = dm.read_map(inp, self.delta_type, self.map[i - 1] if i > 0 else None, w)
+                self.map[i] = dm.read_map(inp, self.delta_type, self.map[i - 1] if i > 0 else None, w, version == 1)
             if self.entropy_type != 4:
                 self.table[i] = dm.read_table(inp)
             if self.entropy_type == 0:               # LZ77: payload length, Deflated length, Deflated bytes

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-block_reader.py version 1.0 -- BlockReader.java for Python (PySide6).
+block_reader.py version 1.1 -- BlockReader.java for Python (PySide6).
 
-Reads Block format 'B' version 1 files, from block_writer.py or
+Reads Block format 'B' version 1 and 2 files, from block_writer.py or
 BlockWriter.java: block map deltas (delta type 13), Context coded. See
 block_writer.BlockCoder.save for the layout.
 
@@ -23,7 +23,7 @@ import viewer_support as vs
 from java_io import DataInput
 
 FORMAT_ID = ord('B')
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2   # 2: block maps carry their predictor ids; version 1 files are still read
 
 
 class BlockDecoder:
@@ -38,8 +38,8 @@ class BlockDecoder:
         ident, version = inp.read_unsigned_byte(), inp.read_unsigned_byte()
         if ident != FORMAT_ID:
             raise IOError(self.filename + " is not a Block Writer file.")
-        if version != FORMAT_VERSION:
-            raise IOError("%s is Block format version %d; this reader reads version %d." % (self.filename, version, FORMAT_VERSION))
+        if version < 1 or version > FORMAT_VERSION:
+            raise IOError("%s is Block format version %d; this reader reads versions 1 to %d." % (self.filename, version, FORMAT_VERSION))
         self.xdim = inp.read_unsigned_short()
         self.ydim = inp.read_unsigned_short()
         self.pixel_shift, self.pixel_quant, self.set_id = [inp.read_byte() for _ in range(3)]
@@ -51,11 +51,11 @@ class BlockDecoder:
         for i in range(3):
             self.min[i] = inp.read_int()
             self.init[i] = inp.read_int()
-            self.map[i] = dm.read_map(inp, 13, self.map[i - 1] if i > 0 else None, w)
+            self.map[i] = dm.read_map(inp, 13, self.map[i - 1] if i > 0 else None, w, version == 1)
             self.delta[i] = dm.read_context_deltas(inp, w * h, self.delta[:i], w)
         print("Image:        %d x %d" % (self.xdim, self.ydim))
         print("Channel set:  " + dm.SET_NAMES[self.set_id])
-        print("Block map:    size %d, %s" % (int(self.map[0][0]), dm.BLOCK_SET_NAMES[int(self.map[0][1])]))
+        print("Block map:    size %d; predictors %s" % (int(self.map[0][0]), ", ".join(dm.describe_map_set(m) for m in self.map)))
         print()
 
     def decode(self):

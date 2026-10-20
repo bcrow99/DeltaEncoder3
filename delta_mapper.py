@@ -774,6 +774,77 @@ BLOCK_SETS = [
 _BLOCK_SETS = [np.array(s, dtype=np.int64) for s in BLOCK_SETS]
 BLOCK_SEARCH_SIZES = [4, 6, 8, 12, 16, 24, 32]
 
+# ---- Predictor ids -----------------------------------------------------------
+#
+# Every predictor a block can use has an id, 0..PREDICTORS-1 (one byte):
+#   0..21    the predictors of _block_predictor, in its numbering;
+#   22..252  the average of two of them, (P_i + P_j + 1) / 2 with i > j,
+#            in the order (1,0), (2,0), (2,1), (3,0), (3,1), (3,2), ...
+# A block map is [block size, n, n predictor ids, then one entry per block:
+# an index 0..n-1 into the ids]. Each channel's map carries its own ids.
+# (Format version 1 files had [block size, set number]; read_map reads both.)
+
+PRIMITIVES = 22
+PREDICTORS = PRIMITIVES + PRIMITIVES * (PRIMITIVES - 1) // 2   # 253
+PRIMITIVE_NAMES = [
+    "a", "b", "c", "d", "(a+b)/2", "(b+c)/2", "(a+c)/2", "(b+d)/2",
+    "(c+d)/2", "(a+b+c+d)/4", "a+b-c", "MED", "(3a+b)/4", "(a+3b)/4", "(3a+d)/4", "(3b+a)/4",
+    "(a+d)/2", "a+(b-c)/2", "b+(a-c)/2", "a+d-b", "(a+b+d)/3", "b+(d-c)/2"]
+
+
+def predictor_entry(pid):
+    """The set entry (for _set_predictor) of a predictor id."""
+    if pid < PRIMITIVES:
+        return pid
+    k, i = pid - PRIMITIVES, 1
+    while k >= i:
+        k -= i
+        i += 1
+    return 32 * (i + 1) + k
+
+
+def predictor_id(entry):
+    """The predictor id of a set entry (either order of an average's pair)."""
+    if entry < 32:
+        return entry
+    p, q = entry // 32 - 1, entry % 32
+    if p == q:
+        return p
+    i, j = max(p, q), min(p, q)
+    return PRIMITIVES + i * (i - 1) // 2 + j
+
+
+def predictor_name(pid):
+    e = predictor_entry(pid)
+    if e < 32:
+        return PRIMITIVE_NAMES[e]
+    return "avg(%s, %s)" % (PRIMITIVE_NAMES[e // 32 - 1], PRIMITIVE_NAMES[e % 32])
+
+
+def get_set_ids(block_set):
+    """The predictor ids of a named set (BLOCK_SET_NAMES)."""
+    return [predictor_id(e) for e in BLOCK_SETS[block_set]]
+
+
+def map_header_length(mp):
+    return 2 + int(mp[1])
+
+
+def get_map_ids(mp):
+    return [int(v) for v in mp[2:map_header_length(mp)]]
+
+
+def describe_map_set(mp):
+    ids = get_map_ids(mp)
+    for s, name in enumerate(BLOCK_SET_NAMES):
+        if ids == get_set_ids(s):
+            return name
+    return "%d predictors" % len(ids)
+
+
+def _entries(ids):
+    return np.array([predictor_entry(int(i)) for i in ids], dtype=np.int64)
+
 
 def blocks_across(xdim, block):
     return (xdim - 2 + block - 1) // block
@@ -789,14 +860,17 @@ def _edges(src, dst, xdim, ydim):
 
 
 @njit
-def _block(src, xdim, ydim, block, ids, set_id):
+def _block(src, xdim, ydim, block, ids, set_ids):
     dst = np.zeros(xdim * ydim, dtype=np.int64)
     bw = (xdim - 2 + block - 1) // block
     bh = (ydim - 1 + block - 1) // block
-    mp = np.zeros(2 + bw * bh, dtype=np.uint8)
-    mp[0] = block
-    mp[1] = set_id
     P = ids.shape[0]
+    head = 2 + P
+    mp = np.zeros(head + bw * bh, dtype=np.uint8)
+    mp[0] = block
+    mp[1] = P
+    for p in range(P):
+        mp[2 + p] = set_ids[p]
     _edges(src, dst, xdim, ydim)
     sums = np.zeros(P, dtype=np.int64)
     prim = np.zeros(22, dtype=np.int64)
@@ -819,7 +893,7 @@ def _block(src, xdim, ydim, block, ids, set_id):
             for p in range(1, P):
                 if sums[p] < sums[best]:
                     best = p
-            mp[2 + by * bw + bx] = best
+            mp[head + by * bw + bx] = best
             for y in range(y0, y1):
                 for x in range(x0, x1):
                     k = y * xdim + x
@@ -831,6 +905,7 @@ def _block(src, xdim, ydim, block, ids, set_id):
 def _from_block(delta, xdim, ydim, init, mp, ids):
     block = np.int64(mp[0])
     bw = (xdim - 2 + block - 1) // block
+    head = 2 + np.int64(mp[1])
     dst = np.zeros(xdim * ydim, dtype=np.int64)
     dst[0] = init
     for x in range(1, xdim):
@@ -838,7 +913,7 @@ def _from_block(delta, xdim, ydim, init, mp, ids):
     for y in range(1, ydim):
         k = y * xdim
         dst[k] = dst[k - xdim] + delta[k]
-        row = 2 + (y - 1) // block * bw
+        row = head + (y - 1) // block * bw
         for x in range(1, xdim - 1):
             k += 1
             e = ids[mp[row + (x - 1) // block]]
@@ -852,8 +927,10 @@ def _from_block(delta, xdim, ydim, init, mp, ids):
 # Dispatch
 # =============================================================================
 
-def get_deltas(src, xdim, ydim, delta_type, variant=0, block=BLOCK_DEFAULT, block_set=0):
-    """(deltas, map or None, init value) for delta_type 0-13."""
+def get_deltas(src, xdim, ydim, delta_type, variant=0, block=BLOCK_DEFAULT, block_set=0, set_ids=None):
+    """(deltas, map or None, init value) for delta_type 0-13. For the block
+    map (13) the predictors are the named set block_set, or the predictor
+    ids set_ids if given."""
     src = np.asarray(src, dtype=np.int64)
     init = int(src[0])
     t = delta_type
@@ -868,7 +945,9 @@ def get_deltas(src, xdim, ydim, delta_type, variant=0, block=BLOCK_DEFAULT, bloc
     elif t == 10: d, m = _scanline45(src, xdim, ydim, 8, variant)
     elif t == 11: d, m = _frame(src, xdim, ydim, 8)
     elif t == 12: d, m = _frame(src, xdim, ydim, 16)
-    elif t == 13: d, m = _block(src, xdim, ydim, block, _BLOCK_SETS[block_set], block_set)
+    elif t == 13:
+        ids = get_set_ids(block_set) if set_ids is None else [int(i) for i in set_ids]
+        d, m = _block(src, xdim, ydim, block, _entries(ids), np.array(ids, dtype=np.int64))
     else: raise ValueError("delta_type %d" % t)
     return d, m, init
 
@@ -888,7 +967,7 @@ def get_values_from_deltas(delta, xdim, ydim, init, delta_type, mp=None, variant
     if t == 10: return _from_scanline45(delta, xdim, ydim, init, mp, 8, variant)
     if t == 11: return _from_frame(delta, xdim, ydim, init, mp, 8)
     if t == 12: return _from_frame(delta, xdim, ydim, init, mp, 16)
-    if t == 13: return _from_block(delta, xdim, ydim, init, mp, _BLOCK_SETS[int(mp[1])])
+    if t == 13: return _from_block(delta, xdim, ydim, init, mp, _entries(get_map_ids(mp)))
     raise ValueError("delta_type %d" % t)
 
 
@@ -980,10 +1059,15 @@ def _map_to_arithmetic(m):
     return out.to_bytes()
 
 
+CONTEXT_MAP_MAX = 32   # the context form sets up K^3 x 3 contexts of K counts, so only small sets use it
+
+
 def _map_to_context(m, previous, width):
     K = max(1, int(m.max()) + 1 if len(m) else 1)
     if previous is not None and len(previous):
         K = max(K, int(np.max(previous)) + 1)
+    if K > CONTEXT_MAP_MAX:
+        return None
     prev, has = _prev_array(previous, len(m))
     ctx = _map_contexts(m, prev, has, width, K)
     coded = am.get_interval_value_context(m.astype(np.int64), K, ctx, K * K * K * 3)
@@ -992,12 +1076,87 @@ def _map_to_context(m, previous, width):
     return out.to_bytes()
 
 
+NEIGHBOUR_CONTEXTS = 32
+
+
+@njit
+def _neighbour(v, previous, has_previous, k, width, which):
+    x = k % width
+    if which == 0:
+        return np.int64(v[k - 1]) if x > 0 else -1
+    if which == 1:
+        return np.int64(v[k - width]) if k >= width else -1
+    if which == 2:
+        return np.int64(previous[k]) if has_previous else -1
+    return np.int64(v[k - width - 1]) if (x > 0 and k >= width) else -1
+
+
+@njit
+def _neighbour_context(v, previous, has_previous, k, width):
+    L = _neighbour(v, previous, has_previous, k, width, 0)
+    U = _neighbour(v, previous, has_previous, k, width, 1)
+    V = _neighbour(v, previous, has_previous, k, width, 2)
+    D = _neighbour(v, previous, has_previous, k, width, 3)
+    c = 0
+    if L >= 0 and L == U: c |= 1
+    if V >= 0 and V == L: c |= 2
+    if V >= 0 and V == U: c |= 4
+    if D >= 0 and D == L: c |= 8
+    if D >= 0 and D == U: c |= 16
+    return c
+
+
+@njit
+def _neighbour_tokens(v, previous, has_previous, width):
+    n = v.shape[0]
+    token = np.zeros(n, dtype=np.int64)
+    ctx = np.zeros(n, dtype=np.int64)
+    for k in range(n):
+        s = v[k]
+        L = _neighbour(v, previous, has_previous, k, width, 0)
+        U = _neighbour(v, previous, has_previous, k, width, 1)
+        V = _neighbour(v, previous, has_previous, k, width, 2)
+        if L >= 0 and s == L: token[k] = 0
+        elif U >= 0 and s == U: token[k] = 1
+        elif V >= 0 and s == V: token[k] = 2
+        else: token[k] = 3 + s
+        ctx[k] = _neighbour_context(v, previous, has_previous, k, width)
+    return token, ctx
+
+
+@njit
+def _decode_map_neighbours(data, n, K, previous, has_previous, width, top):
+    f, bit, total, dt = am.context_decoder_init(data, NEIGHBOUR_CONTEXTS, K + 3)
+    v = np.zeros(n, dtype=np.int64)
+    for k in range(n):
+        c = _neighbour_context(v, previous, has_previous, k, width)
+        t = am.context_decode_one(data, dt, f, bit, total, c, K + 3, top)
+        v[k] = _neighbour(v, previous, has_previous, k, width, t) if t < 3 else t - 3
+    return v.astype(np.uint8)
+
+
+def _map_to_neighbours(m, previous, width):
+    """Form 3: each entry as "same as left" (0), "same as above" (1), "same
+    as the previous channel's map" (2), or 3 + its value; context: which of
+    those neighbours and the upper-left one agree (32 contexts). Any number
+    of values works, so it suits large predictor sets."""
+    v = m.astype(np.int64)
+    K = max(1, int(v.max()) + 1 if len(v) else 1)
+    prev, has = _prev_array(previous, len(m))
+    token, ctx = _neighbour_tokens(v, prev, has, width)
+    coded = am.get_interval_value_context(token, K + 3, ctx, NEIGHBOUR_CONTEXTS)
+    out = DataOutput()
+    out.write_int(len(m)); out.write_short(K); out.write_int(len(coded)); out.write(coded.tobytes())
+    return out.to_bytes()
+
+
 def write_map(out, delta_type, mp, previous, xdim):
     """A delta-type map. Types 6-8 (values 0-3): int length, int packed
     length, 4 values per byte, low bits first. Types 9-13: a flag byte and
     the smallest of three forms -- 0 unary string, 1 arithmetic, 2 context
-    coded (contexts use the previous channel's map). A block map (13) starts
-    with its block size and predictor set bytes."""
+    coded (contexts use the previous channel's map), 3 neighbour coded (format
+    version 2; see _map_to_neighbours). A block map (13) starts
+    with its block size, the number of predictors n and their n ids."""
     mp = np.asarray(mp, dtype=np.uint8)
     if delta_type <= 8:
         packed = np.zeros((len(mp) + 3) // 4, dtype=np.uint8)
@@ -1008,12 +1167,15 @@ def write_map(out, delta_type, mp, previous, xdim):
         return
     width = _map_width(delta_type, xdim)
     if delta_type == 13:
-        out.write_byte(mp[0]); out.write_byte(mp[1])
+        head = map_header_length(mp)
+        out.write(mp[:head].tobytes())
         width = blocks_across(xdim, int(mp[0]))
-        mp = mp[2:]
-        previous = None if previous is None else np.asarray(previous, dtype=np.uint8)[2:]
-    forms = [_map_to_string(mp), _map_to_arithmetic(mp), _map_to_context(mp, previous, width)]
-    best = min(range(3), key=lambda f: (len(forms[f]), f))
+        mp = mp[head:]
+        if previous is not None:
+            previous = np.asarray(previous, dtype=np.uint8)
+            previous = previous[map_header_length(previous):]
+    forms = [_map_to_string(mp), _map_to_arithmetic(mp), _map_to_context(mp, previous, width), _map_to_neighbours(mp, previous, width)]
+    best = min((f for f in range(4) if forms[f] is not None), key=lambda f: (len(forms[f]), f))
     out.write_byte(best)
     out.write(forms[best])
 
@@ -1027,6 +1189,11 @@ def map_bytes(delta_type, mp, previous, xdim):
 def _read_map_forms(inp, previous, width):
     coding = inp.read_byte()
     n = inp.read_int()
+    if coding == 3:
+        K = inp.read_short()
+        coded = np.frombuffer(inp.read_fully(inp.read_int()), dtype=np.uint8)
+        prev, has = _prev_array(previous, n)
+        return _decode_map_neighbours(coded, n, K, prev, has, width, am._highest_one_bit(K + 3))
     if coding == 2:
         K = inp.read_unsigned_byte()
         coded = np.frombuffer(inp.read_fully(inp.read_int()), dtype=np.uint8)
@@ -1055,7 +1222,9 @@ def _read_map_forms(inp, previous, width):
     return mp
 
 
-def read_map(inp, delta_type, previous, xdim):
+def read_map(inp, delta_type, previous, xdim, version1=False):
+    """With version1, a block map is in the format version 1 layout, [block
+    size, set number], and is returned in the current one."""
     if delta_type <= 8:
         n = inp.read_int()
         packed = np.frombuffer(inp.read_fully(inp.read_int()), dtype=np.uint8)
@@ -1063,12 +1232,28 @@ def read_map(inp, delta_type, previous, xdim):
         return ((packed[q >> 2] >> ((q & 3) << 1)) & 3).astype(np.uint8)
     if delta_type == 13:
         block = inp.read_byte()
-        set_id = inp.read_byte()
-        if not (0 <= set_id < len(BLOCK_SET_NAMES)) or not (BLOCK_MIN <= block <= BLOCK_MAX):
-            raise IOError("Block map with predictor set %d and block size %d: not one this version reads." % (set_id, block))
-        prev = None if previous is None else np.asarray(previous, dtype=np.uint8)[2:]
+        if version1:
+            set_id = inp.read_byte()
+            if not (0 <= set_id < len(BLOCK_SET_NAMES)):
+                raise IOError("Block map with predictor set %d: not one this version reads." % set_id)
+            ids = get_set_ids(set_id)
+        else:
+            n = inp.read_unsigned_byte()
+            if not (1 <= n <= PREDICTORS):
+                raise IOError("Block map with %d predictors: not one this version reads." % n)
+            ids = [inp.read_unsigned_byte() for _ in range(n)]
+            if max(ids) >= PREDICTORS:
+                raise IOError("Block map with predictor id %d: not one this version reads." % max(ids))
+        if not (BLOCK_MIN <= block <= BLOCK_MAX):
+            raise IOError("Block map with block size %d: not one this version reads." % block)
+        prev = None
+        if previous is not None:
+            prev = np.asarray(previous, dtype=np.uint8)
+            prev = prev[map_header_length(prev):]
         body = _read_map_forms(inp, prev, blocks_across(xdim, block))
-        return np.concatenate([np.array([block, set_id], dtype=np.uint8), body])
+        if len(body) and int(body.max()) >= len(ids):
+            raise IOError("Block map entry %d with %d predictors." % (int(body.max()), len(ids)))
+        return np.concatenate([np.array([block, len(ids)] + ids, dtype=np.uint8), body])
     return _read_map_forms(inp, previous, _map_width(delta_type, xdim))
 
 
@@ -1207,6 +1392,294 @@ def find_best_block(channel, xdim, ydim, workers=None):
         if 0 <= table[best_set][i] < table[best_set][best_i]:
             best_i = i
     return (BLOCK_SEARCH_SIZES[best_i], best_set), table
+
+
+# ---- Surveying predictor sets (DeltaMapper.surveyBlockSets) -------------------
+#
+# Predictors are ranked by an estimate of their coded size: a cost per delta
+# value per coding context, from the deltas of a reference set (Blends 32);
+# each predictor's estimated bits per block; a greedy order that charges for
+# the map (entropy of the block counts plus a byte per id); real coded sizes
+# at SURVEY_COUNTS; blocks assigned by the estimate. See DeltaMapper.java.
+# Costs are integers (1/256 bits) so the result matches Java exactly.
+
+SURVEY_COUNTS = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64, 80, 96, 128, 160, 192, 253]
+SURVEY_REFERENCE_SET = 4            # Blends 32
+SURVEY_ID_COST = 8 * 256            # a predictor id in the map header, 1/256 bits
+_LOG2 = math.log(2)
+
+
+def _cost256(r):
+    return int(math.floor(256 * math.log(r) / _LOG2 + 0.5))
+
+
+@njit
+def _cost_counts(ref, previous, xdim, ydim, lo, rng, act_limit, cross_limit, n_ctx):
+    ctx = np.zeros(xdim * ydim, dtype=np.int64)
+    count = np.zeros((n_ctx, rng), dtype=np.int64)
+    total = np.zeros(n_ctx, dtype=np.int64)
+    for y in range(1, ydim):
+        for x in range(1, xdim - 1):
+            k = y * xdim + x
+            c = _delta_context(ref, previous, k, xdim, act_limit, cross_limit)
+            ctx[k] = c
+            v = min(rng - 1, max(0, ref[k] - lo))
+            count[c, v] += 1
+            total[c] += 1
+    return ctx, count, total
+
+
+class DeltaCost:
+    """Estimated cost (1/256 bits) of each delta value in each coding
+    context, from the reference deltas ref (DeltaMapper.DeltaCost)."""
+
+    def __init__(self, src, ref, previous, xdim, ydim):
+        src = np.asarray(src, dtype=np.int64)
+        span = int(src.max()) - int(src.min())
+        self.lo = -2 * span - 2
+        self.range = 4 * span + 5
+        self.context, count, total = _cost_counts(np.asarray(ref, dtype=np.int64), _previous_2d(previous, len(src)),
+                                                  xdim, ydim, self.lo, self.range, ACTIVITY_LIMIT, CROSS_LIMIT, CONTEXTS)
+        cost = np.zeros((CONTEXTS, self.range), dtype=np.int64)
+        cache = {}
+        for c in range(CONTEXTS):
+            t = 32.0 * int(total[c]) + self.range
+            row = count[c].tolist()
+            for v in range(self.range):
+                key = (t, row[v])
+                if key not in cache:
+                    cache[key] = _cost256(t / (32.0 * row[v] + 1))
+                cost[c, v] = cache[key]
+        self.cost = cost
+
+
+@njit
+def _block_cost_table(src, xdim, ydim, block, cost, ctx, lo, rng, entry):
+    n = entry.shape[0]
+    bw = (xdim - 2 + block - 1) // block
+    bh = (ydim - 1 + block - 1) // block
+    est = np.zeros(bw * bh * n, dtype=np.int64)
+    prim = np.zeros(PRIMITIVES, dtype=np.int64)
+    for by in range(bh):
+        y0 = 1 + by * block
+        y1 = min(ydim, y0 + block)
+        for y in range(y0, y1):
+            for x in range(1, xdim - 1):
+                k = y * xdim + x
+                s = src[k]
+                c = ctx[k]
+                for q in range(PRIMITIVES):
+                    prim[q] = _block_predictor(q, src[k - 1], src[k - xdim], src[k - xdim - 1], src[k - xdim + 1])
+                base = (by * bw + (x - 1) // block) * n
+                for q in range(n):
+                    e = entry[q]
+                    v = prim[e] if e < 32 else (prim[e // 32 - 1] + prim[e % 32] + 1) >> 1
+                    est[base + q] += cost[c, min(rng - 1, max(0, s - v - lo))]
+    return est
+
+
+def block_cost_table(src, xdim, ydim, block, dc, ids=None):
+    """Estimated bits (1/256) of each predictor in each block, as
+    [block * n + q] for the ids given, or for every id (ids None)."""
+    ids = list(range(PREDICTORS)) if ids is None else ids
+    return _block_cost_table(np.asarray(src, dtype=np.int64), xdim, ydim, block, dc.cost, dc.context,
+                             dc.lo, dc.range, _entries(ids))
+
+
+def _nlog2n_table(n):
+    t = np.zeros(n + 1, dtype=np.int64)
+    for c in range(2, n + 1):
+        t[c] = int(math.floor(256.0 * c * math.log(c) / _LOG2 + 0.5))
+    return t
+
+
+@njit
+def _greedy_cost_gains(est, blocks, cur, assign, count, chosen, n, NL, map_old, id_cost):
+    P = chosen.shape[0]
+    gain = np.zeros(P, dtype=np.int64)
+    moved_from = np.zeros(n, dtype=np.int64)
+    for p in range(P):
+        if chosen[p]:
+            continue
+        moved_from[:] = 0
+        save = 0
+        moved = 0
+        for b in range(blocks):
+            e = est[b * P + p]
+            if e < cur[b]:
+                save += cur[b] - e
+                moved_from[assign[b]] += 1
+                moved += 1
+        map_new = NL[blocks] - NL[moved]
+        for q in range(n):
+            map_new -= NL[count[q] - moved_from[q]]
+        gain[p] = save - (map_new - map_old) - id_cost
+    return gain
+
+
+def greedy_cost_order(est, blocks):
+    """Predictor ids in greedy order over a block_cost_table of every id
+    (DeltaMapper.greedyCostOrder)."""
+    P = PREDICTORS
+    NL = _nlog2n_table(blocks)
+    table = est.reshape(blocks, P)
+    total = table.sum(axis=0)
+    first = int(np.argmin(total))
+    order = [first]
+    chosen = np.zeros(P, dtype=np.bool_)
+    chosen[first] = True
+    cur = table[:, first].copy()
+    assign = np.zeros(blocks, dtype=np.int64)
+    count = np.zeros(P, dtype=np.int64)
+    count[0] = blocks
+    while len(order) < P:
+        n = len(order)
+        map_old = int(NL[blocks]) - int(NL[count[:n]].sum())
+        gain = _greedy_cost_gains(est, blocks, cur, assign, count, chosen, n, NL, map_old, SURVEY_ID_COST)
+        best = -1
+        for p in range(P):
+            if not chosen[p] and (best < 0 or gain[p] > gain[best]):
+                best = p
+        if gain[best] <= 0:
+            break
+        chosen[best] = True
+        order.append(best)
+        col = table[:, best]
+        better = col < cur
+        np.subtract.at(count, assign[better], 1)
+        count[n] += int(better.sum())
+        assign[better] = n
+        cur = np.where(better, col, cur)
+    return order
+
+
+def _assign_by_cost(est, stride, cols, ids, xdim, ydim, block):
+    """A block map for ids: each block uses the first of them with the
+    smallest estimate (cols: each id's column in est)."""
+    bw = blocks_across(xdim, block)
+    bh = (ydim - 1 + block - 1) // block
+    n = len(ids)
+    sub = est.reshape(bw * bh, stride)[:, cols]
+    choice = np.argmin(sub, axis=1)          # first minimum
+    mp = np.zeros(2 + n + bw * bh, dtype=np.uint8)
+    mp[0] = block
+    mp[1] = n
+    mp[2:2 + n] = ids
+    mp[2 + n:] = choice
+    return mp
+
+
+@njit
+def _block_from_map(src, xdim, ydim, mp, entry):
+    block = np.int64(mp[0])
+    bw = (xdim - 2 + block - 1) // block
+    head = 2 + np.int64(mp[1])
+    dst = np.zeros(xdim * ydim, dtype=np.int64)
+    _edges(src, dst, xdim, ydim)
+    for y in range(1, ydim):
+        row = head + (y - 1) // block * bw
+        for x in range(1, xdim - 1):
+            k = y * xdim + x
+            dst[k] = src[k] - _set_predictor(entry[mp[row + (x - 1) // block]], src[k - 1], src[k - xdim], src[k - xdim - 1], src[k - xdim + 1])
+    return dst
+
+
+def get_block_deltas_from_map(src, xdim, ydim, mp):
+    """The block deltas for a given block map (DeltaMapper.getBlockDeltasFromMap)."""
+    mp = np.asarray(mp, dtype=np.uint8)
+    return _block_from_map(np.asarray(src, dtype=np.int64), xdim, ydim, mp, _entries(get_map_ids(mp)))
+
+
+def _channel_cost(src, xdim, ydim, block, chosen_before):
+    ref, _, _ = get_deltas(src, xdim, ydim, 13, 0, block, SURVEY_REFERENCE_SET)
+    return DeltaCost(src, ref, chosen_before, xdim, ydim)
+
+
+def get_block_deltas_by_cost(channel, xdim, ydim, block, ids):
+    """Each channel's (deltas, map) for its predictor ids, blocks assigned
+    by estimated cost as the survey does (DeltaMapper.getBlockDeltasByCost)."""
+    result, delta = [], []
+    for i, c in enumerate(channel):
+        dc = _channel_cost(c, xdim, ydim, block, delta[:i])
+        est = block_cost_table(c, xdim, ydim, block, dc, ids[i])
+        mp = _assign_by_cost(est, len(ids[i]), np.arange(len(ids[i])), ids[i], xdim, ydim, block)
+        d = get_block_deltas_from_map(c, xdim, ydim, mp)
+        result.append((d, mp))
+        delta.append(d)
+    return result
+
+
+class BlockSurvey:
+    def __init__(self, block):
+        self.block = block
+        self.ids = [None] * 3
+        self.bytes = 0
+        self.report = ""
+
+
+def _survey_block_size(channel, xdim, ydim, block, log):
+    result = BlockSurvey(block)
+    delta, mp = [None] * 3, [None] * 3
+    blocks = blocks_across(xdim, block) * ((ydim - 1 + block - 1) // block)
+    log.append("  block %d:" % block)
+    for i in range(3):
+        dc = _channel_cost(channel[i], xdim, ydim, block, delta[:i])
+        est = block_cost_table(channel[i], xdim, ydim, block, dc)
+        order = greedy_cost_order(est, blocks)
+        counts = [c for c in SURVEY_COUNTS if c < len(order)] + [len(order)]
+        best_bytes, worse = None, 0
+        line = "    channel %d (order %d):" % (i, len(order))
+        for n in counts:
+            ids = order[:n]
+            m = _assign_by_cost(est, PREDICTORS, np.array(ids, dtype=np.int64), ids, xdim, ydim, block)
+            d = get_block_deltas_from_map(channel[i], xdim, ydim, m)
+            size = map_bytes(13, m, mp[i - 1] if i > 0 else None, xdim) + len(pack_context_deltas(d, delta[:i], xdim))
+            line += " %d:%s" % (n, format(size, ","))
+            if best_bytes is None or size < best_bytes:
+                best_bytes, result.ids[i], delta[i], mp[i], worse = size, list(ids), d, m, 0
+                line += "*"
+            else:
+                worse += 1
+                if worse == 2:
+                    break
+        result.bytes += best_bytes
+        log.append(line)
+    return result
+
+
+def survey_block_sets(channel, xdim, ydim):
+    """The block size and each channel's predictor ids that code smallest
+    (DeltaMapper.surveyBlockSets): per channel, predictors in greedy order
+    by estimated coded bits (with the map's cost), with the real coded size
+    measured for the first n at SURVEY_COUNTS until two in a row are larger
+    than the best; block sizes 4, 8, 16, then the untried sizes next to the
+    best."""
+    tried, log = {}, []
+    for b in (4, 8, 16):
+        tried[b] = _survey_block_size(channel, xdim, ydim, b, log)
+
+    def best_of():
+        best = None
+        for b in sorted(tried):
+            if best is None or tried[b].bytes < tried[best].bytes:
+                best = b
+        return best
+    s = BLOCK_SEARCH_SIZES.index(best_of())
+    for t in (s - 1, s + 1):
+        if 0 <= t < len(BLOCK_SEARCH_SIZES) and BLOCK_SEARCH_SIZES[t] not in tried:
+            tried[BLOCK_SEARCH_SIZES[t]] = _survey_block_size(channel, xdim, ydim, BLOCK_SEARCH_SIZES[t], log)
+    result = tried[best_of()]
+    r = ["Predictor survey: bytes coded (Context-coded deltas + maps) for the first n predictors",
+         "in each channel's greedy order (by estimated bits); * marks the n kept for the channel."] + log
+    r.append("Block size:" + "".join("  %d -> %s" % (b, format(tried[b].bytes, ",")) for b in sorted(tried))
+             + "   chose %d (%s bytes)" % (result.block, format(result.bytes, ",")))
+    for i in range(3):
+        names = [predictor_name(p) for p in result.ids[i]]
+        r.append("Channel %d, %d predictors:" % (i, len(names)))
+        for k in range(0, len(names), 6):
+            r.append("    " + ", ".join(names[k:k + 6]))
+    result.report = "\n".join(r) + "\n"
+    return result
 
 
 def get_block_table(table, best):

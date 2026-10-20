@@ -33,7 +33,7 @@ from delta_writer import context_code, entropy_code
 from java_io import DataOutput
 
 FORMAT_ID = ord('S')
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2   # 2: block maps carry their predictor ids (delta_mapper.write_map)
 
 ENTROPY_NAMES = ["LZ77", "Huffman", "Arithmetic", "Adaptive", "Context"]
 DELTA_MENU_NAMES = ["H", "V", "Average", "Med", "Directional", "Adaptive", "Scanline 1", "Scanline 2",
