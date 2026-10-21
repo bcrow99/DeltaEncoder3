@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-delta_writer2.py version 2.0 -- DeltaWriter2.java for Python (PySide6).
+delta_writer2.py version 2.1 -- DeltaWriter2.java for Python (PySide6).
 
 A streamlined Delta Writer. Its files are read by delta_reader.py (and
 DeltaReader.java): the header and per-channel layout are the same, with
@@ -40,6 +40,7 @@ from java_io import DataOutput
 
 FORMAT_ID = ord('D')
 FORMAT_VERSION = 3   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps
+SURVEYED = -1   # block_set: the surveyed sets (survey_ids)
 
 # compress_type written to the header: String* (strings that don't compress
 # enough come back uncompressed from get_string_list). DeltaReader treats it like 2.
@@ -146,6 +147,7 @@ class DeltaCoder2:
         self.scanline5_variant = 0
         self.block_size = dm.BLOCK_DEFAULT
         self.block_set = 0
+        self.survey_ids = None      # each channel's surveyed predictor ids (the last block search)
 
         self.channel_sum = [0] * 6
         self.set_sum = [0] * 10
@@ -205,7 +207,7 @@ class DeltaCoder2:
         def channel(i):
             for t in range(N):
                 type_ = FIRST_DELTA_TYPE + t
-                d, m, _ = dm.get_deltas(qc[ids[i]], w, h, type_, self.scanline5_variant, self.block_size, self.block_set, ref=qc[ids[i - 1]] if i > 0 else None)
+                d, m, _ = dm.get_deltas(qc[ids[i]], w, h, type_, self.scanline5_variant, self.block_size, max(0, self.block_set), ref=qc[ids[i - 1]] if i > 0 else None)
                 m = np.asarray(m, dtype=np.uint8)
                 delta_bytes = pack_and_compress(d)
                 delta_bits[i][t] = sm.get_bitlength(delta_bytes)
@@ -260,9 +262,25 @@ class DeltaCoder2:
             size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
             qc = self.quantized_channels(size)
             ids = dm.get_channels(self.min_set_id)
-        best, table = dm.find_best_block([qc[i] for i in ids], size[0], size[1])
+        ch = [qc[i] for i in ids]
+        best, table = dm.find_best_block(ch, size[0], size[1])
         self.block_size, self.block_set = best
         print(dm.get_block_table(table, best), end="")
+        named = table[best[1]][dm.BLOCK_SEARCH_SIZES.index(best[0])]
+        # Then BlockWriter's survey: each channel's own set from all the
+        # predictors, blocks assigned by estimated coded size; kept if it
+        # codes smaller (Context-coded sizes; with another entropy type only a guide).
+        t = vs.Timer()
+        survey = dm.survey_block_sets(ch, size[0], size[1])
+        self.survey_ids = survey.ids
+        print(survey.report, end="")
+        print("Survey took " + t.elapsed())
+        use_survey = survey.bytes <= named
+        print("Surveyed sets %s bytes, best named set (%s, block %d) %s bytes: using the %s."
+              % (format(survey.bytes, ","), dm.BLOCK_SET_NAMES[best[1]], best[0], format(named, ","),
+                 "surveyed sets" if use_survey else "named set"))
+        if use_survey:
+            self.block_size, self.block_set = survey.block, SURVEYED
         print("Block search took " + timer.elapsed())
         print()
 
@@ -332,10 +350,15 @@ class DeltaCoder2:
         table, string, maps, deltas, decoded = ([None] * 3 for _ in range(5))
 
         raw = [None] * 3   # decoded, before the minimum: the next channel's reference
+        # Surveyed sets: blocks assigned by estimated coded size, as the
+        # survey does (channels in order); named sets by smallest |delta|.
+        surveyed = None
+        if self.delta_type == 13 and self.block_set == SURVEYED and self.survey_ids is not None:
+            surveyed = dm.get_block_deltas_by_cost([qc[j] for j in ids], w, h, self.block_size, self.survey_ids)
 
         def channel(i):
             j = ids[i]
-            d, m, _ = dm.get_deltas(qc[j], w, h, self.delta_type, self.scanline5_variant, self.block_size, self.block_set, ref=qc[ids[i - 1]] if i > 0 else None)
+            d, m = surveyed[i] if surveyed is not None else dm.get_deltas(qc[j], w, h, self.delta_type, self.scanline5_variant, self.block_size, max(0, self.block_set), ref=qc[ids[i - 1]] if i > 0 else None)[:2]
             maps[i] = m
             deltas[i] = d
             lo, bits, tbl, s = sm.get_string_list(d, True)
@@ -489,7 +512,9 @@ class DeltaWriter2:
         delta_menu.addSeparator()
         act, self.block_spinner = vs.make_spinner_dialog(view, "Block Size", dm.BLOCK_MIN, dm.BLOCK_MAX, c.block_size, self.set_block_size)
         delta_menu.addAction(act)
-        act, self.block_buttons = vs.make_radio_dialog(view, "Block Predictors", dm.BLOCK_SET_NAMES, c.block_set, self.set_block_set)
+        act, self.block_buttons = vs.make_radio_dialog(view, "Block Predictors", ["Surveyed (per channel)"] + list(dm.BLOCK_SET_NAMES),
+                                                     c.block_set + 1, lambda v: self.set_block_set(v - 1))
+        self.block_buttons[0].setEnabled(False)    # until a block search has run
         delta_menu.addAction(act)
         a = QAction("Find Best Block Settings", view)
         a.triggered.connect(self.find_block_settings)
@@ -547,7 +572,8 @@ class DeltaWriter2:
         c = self.coder
         self.delta_actions[c.delta_type - FIRST_DELTA_TYPE].setChecked(True)
         self.block_spinner.setValue(c.block_size)
-        self.block_buttons[c.block_set].setChecked(True)
+        self.block_buttons[0].setEnabled(c.survey_ids is not None)
+        self.block_buttons[c.block_set + 1].setChecked(True)
         for key, slider in self.sliders.items():
             slider.setValue(getattr(c, key))
         self.updating = False
