@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-block_reader.py version 1.1 -- BlockReader.java for Python (PySide6).
+block_reader.py version 2.0 -- BlockReader.java for Python (PySide6).
 
-Reads Block format 'B' version 1 and 2 files, from block_writer.py or
+Reads Block format 'B' version 3 files, from block_writer.py or
 BlockWriter.java: block map deltas (delta type 13), Context coded. See
 block_writer.BlockCoder.save for the layout.
 
@@ -23,7 +23,7 @@ import viewer_support as vs
 from java_io import DataInput
 
 FORMAT_ID = ord('B')
-FORMAT_VERSION = 2   # 2: block maps carry their predictor ids; version 1 files are still read
+FORMAT_VERSION = 3   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; older files are not read
 
 
 class BlockDecoder:
@@ -38,8 +38,8 @@ class BlockDecoder:
         ident, version = inp.read_unsigned_byte(), inp.read_unsigned_byte()
         if ident != FORMAT_ID:
             raise IOError(self.filename + " is not a Block Writer file.")
-        if version < 1 or version > FORMAT_VERSION:
-            raise IOError("%s is Block format version %d; this reader reads versions 1 to %d." % (self.filename, version, FORMAT_VERSION))
+        if version != FORMAT_VERSION:
+            raise IOError("%s is Block format version %d; this reader reads version %d only (the block predictors changed in it)." % (self.filename, version, FORMAT_VERSION))
         self.xdim = inp.read_unsigned_short()
         self.ydim = inp.read_unsigned_short()
         self.pixel_shift, self.pixel_quant, self.set_id = [inp.read_byte() for _ in range(3)]
@@ -51,7 +51,7 @@ class BlockDecoder:
         for i in range(3):
             self.min[i] = inp.read_int()
             self.init[i] = inp.read_int()
-            self.map[i] = dm.read_map(inp, 13, self.map[i - 1] if i > 0 else None, w, version == 1)
+            self.map[i] = dm.read_map(inp, 13, self.map[i - 1] if i > 0 else None, w)
             self.delta[i] = dm.read_context_deltas(inp, w * h, self.delta[:i], w)
         print("Image:        %d x %d" % (self.xdim, self.ydim))
         print("Channel set:  " + dm.SET_NAMES[self.set_id])
@@ -65,12 +65,12 @@ class BlockDecoder:
         ids = dm.get_channels(self.set_id)
         channel = [None] * 3
 
-        def one(i):
-            ch = dm.get_values_from_deltas(self.delta[i], w, h, self.init[i], 13, self.map[i], 0)
-            if ids[i] > 2:
-                ch = ch + self.min[i]
-            channel[i] = ch
-        vs.parallel(3, one)
+        raw = [None] * 3
+        # In order: each channel's predictors may use the one before it.
+        for i in range(3):
+            raw[i] = dm.get_values_from_deltas(self.delta[i], w, h, self.init[i], 13, self.map[i], 0,
+                                               ref=raw[i - 1] if i > 0 else None)
+            channel[i] = raw[i] + self.min[i] if ids[i] > 2 else raw[i]
         bgr = dm.get_blue_green_red(self.set_id, *channel)
         if self.pixel_quant != 0:
             def resize(c):

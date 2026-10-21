@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-packet_reader.py version 1.0 -- PacketReader.java for Python (PySide6).
+packet_reader.py version 2.0 -- PacketReader.java for Python (PySide6).
 
-Reads Packet format 'P' version 1 and 2 files, from packet_writer.py or
+Reads Packet format 'P' version 3 files, from packet_writer.py or
 PacketWriter.java, and shows the image.
 
     python3 packet_reader.py file
@@ -28,7 +28,7 @@ from java_io import DataInput
 from packet_writer import read_segment_table
 
 FORMAT_ID = ord('P')
-FORMAT_VERSION = 2   # 2: block maps carry their predictor ids; version 1 files are still read
+FORMAT_VERSION = 3   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; older files are not read
 
 ENTROPY_NAMES = ["LZ77", "Huffman", "Arithmetic", "Arithmetic (per packet)", "Huffman (per packet)",
                  "Adaptive", "Adaptive (per packet)", "Context"]
@@ -51,8 +51,8 @@ class PacketDecoder:
         ident, version = inp.read_unsigned_byte(), inp.read_unsigned_byte()
         if ident != FORMAT_ID:
             raise IOError(self.filename + " is not a Packet Writer file.")
-        if version < 1 or version > FORMAT_VERSION:
-            raise IOError("%s is Packet format version %d; this reader reads versions 1 to %d." % (self.filename, version, FORMAT_VERSION))
+        if version != FORMAT_VERSION:
+            raise IOError("%s is Packet format version %d; this reader reads version %d only (the block predictors changed in it)." % (self.filename, version, FORMAT_VERSION))
         self.xdim = inp.read_unsigned_short()
         self.ydim = inp.read_unsigned_short()
         # There is no compress_type: the Packet writers always write unary
@@ -78,7 +78,7 @@ class PacketDecoder:
         for i in range(3):
             self.min[i], self.init[i], self.delta_min[i], self.length[i] = [inp.read_int() for _ in range(4)]
             if dm.has_map(self.delta_type):
-                self.map[i] = dm.read_map(inp, self.delta_type, self.map[i - 1] if i > 0 else None, w, version == 1)
+                self.map[i] = dm.read_map(inp, self.delta_type, self.map[i - 1] if i > 0 else None, w)
             if t == 7:                                   # Context: decoded here, in channel order
                 self.delta[i] = dm.read_context_deltas(inp, w * h, self.delta[:i], w)
                 continue
@@ -164,7 +164,9 @@ class PacketDecoder:
 
     def _to_channel(self, i, delta):
         w, h = self.size
-        channel = dm.get_values_from_deltas(delta, w, h, self.init[i], self.delta_type, self.map[i], self.scanline5_variant)
+        channel = dm.get_values_from_deltas(delta, w, h, self.init[i], self.delta_type, self.map[i], self.scanline5_variant,
+                                            ref=self.raw[i - 1] if i > 0 else None)
+        self.raw[i] = channel   # as decoded: the next channel's reference (block map)
         if dm.get_channels(self.set_id)[i] > 2:
             channel = channel + self.min[i]
         return channel
@@ -174,9 +176,12 @@ class PacketDecoder:
         timer = vs.Timer()
         channel = [None] * 3
 
+        self.raw = [None] * 3
+
         def one(i):
             channel[i] = self.decode_channel(i)
-        vs.parallel(3, one)
+        # The block map predicts from the previous channel: channels in order.
+        vs.channels(self.delta_type == 13, 3, one)
         print("Channels processed in " + timer.elapsed() + ".")
 
         # Recombine the channel set, then resize, then shift.

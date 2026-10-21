@@ -123,7 +123,7 @@ def delta_bytes(m, pixel_quant, pixel_shift):
         if t < best_sum:
             best_sum, best = t, k
     ids = dm.get_channels(best)
-    return 9 + 3 * 8 + dm.get_block_map_bytes([qc[i] for i in ids], size[0], size[1], 12, 0)   # + block_writer's header
+    return 9 + 3 * 8 + dm.get_block_map_bytes([qc[i] for i in ids], size[0], size[1], 12, 3)   # Top 32; + block_writer's header
 
 
 def reconstruct(m, pixel_quant, pixel_shift):

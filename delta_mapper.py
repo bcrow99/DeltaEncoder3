@@ -287,14 +287,20 @@ def _block_predictor(p, a, b, c, d):
     if p == 18: return b + ((a - c) >> 1)
     if p == 19: return a + d - b
     if p == 20: return jdiv(a + b + d + 1, 3)
+    if p == 21: return b + ((d - c) >> 1)
+    # 22-27: selection predictors
+    if p == 22:
+        q = a + b - c
+        pa = abs(q - a); pb = abs(q - b); pc = abs(q - c)
+        return a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)       # Paeth (PNG)
+    if p == 23: return _median3(a, b, c)
+    if p == 24: return _median3(a, b, d)
+    if p == 25: return _median3(a, d, a + d - b)
+    if p == 26: return a if abs(b - c) <= abs(a - c) else b
+    if p == 27:
+        h = abs(b - c); v = abs(a - c); g = abs(a - b)
+        return a if (h <= v and h <= g) else (b if v <= g else d)
     return b + ((d - c) >> 1)
-
-
-@njit
-def _set_predictor(entry, a, b, c, d):
-    if entry < 32:
-        return _block_predictor(entry, a, b, c, d)
-    return (_block_predictor(entry // 32 - 1, a, b, c, d) + _block_predictor(entry % 32, a, b, c, d) + 1) >> 1
 
 
 # =============================================================================
@@ -760,70 +766,90 @@ def _from_frame(src, xdim, ydim, init, mp, n_pred):
 
 # =============================================================================
 # Block map (delta type 13)
+#
+# The interior is split into block x block squares, and each uses one
+# predictor from its channel's set. The map is [block size, n, n predictor
+# ids (PREDICTOR_TABLE), then one entry per block, row by row: an index
+# 0..n-1 into the ids]. Some predictors use the previous channel (in coding
+# order) at the same pixel, so a channel is coded and decoded with the one
+# before it (ref). With a named set a block takes the predictor with the
+# smallest sum of |delta|; survey_block_sets chooses by estimated coded size.
+# See DeltaMapper.java and predictor.txt.
 # =============================================================================
 
 BLOCK_MIN, BLOCK_MAX, BLOCK_DEFAULT = 4, 32, 8
-BLOCK_SET_NAMES = ["Scanline 16", "No Neighbours 16", "Neighbours 8", "Basic 4", "Blends 32"]
-BLOCK_SETS = [
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-    [4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
-    [0, 1, 2, 3, 11, 4, 10, 9],
-    [11, 10, 4, 9],
-    [11, 564, 37, 275, 1, 165, 46, 267, 102, 169, 368, 7, 178, 3, 0, 176,
-     66, 75, 6, 145, 50, 69, 168, 403, 307, 181, 101, 38, 80, 561, 231, 4]]
-_BLOCK_SETS = [np.array(s, dtype=np.int64) for s in BLOCK_SETS]
 BLOCK_SEARCH_SIZES = [4, 6, 8, 12, 16, 24, 32]
 
-# ---- Predictor ids -----------------------------------------------------------
-#
-# Every predictor a block can use has an id, 0..PREDICTORS-1 (one byte):
-#   0..21    the predictors of _block_predictor, in its numbering;
-#   22..252  the average of two of them, (P_i + P_j + 1) / 2 with i > j,
-#            in the order (1,0), (2,0), (2,1), (3,0), (3,1), (3,2), ...
-# A block map is [block size, n, n predictor ids, then one entry per block:
-# an index 0..n-1 into the ids]. Each channel's map carries its own ids.
-# (Format version 1 files had [block size, set number]; read_map reads both.)
-
+# Primitives: 0-21 on a, b, c, d (_block_predictor); 22-27 selection; 28-35
+# cross-channel; 36-39 longer reach; 40-41 clamped; 42-45 bias-corrected.
 PRIMITIVES = 22
-PREDICTORS = PRIMITIVES + PRIMITIVES * (PRIMITIVES - 1) // 2   # 253
+SELECTION_FIRST, CROSS_FIRST, REACH_FIRST, CLAMP_FIRST, BIAS_FIRST, ALL_PRIMITIVES = 22, 28, 36, 40, 42, 46
+GROUP_NAMES = ["selection", "cross-channel", "longer reach", "clamped", "bias-corrected"]
+GROUP_FIRST = [SELECTION_FIRST, CROSS_FIRST, REACH_FIRST, CLAMP_FIRST, BIAS_FIRST, ALL_PRIMITIVES]
 PRIMITIVE_NAMES = [
     "a", "b", "c", "d", "(a+b)/2", "(b+c)/2", "(a+c)/2", "(b+d)/2",
     "(c+d)/2", "(a+b+c+d)/4", "a+b-c", "MED", "(3a+b)/4", "(a+3b)/4", "(3a+d)/4", "(3b+a)/4",
     "(a+d)/2", "a+(b-c)/2", "b+(a-c)/2", "a+d-b", "(a+b+d)/3", "b+(d-c)/2"]
+EXTRA_PRIMITIVE_NAMES = [
+    "Paeth", "median(a,b,c)", "median(a,b,d)", "median(a,d,a+d-b)", "switch(a,b)", "switch(a,b,d)",
+    "a+(R-Ra)", "b+(R-Rb)", "d+(R-Rd)", "MED+(R-MED_R)", "(a+b)/2+(R-..)", "a+b-c+(R-..)", "MED+(R-MED_R)/2", "(a+b)/2+(R-..)/2",
+    "2a-aa", "2b-bb", "GAP", "GAP/8",
+    "clamp(a+b-c)", "clamp(a+d-b)",
+    "MED+bias", "(a+b)/2+bias", "a+bias", "b+bias"]
+CROSS_BASE = np.array([0, 1, 3, 11, 4, 10, 11, 4], dtype=np.int64)   # the last two with half the error
+BIAS_BASE = np.array([11, 4, 0, 1], dtype=np.int64)
+
+# PREDICTOR_TABLE as pairs of primitives (equal for a primitive alone).
+PREDICTOR_PAIRS = [
+    0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 11, 11, 13, 13,
+    16, 16, 18, 18, 19, 19, 23, 23, 24, 24, 25, 25, 28, 28, 29, 29, 30, 30, 31, 31, 32, 32, 34, 34,
+    35, 35, 36, 36, 37, 37, 39, 39, 40, 40, 42, 42, 45, 45, 2, 0, 2, 1, 3, 0, 3, 1, 4, 0,
+    4, 3, 5, 0, 5, 1, 5, 2, 5, 3, 5, 4, 6, 0, 6, 1, 6, 2, 6, 3, 6, 4, 7, 0,
+    7, 1, 7, 4, 7, 5, 7, 6, 8, 0, 8, 1, 8, 4, 9, 4, 9, 6, 11, 0, 11, 1, 11, 7,
+    11, 8, 13, 0, 16, 0, 16, 1, 16, 3, 16, 4, 16, 5, 16, 6, 16, 7, 16, 8, 16, 9, 16, 11,
+    18, 0, 18, 1, 18, 3, 18, 4, 18, 5, 18, 6, 18, 7, 18, 8, 18, 9, 18, 13, 18, 16, 19, 3,
+    19, 5, 19, 6, 19, 7, 19, 8, 19, 18, 23, 0, 23, 1, 23, 2, 23, 3, 23, 4, 23, 5, 23, 6,
+    24, 0, 24, 1, 24, 4, 24, 5, 24, 6, 24, 7, 24, 9, 24, 18, 24, 23, 25, 1, 25, 3, 25, 5,
+    25, 6, 28, 0, 28, 5, 28, 6, 28, 7, 28, 8, 28, 16, 29, 1, 29, 4, 29, 5, 29, 6, 29, 7,
+    29, 8, 29, 16, 29, 28, 30, 6, 30, 7, 30, 16, 30, 25, 30, 28, 30, 29, 31, 0, 31, 5, 31, 6,
+    31, 7, 31, 11, 31, 16, 32, 4, 32, 5, 32, 6, 32, 7, 32, 8, 32, 9, 32, 16, 32, 28, 32, 29,
+    32, 30, 34, 0, 34, 2, 34, 3, 34, 6, 34, 7, 34, 8, 34, 16, 34, 23, 34, 25, 34, 28, 34, 29,
+    34, 30, 34, 31, 35, 0, 35, 1, 35, 2, 35, 3, 35, 4, 35, 5, 35, 6, 35, 7, 35, 8, 35, 9,
+    35, 16, 35, 23, 35, 24, 35, 28, 35, 29, 35, 30, 35, 32, 36, 2, 36, 4, 36, 6, 36, 11, 36, 16,
+    36, 25, 37, 5, 37, 7, 37, 8, 37, 9, 37, 13, 37, 16, 37, 18, 37, 19, 37, 25, 39, 0, 39, 1,
+    39, 2, 39, 3, 39, 4, 39, 5, 39, 6, 39, 7, 39, 8, 39, 9, 39, 11, 39, 13, 39, 16, 39, 18,
+    39, 19, 39, 23, 39, 24, 39, 25, 39, 28, 39, 29, 39, 30, 39, 31, 39, 32, 39, 34, 39, 35, 39, 36,
+    39, 37, 40, 0, 40, 1, 40, 3, 40, 7, 40, 11, 40, 16, 40, 19, 40, 25, 40, 34, 40, 36, 40, 37,
+    40, 39, 42, 0, 42, 1, 42, 3, 42, 4, 42, 6, 42, 7, 42, 16, 42, 18, 42, 23, 42, 29, 42, 34,
+    42, 35, 42, 36, 42, 37, 42, 39, 42, 40, 45, 0, 45, 3, 45, 4, 45, 5, 45, 6, 45, 7, 45, 16,
+    45, 23, 45, 34, 45, 39]
+TABLE_FIRST = np.array(PREDICTOR_PAIRS[0::2], dtype=np.int64)
+TABLE_SECOND = np.array(PREDICTOR_PAIRS[1::2], dtype=np.int64)
+PREDICTORS = len(TABLE_FIRST)   # 255
+TABLE_PRIMITIVES = int(max(TABLE_FIRST.max(), TABLE_SECOND.max())) + 1
+
+# Named sets: the first 4, 8, 16 and 32 of one greedy order (DeltaMapper.BLOCK_ORDER).
+BLOCK_SET_NAMES = ["Top 4", "Top 8", "Top 16", "Top 32"]
+BLOCK_ORDER = [243, 21, 167, 127, 209, 37, 0, 231, 171, 1, 39, 149, 141, 172, 205, 28, 44, 173, 122, 206, 208, 184, 177, 86, 213, 67, 182, 150, 27, 137, 30, 121]
+BLOCK_SET_SIZES = [4, 8, 16, 32]
 
 
-def predictor_entry(pid):
-    """The set entry (for _set_predictor) of a predictor id."""
-    if pid < PRIMITIVES:
-        return pid
-    k, i = pid - PRIMITIVES, 1
-    while k >= i:
-        k -= i
-        i += 1
-    return 32 * (i + 1) + k
-
-
-def predictor_id(entry):
-    """The predictor id of a set entry (either order of an average's pair)."""
-    if entry < 32:
-        return entry
-    p, q = entry // 32 - 1, entry % 32
-    if p == q:
-        return p
-    i, j = max(p, q), min(p, q)
-    return PRIMITIVES + i * (i - 1) // 2 + j
+def primitive_name(p):
+    return PRIMITIVE_NAMES[p] if p < PRIMITIVES else EXTRA_PRIMITIVE_NAMES[p - PRIMITIVES]
 
 
 def predictor_name(pid):
-    e = predictor_entry(pid)
-    if e < 32:
-        return PRIMITIVE_NAMES[e]
-    return "avg(%s, %s)" % (PRIMITIVE_NAMES[e // 32 - 1], PRIMITIVE_NAMES[e % 32])
+    i, j = int(TABLE_FIRST[pid]), int(TABLE_SECOND[pid])
+    return primitive_name(i) if i == j else "avg(%s, %s)" % (primitive_name(i), primitive_name(j))
+
+
+def table_uses(pid, p):
+    return int(TABLE_FIRST[pid]) == p or int(TABLE_SECOND[pid]) == p
 
 
 def get_set_ids(block_set):
     """The predictor ids of a named set (BLOCK_SET_NAMES)."""
-    return [predictor_id(e) for e in BLOCK_SETS[block_set]]
+    return BLOCK_ORDER[:BLOCK_SET_SIZES[block_set]]
 
 
 def map_header_length(mp):
@@ -842,10 +868,6 @@ def describe_map_set(mp):
     return "%d predictors" % len(ids)
 
 
-def _entries(ids):
-    return np.array([predictor_entry(int(i)) for i in ids], dtype=np.int64)
-
-
 def blocks_across(xdim, block):
     return (xdim - 2 + block - 1) // block
 
@@ -860,53 +882,216 @@ def _edges(src, dst, xdim, ydim):
 
 
 @njit
-def _block(src, xdim, ydim, block, ids, set_ids):
-    dst = np.zeros(xdim * ydim, dtype=np.int64)
-    bw = (xdim - 2 + block - 1) // block
-    bh = (ydim - 1 + block - 1) // block
-    P = ids.shape[0]
-    head = 2 + P
-    mp = np.zeros(head + bw * bh, dtype=np.uint8)
-    mp[0] = block
-    mp[1] = P
-    for p in range(P):
-        mp[2 + p] = set_ids[p]
-    _edges(src, dst, xdim, ydim)
-    sums = np.zeros(P, dtype=np.int64)
-    prim = np.zeros(22, dtype=np.int64)
-    for by in range(bh):
-        for bx in range(bw):
-            y0 = 1 + by * block; y1 = min(ydim, y0 + block)
-            x0 = 1 + bx * block; x1 = min(xdim - 1, x0 + block)
-            sums[:] = 0
-            for y in range(y0, y1):
-                for x in range(x0, x1):
-                    k = y * xdim + x
-                    a = src[k - 1]; b = src[k - xdim]; c = src[k - xdim - 1]; d = src[k - xdim + 1]
-                    for q in range(22):
-                        prim[q] = _block_predictor(q, a, b, c, d)
-                    for p in range(P):
-                        e = ids[p]
-                        v = prim[e] if e < 32 else (prim[e // 32 - 1] + prim[e % 32] + 1) >> 1
-                        sums[p] += abs(src[k] - v)
-            best = 0
-            for p in range(1, P):
-                if sums[p] < sums[best]:
-                    best = p
-            mp[head + by * bw + bx] = best
-            for y in range(y0, y1):
-                for x in range(x0, x1):
-                    k = y * xdim + x
-                    dst[k] = src[k] - _set_predictor(ids[best], src[k - 1], src[k - xdim], src[k - xdim - 1], src[k - xdim + 1])
-    return dst, mp
+def _median3(x, y, z):
+    return max(min(x, y), min(max(x, y), z))
 
 
 @njit
-def _from_block(delta, xdim, ydim, init, mp, ids):
+def _gap(w, ww, n, nn, nw, ne, nne, t1, t2, t3):
+    dh = abs(w - ww) + abs(n - nw) + abs(n - ne)
+    dv = abs(w - nw) + abs(n - nn) + abs(ne - nne)
+    if dv - dh > t1:
+        return w
+    if dh - dv > t1:
+        return n
+    p = (2 * (w + n) + ne - nw) >> 2
+    if dv - dh > t2:
+        p = (p + w) >> 1
+    elif dv - dh > t3:
+        p = (3 * p + w) >> 2
+    elif dh - dv > t2:
+        p = (p + n) >> 1
+    elif dh - dv > t3:
+        p = (3 * p + n) >> 2
+    return p
+
+
+@njit
+def _gradient_level(g):
+    m = abs(g)
+    l = 0 if m == 0 else (1 if m < 3 else (2 if m < 7 else (3 if m < 21 else 4)))
+    return -l if g < 0 else l
+
+
+@njit
+def _bias_context(a, b, c, d):
+    return (_gradient_level(d - b) + 4) * 81 + (_gradient_level(b - c) + 4) * 9 + _gradient_level(c - a) + 4
+
+
+@njit
+def _bias_prepare(v, k, xdim, ctx, corr, bsum, bcount):
+    a = v[k - 1]; b = v[k - xdim]; c = v[k - xdim - 1]; d = v[k - xdim + 1]
+    t = _bias_context(a, b, c, d)
+    ctx[k] = t
+    for s in range(4):
+        n = bcount[s, t]
+        e = bsum[s, t]
+        if n == 0:
+            corr[s, k] = 0
+        elif e >= 0:
+            corr[s, k] = (e + n // 2) // n
+        else:
+            corr[s, k] = -((-e + n // 2) // n)
+
+
+@njit
+def _bias_commit(v, k, xdim, ctx, bsum, bcount, bias_base):
+    a = v[k - 1]; b = v[k - xdim]; c = v[k - xdim - 1]; d = v[k - xdim + 1]
+    t = ctx[k]
+    for s in range(4):
+        bsum[s, t] += v[k] - _block_predictor(bias_base[s], a, b, c, d)
+        bcount[s, t] += 1
+        if bcount[s, t] == 64:
+            bsum[s, t] = jdiv(bsum[s, t], 2)
+            bcount[s, t] = 32
+
+
+@njit
+def _bias_corrections(v, xdim, ydim, bias_base):
+    """The encoder's bias corrections for the whole channel, [4, n]."""
+    n = v.shape[0]
+    corr = np.zeros((4, n), dtype=np.int64)
+    ctx = np.zeros(n, dtype=np.int64)
+    bsum = np.zeros((4, 729), dtype=np.int64)
+    bcount = np.zeros((4, 729), dtype=np.int64)
+    for y in range(1, ydim):
+        for x in range(1, xdim - 1):
+            k = y * xdim + x
+            _bias_prepare(v, k, xdim, ctx, corr, bsum, bcount)
+            _bias_commit(v, k, xdim, ctx, bsum, bcount, bias_base)
+    return corr
+
+
+@njit
+def _primitive(q, v, ref, has_ref, corr, k, xdim, cross_base, bias_base):
+    """Primitive q at interior pixel k of channel v (ref: the previous channel)."""
+    a = v[k - 1]; b = v[k - xdim]; c = v[k - xdim - 1]; d = v[k - xdim + 1]
+    if q < CROSS_FIRST:
+        return _block_predictor(q, a, b, c, d)
+    if q < REACH_FIRST:
+        s = q - CROSS_FIRST
+        base = cross_base[s]
+        p = _block_predictor(base, a, b, c, d)
+        if not has_ref:
+            return p
+        e = ref[k] - _block_predictor(base, ref[k - 1], ref[k - xdim], ref[k - xdim - 1], ref[k - xdim + 1])
+        return p + (e >> 1) if s >= 6 else p + e
+    if q < CLAMP_FIRST:
+        x = k % xdim
+        y = k // xdim
+        aa = v[k - 2] if x >= 2 else a
+        bb = v[k - 2 * xdim] if y >= 2 else b
+        if q == REACH_FIRST:
+            return 2 * a - aa
+        if q == REACH_FIRST + 1:
+            return 2 * b - bb
+        nne = v[k - 2 * xdim + 1] if y >= 2 else d
+        if q == REACH_FIRST + 2:
+            return _gap(a, aa, b, bb, c, d, nne, 80, 32, 8)
+        return _gap(a, aa, b, bb, c, d, nne, 10, 4, 1)
+    if q < BIAS_FIRST:
+        lo = min(min(a, b), min(c, d))
+        hi = max(max(a, b), max(c, d))
+        p = a + b - c if q == CLAMP_FIRST else a + d - b
+        return max(lo, min(hi, p))
+    s = q - BIAS_FIRST
+    return _block_predictor(bias_base[s], a, b, c, d) + corr[s, k]
+
+
+@njit
+def _predict(pid, first, second, v, ref, has_ref, corr, k, xdim, cross_base, bias_base):
+    i = first[pid]
+    j = second[pid]
+    p = _primitive(i, v, ref, has_ref, corr, k, xdim, cross_base, bias_base)
+    if i == j:
+        return p
+    return (p + _primitive(j, v, ref, has_ref, corr, k, xdim, cross_base, bias_base) + 1) >> 1
+
+
+class PixelSource:
+    """What the table's primitives need for a channel (DeltaMapper.PixelSource,
+    encoder side): the channel, the previous channel, the bias corrections."""
+
+    def __init__(self, v, ref, xdim, ydim):
+        self.v = np.asarray(v, dtype=np.int64)
+        self.has_ref = ref is not None
+        self.ref = np.asarray(ref, dtype=np.int64) if ref is not None else np.zeros(1, dtype=np.int64)
+        self.xdim, self.ydim = xdim, ydim
+        self.corr = _bias_corrections(self.v, xdim, ydim, BIAS_BASE)
+
+
+@njit
+def _block_from_map(src, ref, has_ref, corr, xdim, ydim, mp, ids, first, second, cross_base, bias_base):
     block = np.int64(mp[0])
     bw = (xdim - 2 + block - 1) // block
     head = 2 + np.int64(mp[1])
     dst = np.zeros(xdim * ydim, dtype=np.int64)
+    _edges(src, dst, xdim, ydim)
+    for y in range(1, ydim):
+        row = head + (y - 1) // block * bw
+        for x in range(1, xdim - 1):
+            k = y * xdim + x
+            dst[k] = src[k] - _predict(ids[mp[row + (x - 1) // block]], first, second, src, ref, has_ref, corr, k, xdim, cross_base, bias_base)
+    return dst
+
+
+def get_block_deltas_from_map(ps, mp, ids=None):
+    """The block deltas for a given block map (DeltaMapper.getBlockDeltasFromMap)."""
+    mp = np.asarray(mp, dtype=np.uint8)
+    ids = np.array(get_map_ids(mp) if ids is None else list(ids), dtype=np.int64)
+    return _block_from_map(ps.v, ps.ref, ps.has_ref, ps.corr, ps.xdim, ps.ydim, mp, ids,
+                           TABLE_FIRST, TABLE_SECOND, CROSS_BASE, BIAS_BASE)
+
+
+@njit
+def _block_choices(src, ref, has_ref, corr, xdim, ydim, block, ids, first, second, cross_base, bias_base):
+    bw = (xdim - 2 + block - 1) // block
+    bh = (ydim - 1 + block - 1) // block
+    n = ids.shape[0]
+    choice = np.zeros(bw * bh, dtype=np.uint8)
+    sums = np.zeros(bw * n, dtype=np.int64)
+    for by in range(bh):
+        sums[:] = 0
+        y0 = 1 + by * block
+        y1 = min(ydim, y0 + block)
+        for y in range(y0, y1):
+            for x in range(1, xdim - 1):
+                k = y * xdim + x
+                base = (x - 1) // block * n
+                for p in range(n):
+                    sums[base + p] += abs(src[k] - _predict(ids[p], first, second, src, ref, has_ref, corr, k, xdim, cross_base, bias_base))
+        for bx in range(bw):
+            best = 0
+            for p in range(1, n):
+                if sums[bx * n + p] < sums[bx * n + best]:
+                    best = p
+            choice[by * bw + bx] = best
+    return choice
+
+
+def get_block_deltas_from_values(src, ref, xdim, ydim, block, ids):
+    """(deltas, map): each block takes the id with the smallest sum of |delta|
+    (DeltaMapper.getBlockDeltasFromValues); ref is the previous channel or None."""
+    ps = PixelSource(src, ref, xdim, ydim)
+    ids = [int(i) for i in ids]
+    arr = np.array(ids, dtype=np.int64)
+    choice = _block_choices(ps.v, ps.ref, ps.has_ref, ps.corr, xdim, ydim, block, arr,
+                            TABLE_FIRST, TABLE_SECOND, CROSS_BASE, BIAS_BASE)
+    mp = np.concatenate([np.array([block, len(ids)] + ids, dtype=np.uint8), choice])
+    return get_block_deltas_from_map(ps, mp, ids), mp
+
+
+@njit
+def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, cross_base, bias_base):
+    block = np.int64(mp[0])
+    bw = (xdim - 2 + block - 1) // block
+    head = 2 + np.int64(mp[1])
+    n = xdim * ydim
+    dst = np.zeros(n, dtype=np.int64)
+    corr = np.zeros((4, n), dtype=np.int64)
+    ctx = np.zeros(n, dtype=np.int64)
+    bsum = np.zeros((4, 729), dtype=np.int64)
+    bcount = np.zeros((4, 729), dtype=np.int64)
     dst[0] = init
     for x in range(1, xdim):
         dst[x] = dst[x - 1] + delta[x]
@@ -916,21 +1101,31 @@ def _from_block(delta, xdim, ydim, init, mp, ids):
         row = head + (y - 1) // block * bw
         for x in range(1, xdim - 1):
             k += 1
-            e = ids[mp[row + (x - 1) // block]]
-            dst[k] = delta[k] + _set_predictor(e, dst[k - 1], dst[k - xdim], dst[k - xdim - 1], dst[k - xdim + 1])
+            _bias_prepare(dst, k, xdim, ctx, corr, bsum, bcount)
+            dst[k] = delta[k] + _predict(ids[mp[row + (x - 1) // block]], first, second, dst, ref, has_ref, corr, k, xdim, cross_base, bias_base)
+            _bias_commit(dst, k, xdim, ctx, bsum, bcount, bias_base)
         k += 1
         dst[k] = dst[k - 1] + delta[k]
     return dst
+
+
+def get_values_from_block_deltas(delta, xdim, ydim, init, mp, ref):
+    mp = np.asarray(mp, dtype=np.uint8)
+    has_ref = ref is not None
+    r = np.asarray(ref, dtype=np.int64) if has_ref else np.zeros(1, dtype=np.int64)
+    return _from_block(np.asarray(delta, dtype=np.int64), r, has_ref, xdim, ydim, init, mp,
+                       np.array(get_map_ids(mp), dtype=np.int64), TABLE_FIRST, TABLE_SECOND, CROSS_BASE, BIAS_BASE)
 
 
 # =============================================================================
 # Dispatch
 # =============================================================================
 
-def get_deltas(src, xdim, ydim, delta_type, variant=0, block=BLOCK_DEFAULT, block_set=0, set_ids=None):
+def get_deltas(src, xdim, ydim, delta_type, variant=0, block=BLOCK_DEFAULT, block_set=0, set_ids=None, ref=None):
     """(deltas, map or None, init value) for delta_type 0-13. For the block
     map (13) the predictors are the named set block_set, or the predictor
-    ids set_ids if given."""
+    ids set_ids if given, and ref is the previous channel (None for the
+    first)."""
     src = np.asarray(src, dtype=np.int64)
     init = int(src[0])
     t = delta_type
@@ -947,12 +1142,14 @@ def get_deltas(src, xdim, ydim, delta_type, variant=0, block=BLOCK_DEFAULT, bloc
     elif t == 12: d, m = _frame(src, xdim, ydim, 16)
     elif t == 13:
         ids = get_set_ids(block_set) if set_ids is None else [int(i) for i in set_ids]
-        d, m = _block(src, xdim, ydim, block, _entries(ids), np.array(ids, dtype=np.int64))
+        d, m = get_block_deltas_from_values(src, ref, xdim, ydim, block, ids)
     else: raise ValueError("delta_type %d" % t)
     return d, m, init
 
 
-def get_values_from_deltas(delta, xdim, ydim, init, delta_type, mp=None, variant=0):
+def get_values_from_deltas(delta, xdim, ydim, init, delta_type, mp=None, variant=0, ref=None):
+    """Inverse of get_deltas; ref (the previous channel as decoded, before
+    any minimum is added back) is used by the block map only."""
     delta = np.asarray(delta, dtype=np.int64)
     t = delta_type
     if t == 0: return _from_horizontal(delta, xdim, ydim, init)
@@ -967,7 +1164,7 @@ def get_values_from_deltas(delta, xdim, ydim, init, delta_type, mp=None, variant
     if t == 10: return _from_scanline45(delta, xdim, ydim, init, mp, 8, variant)
     if t == 11: return _from_frame(delta, xdim, ydim, init, mp, 8)
     if t == 12: return _from_frame(delta, xdim, ydim, init, mp, 16)
-    if t == 13: return _from_block(delta, xdim, ydim, init, mp, _entries(get_map_ids(mp)))
+    if t == 13: return get_values_from_block_deltas(delta, xdim, ydim, init, mp, ref)
     raise ValueError("delta_type %d" % t)
 
 
@@ -1222,9 +1419,7 @@ def _read_map_forms(inp, previous, width):
     return mp
 
 
-def read_map(inp, delta_type, previous, xdim, version1=False):
-    """With version1, a block map is in the format version 1 layout, [block
-    size, set number], and is returned in the current one."""
+def read_map(inp, delta_type, previous, xdim):
     if delta_type <= 8:
         n = inp.read_int()
         packed = np.frombuffer(inp.read_fully(inp.read_int()), dtype=np.uint8)
@@ -1232,18 +1427,12 @@ def read_map(inp, delta_type, previous, xdim, version1=False):
         return ((packed[q >> 2] >> ((q & 3) << 1)) & 3).astype(np.uint8)
     if delta_type == 13:
         block = inp.read_byte()
-        if version1:
-            set_id = inp.read_byte()
-            if not (0 <= set_id < len(BLOCK_SET_NAMES)):
-                raise IOError("Block map with predictor set %d: not one this version reads." % set_id)
-            ids = get_set_ids(set_id)
-        else:
-            n = inp.read_unsigned_byte()
-            if not (1 <= n <= PREDICTORS):
-                raise IOError("Block map with %d predictors: not one this version reads." % n)
-            ids = [inp.read_unsigned_byte() for _ in range(n)]
-            if max(ids) >= PREDICTORS:
-                raise IOError("Block map with predictor id %d: not one this version reads." % max(ids))
+        n = inp.read_unsigned_byte()
+        if not (1 <= n <= PREDICTORS):
+            raise IOError("Block map with %d predictors: not one this version reads." % n)
+        ids = [inp.read_unsigned_byte() for _ in range(n)]
+        if max(ids) >= PREDICTORS:
+            raise IOError("Block map with predictor id %d: not one this version reads." % max(ids))
         if not (BLOCK_MIN <= block <= BLOCK_MAX):
             raise IOError("Block map with block size %d: not one this version reads." % block)
         prev = None
@@ -1357,8 +1546,8 @@ def get_block_map_bytes(channel, xdim, ydim, block, block_set):
     """Bytes the three channels take as block-map deltas (Context coded)
     plus their maps, as the writers save them."""
     d, m = [], []
-    for c in channel:
-        delta, mp, _ = get_deltas(c, xdim, ydim, 13, 0, block, block_set)
+    for i, c in enumerate(channel):
+        delta, mp = get_block_deltas_from_values(c, channel[i - 1] if i > 0 else None, xdim, ydim, block, get_set_ids(block_set))
         d.append(delta); m.append(mp)
     total = 0
     for i in range(3):
@@ -1397,14 +1586,14 @@ def find_best_block(channel, xdim, ydim, workers=None):
 # ---- Surveying predictor sets (DeltaMapper.surveyBlockSets) -------------------
 #
 # Predictors are ranked by an estimate of their coded size: a cost per delta
-# value per coding context, from the deltas of a reference set (Blends 32);
+# value per coding context, from the deltas of a reference set (Top 32);
 # each predictor's estimated bits per block; a greedy order that charges for
 # the map (entropy of the block counts plus a byte per id); real coded sizes
 # at SURVEY_COUNTS; blocks assigned by the estimate. See DeltaMapper.java.
 # Costs are integers (1/256 bits) so the result matches Java exactly.
 
-SURVEY_COUNTS = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64, 80, 96, 128, 160, 192, 253]
-SURVEY_REFERENCE_SET = 4            # Blends 32
+SURVEY_COUNTS = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64, 80, 96, 128, 160, 192, 255]
+SURVEY_REFERENCE_SET = 3            # Top 32
 SURVEY_ID_COST = 8 * 256            # a predictor id in the map header, 1/256 bits
 _LOG2 = math.log(2)
 
@@ -1454,12 +1643,12 @@ class DeltaCost:
 
 
 @njit
-def _block_cost_table(src, xdim, ydim, block, cost, ctx, lo, rng, entry):
-    n = entry.shape[0]
+def _block_cost_table(src, ref, has_ref, corr, xdim, ydim, block, cost, ctx, lo, rng, pids, first, second, n_prim, cross_base, bias_base):
+    n = pids.shape[0]
     bw = (xdim - 2 + block - 1) // block
     bh = (ydim - 1 + block - 1) // block
     est = np.zeros(bw * bh * n, dtype=np.int64)
-    prim = np.zeros(PRIMITIVES, dtype=np.int64)
+    prim = np.zeros(n_prim, dtype=np.int64)
     for by in range(bh):
         y0 = 1 + by * block
         y1 = min(ydim, y0 + block)
@@ -1468,22 +1657,24 @@ def _block_cost_table(src, xdim, ydim, block, cost, ctx, lo, rng, entry):
                 k = y * xdim + x
                 s = src[k]
                 c = ctx[k]
-                for q in range(PRIMITIVES):
-                    prim[q] = _block_predictor(q, src[k - 1], src[k - xdim], src[k - xdim - 1], src[k - xdim + 1])
+                for q in range(n_prim):
+                    prim[q] = _primitive(q, src, ref, has_ref, corr, k, xdim, cross_base, bias_base)
                 base = (by * bw + (x - 1) // block) * n
                 for q in range(n):
-                    e = entry[q]
-                    v = prim[e] if e < 32 else (prim[e // 32 - 1] + prim[e % 32] + 1) >> 1
+                    i = first[pids[q]]
+                    j = second[pids[q]]
+                    v = prim[i] if i == j else (prim[i] + prim[j] + 1) >> 1
                     est[base + q] += cost[c, min(rng - 1, max(0, s - v - lo))]
     return est
 
 
-def block_cost_table(src, xdim, ydim, block, dc, ids=None):
+def block_cost_table(ps, block, dc, ids=None):
     """Estimated bits (1/256) of each predictor in each block, as
     [block * n + q] for the ids given, or for every id (ids None)."""
     ids = list(range(PREDICTORS)) if ids is None else ids
-    return _block_cost_table(np.asarray(src, dtype=np.int64), xdim, ydim, block, dc.cost, dc.context,
-                             dc.lo, dc.range, _entries(ids))
+    return _block_cost_table(ps.v, ps.ref, ps.has_ref, ps.corr, ps.xdim, ps.ydim, block, dc.cost, dc.context,
+                             dc.lo, dc.range, np.array(ids, dtype=np.int64), TABLE_FIRST, TABLE_SECOND,
+                             TABLE_PRIMITIVES, CROSS_BASE, BIAS_BASE)
 
 
 def _nlog2n_table(n):
@@ -1532,7 +1723,7 @@ def greedy_cost_order(est, blocks):
     assign = np.zeros(blocks, dtype=np.int64)
     count = np.zeros(P, dtype=np.int64)
     count[0] = blocks
-    while len(order) < P:
+    while len(order) < min(P, 255):     # a set has at most 255 ids
         n = len(order)
         map_old = int(NL[blocks]) - int(NL[count[:n]].sum())
         gain = _greedy_cost_gains(est, blocks, cur, assign, count, chosen, n, NL, map_old, SURVEY_ID_COST)
@@ -1569,29 +1760,8 @@ def _assign_by_cost(est, stride, cols, ids, xdim, ydim, block):
     return mp
 
 
-@njit
-def _block_from_map(src, xdim, ydim, mp, entry):
-    block = np.int64(mp[0])
-    bw = (xdim - 2 + block - 1) // block
-    head = 2 + np.int64(mp[1])
-    dst = np.zeros(xdim * ydim, dtype=np.int64)
-    _edges(src, dst, xdim, ydim)
-    for y in range(1, ydim):
-        row = head + (y - 1) // block * bw
-        for x in range(1, xdim - 1):
-            k = y * xdim + x
-            dst[k] = src[k] - _set_predictor(entry[mp[row + (x - 1) // block]], src[k - 1], src[k - xdim], src[k - xdim - 1], src[k - xdim + 1])
-    return dst
-
-
-def get_block_deltas_from_map(src, xdim, ydim, mp):
-    """The block deltas for a given block map (DeltaMapper.getBlockDeltasFromMap)."""
-    mp = np.asarray(mp, dtype=np.uint8)
-    return _block_from_map(np.asarray(src, dtype=np.int64), xdim, ydim, mp, _entries(get_map_ids(mp)))
-
-
-def _channel_cost(src, xdim, ydim, block, chosen_before):
-    ref, _, _ = get_deltas(src, xdim, ydim, 13, 0, block, SURVEY_REFERENCE_SET)
+def _channel_cost(src, previous_channel, xdim, ydim, block, chosen_before):
+    ref, _ = get_block_deltas_from_values(src, previous_channel, xdim, ydim, block, get_set_ids(SURVEY_REFERENCE_SET))
     return DeltaCost(src, ref, chosen_before, xdim, ydim)
 
 
@@ -1600,10 +1770,12 @@ def get_block_deltas_by_cost(channel, xdim, ydim, block, ids):
     by estimated cost as the survey does (DeltaMapper.getBlockDeltasByCost)."""
     result, delta = [], []
     for i, c in enumerate(channel):
-        dc = _channel_cost(c, xdim, ydim, block, delta[:i])
-        est = block_cost_table(c, xdim, ydim, block, dc, ids[i])
+        prev = channel[i - 1] if i > 0 else None
+        dc = _channel_cost(c, prev, xdim, ydim, block, delta[:i])
+        ps = PixelSource(c, prev, xdim, ydim)
+        est = block_cost_table(ps, block, dc, ids[i])
         mp = _assign_by_cost(est, len(ids[i]), np.arange(len(ids[i])), ids[i], xdim, ydim, block)
-        d = get_block_deltas_from_map(c, xdim, ydim, mp)
+        d = get_block_deltas_from_map(ps, mp, ids[i])
         result.append((d, mp))
         delta.append(d)
     return result
@@ -1623,8 +1795,10 @@ def _survey_block_size(channel, xdim, ydim, block, log):
     blocks = blocks_across(xdim, block) * ((ydim - 1 + block - 1) // block)
     log.append("  block %d:" % block)
     for i in range(3):
-        dc = _channel_cost(channel[i], xdim, ydim, block, delta[:i])
-        est = block_cost_table(channel[i], xdim, ydim, block, dc)
+        prev = channel[i - 1] if i > 0 else None
+        dc = _channel_cost(channel[i], prev, xdim, ydim, block, delta[:i])
+        ps = PixelSource(channel[i], prev, xdim, ydim)
+        est = block_cost_table(ps, block, dc)
         order = greedy_cost_order(est, blocks)
         counts = [c for c in SURVEY_COUNTS if c < len(order)] + [len(order)]
         best_bytes, worse = None, 0
@@ -1632,7 +1806,7 @@ def _survey_block_size(channel, xdim, ydim, block, log):
         for n in counts:
             ids = order[:n]
             m = _assign_by_cost(est, PREDICTORS, np.array(ids, dtype=np.int64), ids, xdim, ydim, block)
-            d = get_block_deltas_from_map(channel[i], xdim, ydim, m)
+            d = get_block_deltas_from_map(ps, m, ids)
             size = map_bytes(13, m, mp[i - 1] if i > 0 else None, xdim) + len(pack_context_deltas(d, delta[:i], xdim))
             line += " %d:%s" % (n, format(size, ","))
             if best_bytes is None or size < best_bytes:
@@ -1680,6 +1854,52 @@ def survey_block_sets(channel, xdim, ydim):
             r.append("    " + ", ".join(names[k:k + 6]))
     result.report = "\n".join(r) + "\n"
     return result
+
+
+def describe_group_use(survey, coded):
+    """Which primitives past the basic 22 a survey's sets use, by group
+    (DeltaMapper.describeGroupUse); coded: get_block_deltas_by_cost's result."""
+    total = 0
+    blocks = np.zeros((3, PREDICTORS), dtype=np.int64)
+    for i in range(3):
+        mp = coded[i][1]
+        idx = np.asarray(survey.ids[i], dtype=np.int64)[np.asarray(mp[map_header_length(mp):], dtype=np.int64)]
+        blocks[i] += np.bincount(idx, minlength=PREDICTORS)
+        total += len(idx)
+    r = ["Predictors past the basic 22 in the surveyed sets (share of all blocks):"]
+    for g, gname in enumerate(GROUP_NAMES):
+        lo, hi = GROUP_FIRST[g], GROUP_FIRST[g + 1]
+        anyb = 0
+        for i in range(3):
+            for pid in survey.ids[i]:
+                if any(table_uses(pid, p) for p in range(lo, hi)):
+                    anyb += int(blocks[i][pid])
+        used, unused = [], []
+        for p in range(lo, hi):
+            if not any(table_uses(pid, p) for pid in range(PREDICTORS)):
+                continue
+            alone = avg = chosen = 0
+            for i in range(3):
+                for pid in survey.ids[i]:
+                    if table_uses(pid, p):
+                        chosen += 1
+                        if TABLE_FIRST[pid] == TABLE_SECOND[pid]:
+                            alone += int(blocks[i][pid])
+                        else:
+                            avg += int(blocks[i][pid])
+            if chosen == 0:
+                unused.append(primitive_name(p))
+            else:
+                used.append("      %-20s %2d ids chosen, %5.2f%% alone, %5.2f%% in averages"
+                            % (primitive_name(p), chosen, 100.0 * alone / total, 100.0 * avg / total))
+        if not used:
+            r.append("  %s: unused." % gname)
+        else:
+            r.append("  %s: used, in %.2f%% of blocks." % (gname, 100.0 * anyb / total))
+            r += used
+            if unused:
+                r.append("      unused: " + ", ".join(unused))
+    return "\n".join(r) + "\n"
 
 
 def get_block_table(table, best):

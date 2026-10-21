@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-delta_reader.py version 1.0 -- DeltaReader.java for Python (PySide6).
+delta_reader.py version 2.0 -- DeltaReader.java for Python (PySide6).
 
-Reads Delta format 'D' version 1 and 2 files, from delta_writer.py or
+Reads Delta format 'D' version 3 files, from delta_writer.py or
 DeltaWriter.java (or DeltaWriter2.java), and shows the image.
 
     python3 delta_reader.py file
@@ -29,7 +29,7 @@ import viewer_support as vs
 from java_io import DataInput
 
 FORMAT_ID = ord('D')
-FORMAT_VERSION = 2   # 2: block maps carry their predictor ids; version 1 files are still read
+FORMAT_VERSION = 3   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; older files are not read
 
 ENTROPY_NAMES = ["LZ77", "Huffman", "Arithmetic", "Adaptive", "Context"]
 COMPRESS_NAMES = ["Integer", "String", "String*", "String* (DeltaWriter2)"]
@@ -47,8 +47,8 @@ class DeltaDecoder:
         ident, version = inp.read_unsigned_byte(), inp.read_unsigned_byte()
         if ident != FORMAT_ID:
             raise IOError(self.filename + " is not a Delta Writer file.")
-        if version < 1 or version > FORMAT_VERSION:
-            raise IOError("%s is Delta format version %d; this reader reads versions 1 to %d." % (self.filename, version, FORMAT_VERSION))
+        if version != FORMAT_VERSION:
+            raise IOError("%s is Delta format version %d; this reader reads version %d only (the block predictors changed in it)." % (self.filename, version, FORMAT_VERSION))
         self.xdim = inp.read_unsigned_short()
         self.ydim = inp.read_unsigned_short()
         (self.pixel_shift, self.pixel_quant, self.set_id, self.delta_type, self.compress_type,
@@ -72,7 +72,7 @@ class DeltaDecoder:
             self.min[i], self.init[i], self.delta_min[i], self.length[i], self.compressed_length[i] = [inp.read_int() for _ in range(5)]
             inp.read_byte()                          # iterations (the string carries them too)
             if dm.has_map(self.delta_type):
-                self.map[i] = dm.read_map(inp, self.delta_type, self.map[i - 1] if i > 0 else None, w, version == 1)
+                self.map[i] = dm.read_map(inp, self.delta_type, self.map[i - 1] if i > 0 else None, w)
             if self.entropy_type == 4:               # Context: decoded here, in channel order
                 self.delta[i] = dm.read_context_deltas(inp, w * h, self.delta[:i], w)
                 continue
@@ -115,7 +115,9 @@ class DeltaDecoder:
                 delta = sm.unpack_strings(sm.decompress_strings(payload), self.table[i], n, self.length[i])
                 delta[0] = 0
                 delta[1:] += self.delta_min[i]
-        channel = dm.get_values_from_deltas(delta, w, h, self.init[i], self.delta_type, self.map[i], self.scanline5_variant)
+        channel = dm.get_values_from_deltas(delta, w, h, self.init[i], self.delta_type, self.map[i], self.scanline5_variant,
+                                            ref=self.raw[i - 1] if i > 0 else None)
+        self.raw[i] = channel   # as decoded: the next channel's reference (block map)
         if dm.get_channels(self.set_id)[i] > 2:
             channel = channel + self.min[i]
         return channel
@@ -125,9 +127,12 @@ class DeltaDecoder:
         timer = vs.Timer()
         channel = [None] * 3
 
+        self.raw = [None] * 3
+
         def one(i):
             channel[i] = self.decode_channel(i)
-        vs.parallel(3, one)
+        # The block map predicts from the previous channel: channels in order.
+        vs.channels(self.delta_type == 13, 3, one)
         print("Channels processed in " + timer.elapsed() + ".")
 
         # Recombine the channel set, then resize, then shift.

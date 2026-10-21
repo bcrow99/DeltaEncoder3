@@ -104,6 +104,16 @@ def parallel(n, body):
         f.result()
 
 
+def channels(in_order, n, body):
+    """body(0..n-1): in order when in_order (block-map channels, which predict
+    from the one before), else in parallel."""
+    if in_order:
+        for i in range(n):
+            body(i)
+    else:
+        parallel(n, body)
+
+
 class _Relay(QObject):
     done = Signal(object)
 

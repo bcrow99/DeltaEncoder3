@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-simple_writer.py version 1.0 -- SimpleWriter.java for Python (PySide6).
+simple_writer.py version 2.0 -- SimpleWriter.java for Python (PySide6).
 
 Quantizes an image, codes it as deltas packed into unary strings, and saves
-(to the file "foo", as the Java version does) in Simple format 'S' version 1:
+(to the file "foo", as the Java version does) in Simple format 'S' version 3:
 the same file layout as SimpleWriter.java, so either program's files open
 in either reader.
 
@@ -33,7 +33,7 @@ from delta_writer import context_code, entropy_code
 from java_io import DataOutput
 
 FORMAT_ID = ord('S')
-FORMAT_VERSION = 2   # 2: block maps carry their predictor ids (delta_mapper.write_map)
+FORMAT_VERSION = 3   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps
 
 ENTROPY_NAMES = ["LZ77", "Huffman", "Arithmetic", "Adaptive", "Context"]
 DELTA_MENU_NAMES = ["H", "V", "Average", "Med", "Directional", "Adaptive", "Scanline 1", "Scanline 2",
@@ -128,9 +128,11 @@ class SimpleCoder:
         self.delta_xdim = w
         table, strings, maps, deltas, decoded = ([None] * 3 for _ in range(5))
 
+        raw = [None] * 3   # decoded, before the minimum: the next channel's reference
+
         def channel(i):
             j = ids[i]
-            d, m, _ = dm.get_deltas(qc[j], w, h, self.delta_type, self.scanline5_variant, self.block_size, self.block_set)
+            d, m, _ = dm.get_deltas(qc[j], w, h, self.delta_type, self.scanline5_variant, self.block_size, self.block_set, ref=qc[ids[i - 1]] if i > 0 else None)
             maps[i] = m
             deltas[i] = d
             lo, bits, tbl, s = sm.get_string_list(d, True)
@@ -141,11 +143,12 @@ class SimpleCoder:
             d2 = sm.unpack_strings(sm.decompress_strings(s), tbl, w * h, bits)
             d2[0] = 0
             d2[1:] += lo
-            ch = dm.get_values_from_deltas(d2, w, h, self.channel_init[j], self.delta_type, m, self.scanline5_variant)
+            ch = dm.get_values_from_deltas(d2, w, h, self.channel_init[j], self.delta_type, m, self.scanline5_variant, ref=raw[i - 1] if i > 0 else None)
+            raw[i] = ch
             if j > 2:
                 ch = ch + self.channel_min[j]
             decoded[i] = ch
-        vs.parallel(3, channel)
+        vs.channels(self.delta_type == 13, 3, channel)
         self.table_list, self.string_list, self.map_list, self.delta_list = table, strings, maps, deltas
 
         # As the reader: recombine the channel set first, then resize, then shift.

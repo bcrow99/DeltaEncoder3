@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
-block_writer.py version 1.3 -- BlockWriter.java for Python (PySide6).
+block_writer.py version 2.0 -- BlockWriter.java for Python (PySide6).
 
 A writer with one delta type and one entropy coder: the block map (delta
 type 13) with Context-coded deltas and a coded map. Each block uses one
-predictor from its channel's set, and a set can be any of the 253
+predictor from its channel's set, and a set can be any of the 255
 predictors delta_mapper has ids for. The startup analysis (and Find Best)
 picks the channel set, then surveys the sets (delta_mapper.survey_block_sets:
 per channel, predictors added in greedy order by estimated coded bits,
 blocks assigned by the estimate, and the real coded size measured), and
 also codes with each named set (find_best_block); it keeps whichever is
 smallest -- actual sizes, not estimates. Saves (to the file
-"foo", as the Java version does) in Block format 'B' version 2, read by
+"foo", as the Java version does) in Block format 'B' version 3, read by
 block_reader.py and BlockReader.java.
 
     python3 block_writer.py [image]
@@ -36,7 +36,7 @@ from java_io import DataOutput
 
 SURVEYED = -1
 FORMAT_ID = ord('B')
-FORMAT_VERSION = 2   # 2: block maps carry their predictor ids (delta_mapper.write_map)
+FORMAT_VERSION = 3   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps
 
 
 def best_set(channel_sum):
@@ -122,6 +122,7 @@ class BlockCoder:
         survey = dm.survey_block_sets([qc[i] for i in ids], size[0], size[1])
         self.survey_ids = survey.ids
         print(survey.report, end="")
+        print(dm.describe_group_use(survey, dm.get_block_deltas_by_cost([qc[i] for i in ids], size[0], size[1], survey.block, survey.ids)), end="")
         print("Survey took " + t.elapsed())
         use_survey = survey.bytes <= named
         print("Surveyed sets %s bytes, best named set (%s, block %d) %s bytes: using the %s."
@@ -151,18 +152,22 @@ class BlockCoder:
         if self.block_set == SURVEYED and self.survey_ids is not None:
             surveyed = dm.get_block_deltas_by_cost([qc[j] for j in ids], w, h, self.block_size, self.survey_ids)
 
+        raw = [None] * 3   # decoded, before the minimum: the next channel's reference
+
         def channel(i):
             j = ids[i]
             if surveyed is not None:
                 d, m = surveyed[i]
             else:
-                d, m, _ = dm.get_deltas(qc[j], w, h, 13, 0, self.block_size, max(0, self.block_set))
+                d, m, _ = dm.get_deltas(qc[j], w, h, 13, 0, self.block_size, max(0, self.block_set),
+                                       ref=qc[ids[i - 1]] if i > 0 else None)
             deltas[i], maps[i] = d, m
-            ch = dm.get_values_from_deltas(d, w, h, self.channel_init[j], 13, m, 0)
+            ch = dm.get_values_from_deltas(d, w, h, self.channel_init[j], 13, m, 0, ref=raw[i - 1] if i > 0 else None)
+            raw[i] = ch
             if j > 2:
                 ch = ch + self.channel_min[j]
             decoded[i] = ch
-        vs.parallel(3, channel)
+        vs.channels(True, 3, channel)
         self.delta_list, self.map_list, self.delta_xdim = deltas, maps, w
 
         # As the reader: recombine the channel set first, then resize, then shift.

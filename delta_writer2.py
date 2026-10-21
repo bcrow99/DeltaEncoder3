@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-delta_writer2.py version 1.0 -- DeltaWriter2.java for Python (PySide6).
+delta_writer2.py version 2.0 -- DeltaWriter2.java for Python (PySide6).
 
 A streamlined Delta Writer. Its files are read by delta_reader.py (and
 DeltaReader.java): the header and per-channel layout are the same, with
@@ -39,7 +39,7 @@ from delta_writer import ENTROPY_NAMES, context_code, entropy_code, pack_and_com
 from java_io import DataOutput
 
 FORMAT_ID = ord('D')
-FORMAT_VERSION = 2   # 2: block maps carry their predictor ids (delta_mapper.write_map)
+FORMAT_VERSION = 3   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps
 
 # compress_type written to the header: String* (strings that don't compress
 # enough come back uncompressed from get_string_list). DeltaReader treats it like 2.
@@ -205,7 +205,7 @@ class DeltaCoder2:
         def channel(i):
             for t in range(N):
                 type_ = FIRST_DELTA_TYPE + t
-                d, m, _ = dm.get_deltas(qc[ids[i]], w, h, type_, self.scanline5_variant, self.block_size, self.block_set)
+                d, m, _ = dm.get_deltas(qc[ids[i]], w, h, type_, self.scanline5_variant, self.block_size, self.block_set, ref=qc[ids[i - 1]] if i > 0 else None)
                 m = np.asarray(m, dtype=np.uint8)
                 delta_bytes = pack_and_compress(d)
                 delta_bits[i][t] = sm.get_bitlength(delta_bytes)
@@ -331,9 +331,11 @@ class DeltaCoder2:
         ids = dm.get_channels(self.min_set_id)
         table, string, maps, deltas, decoded = ([None] * 3 for _ in range(5))
 
+        raw = [None] * 3   # decoded, before the minimum: the next channel's reference
+
         def channel(i):
             j = ids[i]
-            d, m, _ = dm.get_deltas(qc[j], w, h, self.delta_type, self.scanline5_variant, self.block_size, self.block_set)
+            d, m, _ = dm.get_deltas(qc[j], w, h, self.delta_type, self.scanline5_variant, self.block_size, self.block_set, ref=qc[ids[i - 1]] if i > 0 else None)
             maps[i] = m
             deltas[i] = d
             lo, bits, tbl, s = sm.get_string_list(d, True)
@@ -344,11 +346,12 @@ class DeltaCoder2:
             d2 = sm.unpack_strings(sm.decompress_strings(s), tbl, w * h, bits)
             d2[0] = 0
             d2[1:] += lo
-            ch = dm.get_values_from_deltas(d2, w, h, self.channel_init[j], self.delta_type, m, self.scanline5_variant)
+            ch = dm.get_values_from_deltas(d2, w, h, self.channel_init[j], self.delta_type, m, self.scanline5_variant, ref=raw[i - 1] if i > 0 else None)
+            raw[i] = ch
             if j > 2:
                 ch = ch + self.channel_min[j]
             decoded[i] = ch
-        vs.parallel(3, channel)
+        vs.channels(self.delta_type == 13, 3, channel)
         self.table, self.string, self.map, self.delta_list, self.delta_xdim = table, string, maps, deltas, w
 
         # As the reader: recombine the channel set first, then resize, then shift.
