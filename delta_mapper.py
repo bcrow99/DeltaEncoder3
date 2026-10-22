@@ -881,6 +881,49 @@ _CPUS = os.cpu_count() or 1
 _ROW_POOL = ThreadPoolExecutor(_CPUS)
 
 
+def _available_memory():
+    """Bytes of memory free for new work, or None if it can't be told."""
+    try:
+        import psutil
+        return int(psutil.virtual_memory().available)
+    except Exception:
+        pass
+    try:                                    # Linux
+        return os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
+    except (ValueError, OSError, AttributeError):
+        pass
+    try:                                    # Windows
+        import ctypes
+
+        class _Status(ctypes.Structure):
+            _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total_phys", ctypes.c_ulonglong),
+                        ("avail_phys", ctypes.c_ulonglong), ("total_page", ctypes.c_ulonglong), ("avail_page", ctypes.c_ulonglong),
+                        ("total_virtual", ctypes.c_ulonglong), ("avail_virtual", ctypes.c_ulonglong), ("avail_extended", ctypes.c_ulonglong)]
+        st = _Status()
+        st.length = ctypes.sizeof(_Status)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st)):
+            return int(st.avail_phys)
+    except Exception:
+        pass
+    return None
+
+
+def _bounded_map(fn, items, task_bytes):
+    """[fn(x) for x in items], as many at once as there are cores and as free
+    memory allows (each task needing about task_bytes): big images run fewer
+    trials at once instead of pushing the machine into swap. (Python has no
+    heap limit to raise; this is DeltaMapper.boundedParallel.)"""
+    items = list(items)
+    free = _available_memory()
+    if free is None:
+        free = 4 << 30                      # can't tell: assume 4 GB
+    workers = max(1, min(len(items), _CPUS, int(free * 0.6) // max(1, task_bytes)))
+    if workers == 1:
+        return [fn(x) for x in items]
+    with ThreadPoolExecutor(workers) as pool:
+        return list(pool.map(fn, items))
+
+
 def _in_bands(n, body):
     """body(lo, hi) over 0..n-1 in up to 2 x cores bands, in parallel."""
     k = max(1, min(n, 2 * _CPUS))
@@ -1657,19 +1700,18 @@ def find_best_block(channel, xdim, ydim, workers=None):
     n_sets = len(BLOCK_SET_NAMES)
     first = [0, 2, 4]
     table = [[-1] * len(BLOCK_SEARCH_SIZES) for _ in range(n_sets)]
+    task = 64 * xdim * ydim                 # a trial's deltas, maps and Context-coder arrays, 3 channels
     jobs = [(s, i) for s in range(n_sets) for i in first]
-    with ThreadPoolExecutor(workers) as pool:
-        for (s, i), v in zip(jobs, pool.map(lambda j: get_block_map_bytes(channel, xdim, ydim, BLOCK_SEARCH_SIZES[j[1]], j[0], ps), jobs)):
-            table[s][i] = v
+    for (s, i), v in zip(jobs, _bounded_map(lambda j: get_block_map_bytes(channel, xdim, ydim, BLOCK_SEARCH_SIZES[j[1]], j[0], ps), jobs, task)):
+        table[s][i] = v
     best_set, best_i = 0, first[0]
     for s in range(n_sets):
         for i in first:
             if table[s][i] < table[best_set][best_i]:
                 best_set, best_i = s, i
     more = [i for i in (best_i - 1, best_i + 1) if 0 <= i < len(BLOCK_SEARCH_SIZES) and table[best_set][i] < 0]
-    with ThreadPoolExecutor(workers) as pool:
-        for i, v in zip(more, pool.map(lambda i: get_block_map_bytes(channel, xdim, ydim, BLOCK_SEARCH_SIZES[i], best_set, ps), more)):
-            table[best_set][i] = v
+    for i, v in zip(more, _bounded_map(lambda i: get_block_map_bytes(channel, xdim, ydim, BLOCK_SEARCH_SIZES[i], best_set, ps), more, task)):
+        table[best_set][i] = v
     for i in range(len(BLOCK_SEARCH_SIZES)):
         if 0 <= table[best_set][i] < table[best_set][best_i]:
             best_i = i
@@ -1794,7 +1836,7 @@ def block_cost_table(ps, block, dc, ids=None, rows=None):
     ids = np.array(list(range(PREDICTORS)) if ids is None else ids, dtype=np.int64)
     bh = (ps.ydim - 1 + block - 1) // block
     rows = np.arange(bh, dtype=np.int64) if rows is None else np.asarray(rows, dtype=np.int64)
-    est = np.zeros(blocks_across(ps.xdim, block) * len(rows) * len(ids), dtype=np.int64)
+    est = np.zeros(blocks_across(ps.xdim, block) * len(rows) * len(ids), dtype=np.int32)   # as Java's int
     _in_bands(len(rows), lambda lo, hi: _block_cost_table(ps.v, ps.ref, ps.has_ref, ps.corr, ps.xdim, ps.ydim, block, dc.cost, dc.context,
                                                           dc.lo, dc.range, ids, TABLE_FIRST, TABLE_SECOND,
                                                           TABLE_PRIMITIVES, CROSS_BASE, BIAS_BASE, rows, lo, hi, est))
@@ -1863,12 +1905,12 @@ def greedy_cost_order(est, blocks, id_cost=None):
     P = PREDICTORS
     NL = _nlog2n_table(blocks)
     table = est.reshape(blocks, P)
-    total = table.sum(axis=0)
+    total = table.sum(axis=0, dtype=np.int64)
     first = int(np.argmin(total))
     order = [first]
     chosen = np.zeros(P, dtype=np.bool_)
     chosen[first] = True
-    cur = table[:, first].copy()
+    cur = table[:, first].astype(np.int64)
     assign = np.zeros(blocks, dtype=np.int64)
     count = np.zeros(P, dtype=np.int64)
     count[0] = blocks
@@ -2013,11 +2055,14 @@ def survey_block_sets(channel, xdim, ydim):
     tried, log = {}, []
     ps = pixel_sources(channel, xdim, ydim)
 
+    blocks4 = blocks_across(xdim, 4) * ((ydim - 1 + 3) // 4)
+    task = 160 * xdim * ydim + 4 * PREDICTORS * min(SURVEY_SAMPLE_BLOCKS, blocks4)
+
     def survey_sizes(sizes):
-        # The block sizes are independent: surveyed at the same time.
+        # The block sizes are independent: surveyed at the same time, as many
+        # as memory allows.
         logs = {b: [] for b in sizes}
-        with ThreadPoolExecutor(len(sizes)) as pool:
-            got = dict(zip(sizes, pool.map(lambda b: _survey_block_size(ps, b, logs[b]), sizes)))
+        got = dict(zip(sizes, _bounded_map(lambda b: _survey_block_size(ps, b, logs[b]), sizes, task)))
         for b in sizes:
             tried[b] = got[b]
             log.extend(logs[b])
