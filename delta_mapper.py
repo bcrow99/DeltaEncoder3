@@ -942,7 +942,7 @@ def _bias_context(a, b, c, d):
 def _bias_prepare(v, k, xdim, ctx, corr, bsum, bcount):
     a = v[k - 1]; b = v[k - xdim]; c = v[k - xdim - 1]; d = v[k - xdim + 1]
     t = _bias_context(a, b, c, d)
-    ctx[k] = t
+    ctx[0] = t
     for s in range(4):
         n = bcount[s, t]
         e = bsum[s, t]
@@ -957,7 +957,7 @@ def _bias_prepare(v, k, xdim, ctx, corr, bsum, bcount):
 @njit
 def _bias_commit(v, k, xdim, ctx, bsum, bcount, bias_base):
     a = v[k - 1]; b = v[k - xdim]; c = v[k - xdim - 1]; d = v[k - xdim + 1]
-    t = ctx[k]
+    t = ctx[0]
     for s in range(4):
         bsum[s, t] += v[k] - _block_predictor(bias_base[s], a, b, c, d)
         bcount[s, t] += 1
@@ -970,8 +970,8 @@ def _bias_commit(v, k, xdim, ctx, bsum, bcount, bias_base):
 def _bias_corrections(v, xdim, ydim, bias_base):
     """The encoder's bias corrections for the whole channel, [4, n]."""
     n = v.shape[0]
-    corr = np.zeros((4, n), dtype=np.int64)
-    ctx = np.zeros(n, dtype=np.int64)
+    corr = np.zeros((4, n), dtype=np.int16)   # |corr| <= the channel's range
+    ctx = np.zeros(1, dtype=np.int64)          # the current pixel's bias context
     bsum = np.zeros((4, 729), dtype=np.int64)
     bcount = np.zeros((4, 729), dtype=np.int64)
     for y in range(1, ydim):
@@ -1015,7 +1015,7 @@ def _primitive(q, v, ref, has_ref, corr, k, xdim, cross_base, bias_base):
         p = a + b - c if q == CLAMP_FIRST else a + d - b
         return max(lo, min(hi, p))
     s = q - BIAS_FIRST
-    return _block_predictor(bias_base[s], a, b, c, d) + corr[s, k]
+    return _block_predictor(bias_base[s], a, b, c, d) + np.int64(corr[s, k])
 
 
 @njit
@@ -1099,7 +1099,11 @@ def _block_choices(src, ref, has_ref, corr, xdim, ydim, block, ids, used, first,
 def get_block_deltas_from_values(src, ref, xdim, ydim, block, ids):
     """(deltas, map): each block takes the id with the smallest sum of |delta|
     (DeltaMapper.getBlockDeltasFromValues); ref is the previous channel or None."""
-    ps = PixelSource(src, ref, xdim, ydim)
+    return _block_deltas_from_values(PixelSource(src, ref, xdim, ydim), block, ids)
+
+
+def _block_deltas_from_values(ps, block, ids):
+    xdim, ydim = ps.xdim, ps.ydim
     ids = [int(i) for i in ids]
     arr = np.array(ids, dtype=np.int64)
     used = np.array(sorted(set(int(TABLE_FIRST[i]) for i in ids) | set(int(TABLE_SECOND[i]) for i in ids)), dtype=np.int64)
@@ -1118,8 +1122,8 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
     head = 2 + np.int64(mp[1])
     n = xdim * ydim
     dst = np.zeros(n, dtype=np.int64)
-    corr = np.zeros((4, n), dtype=np.int64)
-    ctx = np.zeros(n, dtype=np.int64)
+    corr = np.zeros((4, n), dtype=np.int16)
+    ctx = np.zeros(1, dtype=np.int64)
     bsum = np.zeros((4, 729), dtype=np.int64)
     bcount = np.zeros((4, 729), dtype=np.int64)
     dst[0] = init
@@ -1572,12 +1576,13 @@ def read_context_deltas(inp, n, previous, xdim):
 # Block-map settings search
 # =============================================================================
 
-def get_block_map_bytes(channel, xdim, ydim, block, block_set):
+def get_block_map_bytes(channel, xdim, ydim, block, block_set, ps=None):
     """Bytes the three channels take as block-map deltas (Context coded)
-    plus their maps, as the writers save them."""
+    plus their maps, as the writers save them (ps: their PixelSources)."""
+    ps = pixel_sources(channel, xdim, ydim) if ps is None else ps
     d, m = [], []
-    for i, c in enumerate(channel):
-        delta, mp = get_block_deltas_from_values(c, channel[i - 1] if i > 0 else None, xdim, ydim, block, get_set_ids(block_set))
+    for i in range(len(channel)):
+        delta, mp = _block_deltas_from_values(ps[i], block, get_set_ids(block_set))
         d.append(delta); m.append(mp)
     total = 0
     for i in range(3):
@@ -1591,12 +1596,13 @@ def find_best_block(channel, xdim, ydim, workers=None):
     smallest: every set at sizes 4, 8 and 16, then the best set at the
     untried sizes next to its best. Returns ((block, set), bytes) where
     bytes[set][size index] is -1 for sizes not tried."""
+    ps = pixel_sources(channel, xdim, ydim)
     n_sets = len(BLOCK_SET_NAMES)
     first = [0, 2, 4]
     table = [[-1] * len(BLOCK_SEARCH_SIZES) for _ in range(n_sets)]
     jobs = [(s, i) for s in range(n_sets) for i in first]
     with ThreadPoolExecutor(workers) as pool:
-        for (s, i), v in zip(jobs, pool.map(lambda j: get_block_map_bytes(channel, xdim, ydim, BLOCK_SEARCH_SIZES[j[1]], j[0]), jobs)):
+        for (s, i), v in zip(jobs, pool.map(lambda j: get_block_map_bytes(channel, xdim, ydim, BLOCK_SEARCH_SIZES[j[1]], j[0], ps), jobs)):
             table[s][i] = v
     best_set, best_i = 0, first[0]
     for s in range(n_sets):
@@ -1605,7 +1611,7 @@ def find_best_block(channel, xdim, ydim, workers=None):
                 best_set, best_i = s, i
     more = [i for i in (best_i - 1, best_i + 1) if 0 <= i < len(BLOCK_SEARCH_SIZES) and table[best_set][i] < 0]
     with ThreadPoolExecutor(workers) as pool:
-        for i, v in zip(more, pool.map(lambda i: get_block_map_bytes(channel, xdim, ydim, BLOCK_SEARCH_SIZES[i], best_set), more)):
+        for i, v in zip(more, pool.map(lambda i: get_block_map_bytes(channel, xdim, ydim, BLOCK_SEARCH_SIZES[i], best_set, ps), more)):
             table[best_set][i] = v
     for i in range(len(BLOCK_SEARCH_SIZES)):
         if 0 <= table[best_set][i] < table[best_set][best_i]:
@@ -1625,6 +1631,7 @@ def find_best_block(channel, xdim, ydim, workers=None):
 SURVEY_COUNTS = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64, 80, 96, 128, 160, 192, 255]
 SURVEY_REFERENCE_SET = 3            # Top 32
 SURVEY_ID_COST = 8 * 256            # a predictor id in the map header, 1/256 bits
+SURVEY_SAMPLE_BLOCKS = 1 << 17      # blocks the greedy order is found on, at most
 _LOG2 = math.log(2)
 
 
@@ -1673,12 +1680,13 @@ class DeltaCost:
 
 
 @njit
-def _block_cost_table(src, ref, has_ref, corr, xdim, ydim, block, cost, ctx, lo, rng, pids, first, second, n_prim, cross_base, bias_base, by0, by1, est):
-    """Block rows by0..by1-1 of the cost table, into est."""
+def _block_cost_table(src, ref, has_ref, corr, xdim, ydim, block, cost, ctx, lo, rng, pids, first, second, n_prim, cross_base, bias_base, rows, r0, r1, est):
+    """Block rows rows[r0..r1-1] of the cost table, into est[(r * bw + bx) * n + q]."""
     n = pids.shape[0]
     bw = (xdim - 2 + block - 1) // block
     prim = np.zeros(n_prim, dtype=np.int64)
-    for by in range(by0, by1):
+    for r in range(r0, r1):
+        by = rows[r]
         y0 = 1 + by * block
         y1 = min(ydim, y0 + block)
         for y in range(y0, y1):
@@ -1688,7 +1696,7 @@ def _block_cost_table(src, ref, has_ref, corr, xdim, ydim, block, cost, ctx, lo,
                 c = ctx[k]
                 for q in range(n_prim):
                     prim[q] = _primitive(q, src, ref, has_ref, corr, k, xdim, cross_base, bias_base)
-                base = (by * bw + (x - 1) // block) * n
+                base = (r * bw + (x - 1) // block) * n
                 for q in range(n):
                     i = first[pids[q]]
                     j = second[pids[q]]
@@ -1696,16 +1704,69 @@ def _block_cost_table(src, ref, has_ref, corr, xdim, ydim, block, cost, ctx, lo,
                     est[base + q] += cost[c, min(rng - 1, max(0, s - v - lo))]
 
 
-def block_cost_table(ps, block, dc, ids=None):
+@njit
+def _prefix_maps(src, ref, has_ref, corr, xdim, ydim, block, cost, ctx, lo, rng, pids, first, second, n_prim, cross_base, bias_base,
+                 counts, heads, by0, by1, maps):
+    """Block rows by0..by1-1 of the prefix maps (DeltaMapper.prefixMaps): row c
+    of maps is the map for the first counts[c] ids, entries from heads[c]."""
+    n = pids.shape[0]
+    bw = (xdim - 2 + block - 1) // block
+    est = np.zeros(bw * n, dtype=np.int64)
+    rows = np.zeros(1, dtype=np.int64)
+    for by in range(by0, by1):
+        est[:] = 0
+        rows[0] = by
+        _block_cost_table(src, ref, has_ref, corr, xdim, ydim, block, cost, ctx, lo, rng, pids, first, second, n_prim,
+                          cross_base, bias_base, rows, 0, 1, est)
+        for bx in range(bw):
+            best = 0
+            c = 0
+            for q in range(n):
+                if c >= counts.shape[0]:
+                    break
+                if est[bx * n + q] < est[bx * n + best]:
+                    best = q
+                while c < counts.shape[0] and counts[c] == q + 1:
+                    maps[c, heads[c] + by * bw + bx] = best
+                    c += 1
+
+
+def block_cost_table(ps, block, dc, ids=None, rows=None):
     """Estimated bits (1/256) of each predictor in each block, as
-    [block * n + q] for the ids given, or for every id (ids None)."""
+    [block * n + q] for the ids given, or for every id (ids None); for the
+    given block rows only (rows), or all of them."""
     ids = np.array(list(range(PREDICTORS)) if ids is None else ids, dtype=np.int64)
     bh = (ps.ydim - 1 + block - 1) // block
-    est = np.zeros(blocks_across(ps.xdim, block) * bh * len(ids), dtype=np.int64)
-    _in_bands(bh, lambda lo, hi: _block_cost_table(ps.v, ps.ref, ps.has_ref, ps.corr, ps.xdim, ps.ydim, block, dc.cost, dc.context,
-                                                   dc.lo, dc.range, ids, TABLE_FIRST, TABLE_SECOND,
-                                                   TABLE_PRIMITIVES, CROSS_BASE, BIAS_BASE, lo, hi, est))
+    rows = np.arange(bh, dtype=np.int64) if rows is None else np.asarray(rows, dtype=np.int64)
+    est = np.zeros(blocks_across(ps.xdim, block) * len(rows) * len(ids), dtype=np.int64)
+    _in_bands(len(rows), lambda lo, hi: _block_cost_table(ps.v, ps.ref, ps.has_ref, ps.corr, ps.xdim, ps.ydim, block, dc.cost, dc.context,
+                                                          dc.lo, dc.range, ids, TABLE_FIRST, TABLE_SECOND,
+                                                          TABLE_PRIMITIVES, CROSS_BASE, BIAS_BASE, rows, lo, hi, est))
     return est
+
+
+def prefix_maps(ps, block, dc, ids, counts):
+    """Block maps for the first counts[c] of ids, each block taking the first
+    id of the prefix with the smallest estimate, one block row at a time
+    (DeltaMapper.prefixMaps)."""
+    bw = blocks_across(ps.xdim, block)
+    bh = (ps.ydim - 1 + block - 1) // block
+    ids = [int(i) for i in ids]
+    width = 2 + max(counts) + bw * bh
+    maps = np.zeros((len(counts), width), dtype=np.uint8)
+    heads = np.array([2 + c for c in counts], dtype=np.int64)
+    arr = np.array(ids, dtype=np.int64)
+    _in_bands(bh, lambda lo, hi: _prefix_maps(ps.v, ps.ref, ps.has_ref, ps.corr, ps.xdim, ps.ydim, block, dc.cost, dc.context,
+                                              dc.lo, dc.range, arr, TABLE_FIRST, TABLE_SECOND, TABLE_PRIMITIVES, CROSS_BASE, BIAS_BASE,
+                                              np.array(counts, dtype=np.int64), heads, lo, hi, maps))
+    out = []
+    for c, m in enumerate(counts):
+        mp = maps[c, :2 + m + bw * bh].copy()
+        mp[0] = block
+        mp[1] = m
+        mp[2:2 + m] = ids[:m]
+        out.append(mp)
+    return out
 
 
 def _nlog2n_table(n):
@@ -1738,9 +1799,11 @@ def _greedy_cost_gains(est, blocks, cur, assign, count, chosen, n, NL, map_old, 
         gain[p] = save - (map_new - map_old) - id_cost
 
 
-def greedy_cost_order(est, blocks):
+def greedy_cost_order(est, blocks, id_cost=None):
     """Predictor ids in greedy order over a block_cost_table of every id
-    (DeltaMapper.greedyCostOrder)."""
+    (DeltaMapper.greedyCostOrder); id_cost, the cost of an id in the map
+    header, is scaled down when est covers only a sample of the blocks."""
+    id_cost = SURVEY_ID_COST if id_cost is None else id_cost
     P = PREDICTORS
     NL = _nlog2n_table(blocks)
     table = est.reshape(blocks, P)
@@ -1758,7 +1821,7 @@ def greedy_cost_order(est, blocks):
         map_old = int(NL[blocks]) - int(NL[count[:n]].sum())
         gain = np.zeros(P, dtype=np.int64)
         _in_bands(P, lambda lo, hi: _greedy_cost_gains(est, blocks, cur, assign, count, chosen, n, NL, map_old,
-                                                       SURVEY_ID_COST, lo, hi, gain))
+                                                       id_cost, lo, hi, gain))
         best = -1
         for p in range(P):
             if not chosen[p] and (best < 0 or gain[p] > gain[best]):
@@ -1792,22 +1855,31 @@ def _assign_by_cost(est, stride, cols, ids, xdim, ydim, block):
     return mp
 
 
-def _channel_cost(src, previous_channel, xdim, ydim, block, chosen_before):
-    ref, _ = get_block_deltas_from_values(src, previous_channel, xdim, ydim, block, get_set_ids(SURVEY_REFERENCE_SET))
-    return DeltaCost(src, ref, chosen_before, xdim, ydim)
+def pixel_sources(channel, xdim, ydim):
+    """Each channel's PixelSource, with the channel before it as reference."""
+    ps = [None] * len(channel)
+
+    def one(i):
+        ps[i] = PixelSource(channel[i], channel[i - 1] if i > 0 else None, xdim, ydim)
+    for f in [_ROW_POOL.submit(one, i) for i in range(len(channel))]:
+        f.result()
+    return ps
+
+
+def _channel_cost(ps, block, chosen_before):
+    ref, _ = _block_deltas_from_values(ps, block, get_set_ids(SURVEY_REFERENCE_SET))
+    return DeltaCost(ps.v, ref, chosen_before, ps.xdim, ps.ydim)
 
 
 def get_block_deltas_by_cost(channel, xdim, ydim, block, ids):
     """Each channel's (deltas, map) for its predictor ids, blocks assigned
     by estimated cost as the survey does (DeltaMapper.getBlockDeltasByCost)."""
     result, delta = [], []
-    for i, c in enumerate(channel):
-        prev = channel[i - 1] if i > 0 else None
-        dc = _channel_cost(c, prev, xdim, ydim, block, delta[:i])
-        ps = PixelSource(c, prev, xdim, ydim)
-        est = block_cost_table(ps, block, dc, ids[i])
-        mp = _assign_by_cost(est, len(ids[i]), np.arange(len(ids[i])), ids[i], xdim, ydim, block)
-        d = get_block_deltas_from_map(ps, mp, ids[i])
+    ps = pixel_sources(channel, xdim, ydim)
+    for i in range(len(channel)):
+        dc = _channel_cost(ps[i], block, delta[:i])
+        mp = prefix_maps(ps[i], block, dc, ids[i], [len(ids[i])])[0]
+        d = get_block_deltas_from_map(ps[i], mp, ids[i])
         result.append((d, mp))
         delta.append(d)
     return result
@@ -1821,24 +1893,35 @@ class BlockSurvey:
         self.report = ""
 
 
-def _survey_block_size(channel, xdim, ydim, block, log):
+def _survey_block_size(ps, block, log):
+    xdim, ydim = ps[0].xdim, ps[0].ydim
     result = BlockSurvey(block)
     delta, mp = [None] * 3, [None] * 3
-    blocks = blocks_across(xdim, block) * ((ydim - 1 + block - 1) // block)
-    log.append("  block %d:" % block)
+    bw = blocks_across(xdim, block)
+    bh = (ydim - 1 + block - 1) // block
+    blocks = bw * bh
+    # Big images: the greedy order is found on every step-th block row (at
+    # most SURVEY_SAMPLE_BLOCKS blocks), the id's cost scaled to match; the
+    # maps are then made over every block.
+    step = (blocks + SURVEY_SAMPLE_BLOCKS - 1) // SURVEY_SAMPLE_BLOCKS if blocks > SURVEY_SAMPLE_BLOCKS else 1
+    rows = np.arange(0, bh, step, dtype=np.int64)
+    sampled = len(rows) * bw
+    log.append("  block %d%s:" % (block, " (order from %s of %s blocks)" % (format(sampled, ","), format(blocks, ",")) if step > 1 else ""))
     for i in range(3):
-        prev = channel[i - 1] if i > 0 else None
-        dc = _channel_cost(channel[i], prev, xdim, ydim, block, delta[:i])
-        ps = PixelSource(channel[i], prev, xdim, ydim)
-        est = block_cost_table(ps, block, dc)
-        order = greedy_cost_order(est, blocks)
+        dc = _channel_cost(ps[i], block, delta[:i])
+        est = block_cost_table(ps[i], block, dc, rows=rows)
+        order = greedy_cost_order(est, sampled, SURVEY_ID_COST * sampled // blocks)
         counts = [c for c in SURVEY_COUNTS if c < len(order)] + [len(order)]
+        prefix = None
+        if step > 1:
+            est = None
+            prefix = prefix_maps(ps[i], block, dc, order, counts)
         best_bytes, worse = None, 0
         line = "    channel %d (order %d):" % (i, len(order))
-        for n in counts:
+        for c, n in enumerate(counts):
             ids = order[:n]
-            m = _assign_by_cost(est, PREDICTORS, np.array(ids, dtype=np.int64), ids, xdim, ydim, block)
-            d = get_block_deltas_from_map(ps, m, ids)
+            m = prefix[c] if prefix is not None else _assign_by_cost(est, PREDICTORS, np.array(ids, dtype=np.int64), ids, xdim, ydim, block)
+            d = get_block_deltas_from_map(ps[i], m, ids)
             size = map_bytes(13, m, mp[i - 1] if i > 0 else None, xdim) + len(pack_context_deltas(d, delta[:i], xdim))
             line += " %d:%s" % (n, format(size, ","))
             if best_bytes is None or size < best_bytes:
@@ -1861,12 +1944,13 @@ def survey_block_sets(channel, xdim, ydim):
     than the best; block sizes 4, 8, 16, then the untried sizes next to the
     best."""
     tried, log = {}, []
+    ps = pixel_sources(channel, xdim, ydim)
 
     def survey_sizes(sizes):
         # The block sizes are independent: surveyed at the same time.
         logs = {b: [] for b in sizes}
         with ThreadPoolExecutor(len(sizes)) as pool:
-            got = dict(zip(sizes, pool.map(lambda b: _survey_block_size(channel, xdim, ydim, b, logs[b]), sizes)))
+            got = dict(zip(sizes, pool.map(lambda b: _survey_block_size(ps, b, logs[b]), sizes)))
         for b in sizes:
             tried[b] = got[b]
             log.extend(logs[b])
