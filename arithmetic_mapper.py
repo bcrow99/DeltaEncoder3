@@ -332,13 +332,46 @@ def get_arithmetic_values_adaptive(encoded, n):
 
 @njit
 def _context_encode(symbol, n_symbols, context, n_contexts, top):
+    # The range coder of _encode / _shift_low with its state in local
+    # variables (kept in registers; the same bytes, about twice as fast).
     f, bit, total = _models(n_contexts, n_symbols)
-    st, out = _enc_init(symbol.shape[0] // 2)
-    for k in range(symbol.shape[0]):
+    n = symbol.shape[0]
+    out = np.zeros(max(16, n // 2 + n // 8 + 16), dtype=np.uint8)
+    low = np.int64(0)
+    rng = np.int64(RANGE_TOP - 1)
+    cache = np.int64(0)
+    csize = np.int64(1)
+    size = 0
+    for k in range(n):
         c = context[k]
         s = symbol[k]
-        out = _encode(st, out, _model_start(bit, c, s), f[c, s], total[c])
+        start = _model_start(bit, c, s)
+        r = rng // total[c]
+        low += start * r
+        rng = np.int64(f[c, s]) * r
+        while rng < RANGE_BOTTOM:
+            rng <<= 8
+            # shift low
+            if low < 0xFF00000000 or low >= RANGE_TOP:
+                carry = low >> 40
+                temp = cache
+                while True:
+                    if size == out.shape[0]:
+                        bigger = np.zeros(out.shape[0] * 2, dtype=np.uint8)
+                        bigger[:size] = out
+                        out = bigger
+                    out[size] = (temp + carry) & 0xFF
+                    size += 1
+                    temp = 0xFF
+                    csize -= 1
+                    if csize == 0:
+                        break
+                cache = (low >> 32) & 0xFF
+            csize += 1
+            low = (low & 0xFFFFFFFF) << 8
         _model_update(f, bit, total, c, n_symbols, s, CONTEXT_INCREMENT, CONTEXT_LIMIT)
+    st = np.zeros(5, dtype=np.int64)
+    st[0] = low; st[1] = rng; st[2] = cache; st[3] = csize; st[4] = size
     return _finish(st, out)
 
 

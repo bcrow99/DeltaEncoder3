@@ -1019,6 +1019,53 @@ def _primitive(q, v, ref, has_ref, corr, k, xdim, cross_base, bias_base):
 
 
 @njit
+def _all_primitives(v, ref, has_ref, corr, k, xdim, prim):
+    """Every primitive (0..ALL_PRIMITIVES-1) at interior pixel k, into prim:
+    the same values as _primitive, in one straight pass (the neighbours read
+    once, no dispatch)."""
+    a = v[k - 1]; b = v[k - xdim]; c = v[k - xdim - 1]; d = v[k - xdim + 1]
+    prim[0] = a; prim[1] = b; prim[2] = c; prim[3] = d
+    prim[4] = (a + b) >> 1; prim[5] = (b + c) >> 1; prim[6] = (a + c) >> 1; prim[7] = (b + d) >> 1
+    prim[8] = (c + d) >> 1; prim[9] = (a + b + c + d + 2) >> 2; prim[10] = a + b - c
+    med = _med(a, b, c)
+    prim[11] = med
+    prim[12] = (a * 3 + b + 2) >> 2; prim[13] = (a + b * 3 + 2) >> 2; prim[14] = (a * 3 + d + 2) >> 2; prim[15] = (b * 3 + a + 2) >> 2
+    prim[16] = (a + d) >> 1; prim[17] = a + ((b - c) >> 1); prim[18] = b + ((a - c) >> 1); prim[19] = a + d - b
+    prim[20] = jdiv(a + b + d + 1, 3); prim[21] = b + ((d - c) >> 1)
+    q = a + b - c
+    pa = abs(q - a); pb = abs(q - b); pc = abs(q - c)
+    prim[22] = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+    prim[23] = _median3(a, b, c); prim[24] = _median3(a, b, d); prim[25] = _median3(a, d, a + d - b)
+    prim[26] = a if abs(b - c) <= abs(a - c) else b
+    h = abs(b - c); vv = abs(a - c); g = abs(a - b)
+    prim[27] = a if (h <= vv and h <= g) else (b if vv <= g else d)
+    # cross-channel: base P = a, b, d, MED, (a+b)/2, a+b-c, then MED and (a+b)/2 with half the error
+    if has_ref:
+        r = ref[k]; ra = ref[k - 1]; rb = ref[k - xdim]; rc = ref[k - xdim - 1]; rd = ref[k - xdim + 1]
+        e_med = r - _med(ra, rb, rc)
+        e_avg = r - ((ra + rb) >> 1)
+        prim[28] = a + (r - ra); prim[29] = b + (r - rb); prim[30] = d + (r - rd); prim[31] = med + e_med
+        prim[32] = prim[4] + e_avg; prim[33] = prim[10] + (r - (ra + rb - rc))
+        prim[34] = med + (e_med >> 1); prim[35] = prim[4] + (e_avg >> 1)
+    else:
+        prim[28] = a; prim[29] = b; prim[30] = d; prim[31] = med; prim[32] = prim[4]; prim[33] = prim[10]
+        prim[34] = med; prim[35] = prim[4]
+    x = k % xdim
+    y = k // xdim
+    aa = v[k - 2] if x >= 2 else a
+    bb = v[k - 2 * xdim] if y >= 2 else b
+    nne = v[k - 2 * xdim + 1] if y >= 2 else d
+    prim[36] = 2 * a - aa; prim[37] = 2 * b - bb
+    prim[38] = _gap(a, aa, b, bb, c, d, nne, 80, 32, 8)
+    prim[39] = _gap(a, aa, b, bb, c, d, nne, 10, 4, 1)
+    lo = min(min(a, b), min(c, d))
+    hi = max(max(a, b), max(c, d))
+    prim[40] = max(lo, min(hi, a + b - c)); prim[41] = max(lo, min(hi, a + d - b))
+    prim[42] = med + np.int64(corr[0, k]); prim[43] = prim[4] + np.int64(corr[1, k])
+    prim[44] = a + np.int64(corr[2, k]); prim[45] = b + np.int64(corr[3, k])
+
+
+@njit
 def _predict(pid, first, second, v, ref, has_ref, corr, k, xdim, cross_base, bias_base):
     i = first[pid]
     j = second[pid]
@@ -1046,11 +1093,16 @@ def _block_from_map(src, ref, has_ref, corr, xdim, y0, y1, mp, ids, first, secon
     block = np.int64(mp[0])
     bw = (xdim - 2 + block - 1) // block
     head = 2 + np.int64(mp[1])
+    prim = np.zeros(ALL_PRIMITIVES, dtype=np.int64)   # all of them: faster than computing two by dispatch
     for y in range(y0, y1):
         row = head + (y - 1) // block * bw
         for x in range(1, xdim - 1):
             k = y * xdim + x
-            dst[k] = src[k] - _predict(ids[mp[row + (x - 1) // block]], first, second, src, ref, has_ref, corr, k, xdim, cross_base, bias_base)
+            _all_primitives(src, ref, has_ref, corr, k, xdim, prim)
+            pid = ids[mp[row + (x - 1) // block]]
+            i = first[pid]
+            j = second[pid]
+            dst[k] = src[k] - (prim[i] if i == j else (prim[i] + prim[j] + 1) >> 1)
 
 
 def get_block_deltas_from_map(ps, mp, ids=None):
@@ -1072,7 +1124,7 @@ def _block_choices(src, ref, has_ref, corr, xdim, ydim, block, ids, used, first,
     bw = (xdim - 2 + block - 1) // block
     n = ids.shape[0]
     sums = np.zeros(bw * n, dtype=np.int64)
-    prim = np.zeros(n_prim, dtype=np.int64)
+    prim = np.zeros(ALL_PRIMITIVES, dtype=np.int64)
     for by in range(by0, by1):
         sums[:] = 0
         y0 = 1 + by * block
@@ -1080,8 +1132,7 @@ def _block_choices(src, ref, has_ref, corr, xdim, ydim, block, ids, used, first,
         for y in range(y0, y1):
             for x in range(1, xdim - 1):
                 k = y * xdim + x
-                for u in range(used.shape[0]):
-                    prim[used[u]] = _primitive(used[u], src, ref, has_ref, corr, k, xdim, cross_base, bias_base)
+                _all_primitives(src, ref, has_ref, corr, k, xdim, prim)
                 base = (x - 1) // block * n
                 for p in range(n):
                     i = first[ids[p]]
@@ -1126,6 +1177,7 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
     ctx = np.zeros(1, dtype=np.int64)
     bsum = np.zeros((4, 729), dtype=np.int64)
     bcount = np.zeros((4, 729), dtype=np.int64)
+    prim = np.zeros(ALL_PRIMITIVES, dtype=np.int64)
     dst[0] = init
     for x in range(1, xdim):
         dst[x] = dst[x - 1] + delta[x]
@@ -1136,7 +1188,11 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
         for x in range(1, xdim - 1):
             k += 1
             _bias_prepare(dst, k, xdim, ctx, corr, bsum, bcount)
-            dst[k] = delta[k] + _predict(ids[mp[row + (x - 1) // block]], first, second, dst, ref, has_ref, corr, k, xdim, cross_base, bias_base)
+            _all_primitives(dst, ref, has_ref, corr, k, xdim, prim)
+            pid = ids[mp[row + (x - 1) // block]]
+            i = first[pid]
+            j = second[pid]
+            dst[k] = delta[k] + (prim[i] if i == j else (prim[i] + prim[j] + 1) >> 1)
             _bias_commit(dst, k, xdim, ctx, bsum, bcount, bias_base)
         k += 1
         dst[k] = dst[k - 1] + delta[k]
@@ -1521,11 +1577,10 @@ def _delta_context(d, previous, k, xdim, act_limit, cross_limit):
 
 
 @njit
-def _delta_contexts(d, previous, xdim, act_limit, cross_limit):
-    ctx = np.zeros(d.shape[0], dtype=np.int64)
-    for k in range(d.shape[0]):
+def _delta_contexts(d, previous, xdim, act_limit, cross_limit, k0, k1, ctx):
+    """Contexts of deltas k0..k1-1, into ctx."""
+    for k in range(k0, k1):
         ctx[k] = _delta_context(d, previous, k, xdim, act_limit, cross_limit)
-    return ctx
 
 
 @njit
@@ -1555,7 +1610,9 @@ def pack_context_deltas(delta, previous, xdim):
     rank = np.zeros(len(count), dtype=np.int64)
     rank[order] = np.arange(len(count))
     symbol = rank[delta - lo]
-    ctx = _delta_contexts(delta, _previous_2d(previous, len(delta)), xdim, ACTIVITY_LIMIT, CROSS_LIMIT)
+    prev2d = _previous_2d(previous, len(delta))
+    ctx = np.zeros(len(delta), dtype=np.int64)
+    _in_bands(len(delta), lambda k0, k1: _delta_contexts(delta, prev2d, xdim, ACTIVITY_LIMIT, CROSS_LIMIT, k0, k1, ctx))
     coded = am.get_interval_value_context(symbol, len(rank), ctx, CONTEXTS)
     out = DataOutput()
     out.write_int(lo); write_table(out, rank); out.write_int(len(coded)); out.write(coded.tobytes())
@@ -1684,7 +1741,7 @@ def _block_cost_table(src, ref, has_ref, corr, xdim, ydim, block, cost, ctx, lo,
     """Block rows rows[r0..r1-1] of the cost table, into est[(r * bw + bx) * n + q]."""
     n = pids.shape[0]
     bw = (xdim - 2 + block - 1) // block
-    prim = np.zeros(n_prim, dtype=np.int64)
+    prim = np.zeros(ALL_PRIMITIVES, dtype=np.int64)
     for r in range(r0, r1):
         by = rows[r]
         y0 = 1 + by * block
@@ -1694,8 +1751,7 @@ def _block_cost_table(src, ref, has_ref, corr, xdim, ydim, block, cost, ctx, lo,
                 k = y * xdim + x
                 s = src[k]
                 c = ctx[k]
-                for q in range(n_prim):
-                    prim[q] = _primitive(q, src, ref, has_ref, corr, k, xdim, cross_base, bias_base)
+                _all_primitives(src, ref, has_ref, corr, k, xdim, prim)
                 base = (r * bw + (x - 1) // block) * n
                 for q in range(n):
                     i = first[pids[q]]
@@ -1818,25 +1874,36 @@ def greedy_cost_order(est, blocks, id_cost=None):
     count[0] = blocks
     while len(order) < min(P, 255):     # a set has at most 255 ids
         n = len(order)
-        map_old = int(NL[blocks]) - int(NL[count[:n]].sum())
+        map_old = int(NL[blocks]) - int(NL[count[:n]].sum())   # (n numbers: cheap)
         gain = np.zeros(P, dtype=np.int64)
         _in_bands(P, lambda lo, hi: _greedy_cost_gains(est, blocks, cur, assign, count, chosen, n, NL, map_old,
                                                        id_cost, lo, hi, gain))
-        best = -1
-        for p in range(P):
-            if not chosen[p] and (best < 0 or gain[p] > gain[best]):
-                best = p
-        if gain[best] <= 0:
+        best = _greedy_step(est, P, blocks, gain, chosen, n, cur, assign, count)
+        if best < 0:
             break
-        chosen[best] = True
         order.append(best)
-        col = table[:, best]
-        better = col < cur
-        np.subtract.at(count, assign[better], 1)
-        count[n] += int(better.sum())
-        assign[better] = n
-        cur = np.where(better, col, cur)
     return order
+
+
+@njit
+def _greedy_step(est, P, blocks, gain, chosen, n, cur, assign, count):
+    """The predictor with the largest gain (first on ties), or -1 if no gain
+    is positive; else adds it: blocks it estimates cheaper move to it (index n)."""
+    best = -1
+    for p in range(P):
+        if not chosen[p] and (best < 0 or gain[p] > gain[best]):
+            best = p
+    if gain[best] <= 0:
+        return -1
+    chosen[best] = True
+    for b in range(blocks):
+        e = est[b * P + best]
+        if e < cur[b]:
+            cur[b] = e
+            count[assign[b]] -= 1
+            assign[b] = n
+            count[n] += 1
+    return best
 
 
 def _assign_by_cost(est, stride, cols, ids, xdim, ydim, block):
