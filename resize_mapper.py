@@ -1,5 +1,5 @@
 """
-resize_mapper.py -- ResizeMapper.java (resize, resizeX2, resizeY2): the
+resize_mapper.py -- ResizeMapper.java (resize, resizeX, resizeY): the
 Pixel Resolution resize, by dropping (shrink) or inserting averaged (grow)
 columns and rows at evenly spaced points.
 
@@ -16,8 +16,7 @@ from numba_support import njit, jdiv
 @njit
 def _long_segments(number_of_segments, remainder):
     is_long = np.zeros(number_of_segments, dtype=np.bool_)
-    interval = 1.0 / (remainder + 1)
-    increment = int(interval * number_of_segments)
+    increment = number_of_segments // (remainder + 1)
     index = increment
     for _ in range(remainder):
         is_long[index] = True
@@ -26,7 +25,7 @@ def _long_segments(number_of_segments, remainder):
 
 
 @njit
-def resize_x2(src, xdim, new_xdim):
+def resize_x(src, xdim, new_xdim):
     ydim = src.shape[0] // xdim
     dst = np.zeros(new_xdim * ydim, dtype=np.int64)
     if new_xdim == xdim:
@@ -132,6 +131,8 @@ def resize_x2(src, xdim, new_xdim):
                         dst[m] = jdiv(src[k] + src[k - 1], 2); m += 1
                         start = stop
                         stop = start + segment_length
+                    if is_long[number_of_segments - 1]:   # the last segment can be a long one too
+                        stop += 1
                     k = start
                     while k < stop:
                         dst[m] = src[k]; m += 1; k += 1
@@ -140,7 +141,7 @@ def resize_x2(src, xdim, new_xdim):
 
 
 @njit
-def resize_y2(src, xdim, new_ydim):
+def resize_y(src, xdim, new_ydim):
     ydim = src.shape[0] // xdim
     dst = np.zeros(xdim * new_ydim, dtype=np.int64)
     if new_ydim == ydim:
@@ -264,5 +265,5 @@ def resize(src, xdim, new_xdim, new_ydim):
     """Resizes a flat xdim-wide channel to new_xdim x new_ydim."""
     src = np.asarray(src, dtype=np.int64)
     if new_xdim < xdim:
-        return resize_y2(resize_x2(src, xdim, new_xdim), new_xdim, new_ydim)
-    return resize_x2(resize_y2(src, xdim, new_ydim), xdim, new_xdim)
+        return resize_y(resize_x(src, xdim, new_xdim), new_xdim, new_ydim)
+    return resize_x(resize_y(src, xdim, new_ydim), xdim, new_xdim)
