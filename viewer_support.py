@@ -17,9 +17,12 @@ logical pixel, which is what the Java version's "Actual Size" does.
 The program exits when its last window closes (Qt's default).
 """
 
+import os
+import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+import faulthandler
 
 import numpy as np
 
@@ -28,6 +31,13 @@ from PySide6.QtGui import QImage, QPainter, QAction, QKeySequence, QGuiApplicati
 from PySide6.QtWidgets import (QMainWindow, QScrollArea, QWidget, QDialog, QSlider, QLineEdit,
                                QHBoxLayout, QVBoxLayout, QLabel, QSpinBox, QRadioButton,
                                QButtonGroup, QMessageBox, QApplication)
+
+# Diagnostics: with the environment variable DELTA_STACKS set to a number of
+# seconds, every thread's Python stack is printed to the console after that
+# long, and again every so often, so a hang shows where it is waiting.
+if os.environ.get("DELTA_STACKS"):
+    faulthandler.dump_traceback_later(float(os.environ["DELTA_STACKS"]), repeat=True, file=sys.stderr)
+
 
 ZOOM_FACTOR = 1.25
 ZOOM_MIN = 0.05
@@ -42,14 +52,17 @@ MIN_DIM = 4
 
 def read_image(filename):
     """Reads an image as an (ydim, xdim, 3) uint8 array in R, G, B order
-    (gray images are copied to all three; alpha is dropped). Raises IOError
+    (gray images are copied to all three; alpha is dropped; an EXIF
+    orientation tag is ignored, as in Java). Raises IOError
     with a message for the user if the file can't be used."""
     import cv2
     try:
         data = np.fromfile(filename, dtype=np.uint8)      # works with any path on Windows too
     except OSError as e:
         raise IOError("Can't read %s: %s" % (filename, e))
-    bgr = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    # Ignore any EXIF orientation tag, as Java's ImageIO does, so both
+    # programs code the same pixels in the same order.
+    bgr = cv2.imdecode(data, cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION)
     if bgr is None:
         raise IOError(filename + " is not an image format this program can read.")
     h, w = bgr.shape[:2]
