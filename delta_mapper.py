@@ -779,6 +779,14 @@ def _from_frame(src, xdim, ydim, init, mp, n_pred):
 # =============================================================================
 
 BLOCK_MIN, BLOCK_MAX, BLOCK_DEFAULT = 4, 32, 8
+# Block shapes, a block map's first byte (DeltaMapper.BLOCK_SHAPES):
+# BLOCK_MIN..BLOCK_MAX is a square of that size; SHAPE_FIRST + i is
+# BLOCK_SHAPES[i], width x height (width 0: the whole row). Rows of pixels
+# -- "lines" -- are the 1-high ones. Blocks are numbered row by row.
+SHAPE_FIRST = 64
+BLOCK_SHAPES = [(16, 4), (32, 2), (64, 1), (256, 1), (0, 1), (4, 16), (1, 64)]
+_SHAPE_W = np.array([w for w, _ in BLOCK_SHAPES], dtype=np.int64)
+_SHAPE_H = np.array([h for _, h in BLOCK_SHAPES], dtype=np.int64)
 BLOCK_SEARCH_SIZES = [4, 6, 8, 12, 16, 24, 32]
 
 # Primitives: 0-21 on a, b, c, d (_block_predictor); 22-27 selection; 28-35
@@ -869,8 +877,49 @@ def describe_map_set(mp):
     return "%d predictors" % len(ids)
 
 
+@njit
+def _block_wh(block, xdim):
+    """(width, height) of a block shape."""
+    if block < SHAPE_FIRST:
+        return block, block
+    w = _SHAPE_W[block - SHAPE_FIRST]
+    if w == 0:
+        w = max(1, xdim - 2)
+    return w, _SHAPE_H[block - SHAPE_FIRST]
+
+
+def block_width(block, xdim):
+    return int(_block_wh(int(block), int(xdim))[0])
+
+
+def block_height(block):
+    block = int(block)
+    return block if block < SHAPE_FIRST else BLOCK_SHAPES[block - SHAPE_FIRST][1]
+
+
+def valid_shape(block):
+    return BLOCK_MIN <= block <= BLOCK_MAX or SHAPE_FIRST <= block < SHAPE_FIRST + len(BLOCK_SHAPES)
+
+
+def shape_name(block):
+    """"8" for a square, "16x4", "row" for a whole-row line."""
+    block = int(block)
+    if block < SHAPE_FIRST:
+        return str(block)
+    w, h = BLOCK_SHAPES[block - SHAPE_FIRST]
+    return "row" if w == 0 else "%dx%d" % (w, h)
+
+
 def blocks_across(xdim, block):
-    return (xdim - 2 + block - 1) // block
+    """Blocks across the interior (columns 1..xdim-2)."""
+    w = block_width(block, xdim)
+    return (xdim - 2 + w - 1) // w
+
+
+def blocks_down(ydim, block):
+    """Blocks down the interior (rows 1..ydim-1)."""
+    h = block_height(block)
+    return (ydim - 1 + h - 1) // h
 
 
 # Row bands: the Numba-compiled loops release the GIL, so splitting their
@@ -1133,16 +1182,16 @@ class PixelSource:
 @njit
 def _block_from_map(src, ref, has_ref, corr, xdim, y0, y1, mp, ids, first, second, cross_base, bias_base, dst):
     """Rows y0..y1-1 (>= 1) of the block deltas, into dst."""
-    block = np.int64(mp[0])
-    bw = (xdim - 2 + block - 1) // block
+    bwd, bht = _block_wh(np.int64(mp[0]), xdim)
+    bw = (xdim - 2 + bwd - 1) // bwd
     head = 2 + np.int64(mp[1])
     prim = np.zeros(ALL_PRIMITIVES, dtype=np.int64)   # all of them: faster than computing two by dispatch
     for y in range(y0, y1):
-        row = head + (y - 1) // block * bw
+        row = head + (y - 1) // bht * bw
         for x in range(1, xdim - 1):
             k = y * xdim + x
             _all_primitives(src, ref, has_ref, corr, k, xdim, prim)
-            pid = ids[mp[row + (x - 1) // block]]
+            pid = ids[mp[row + (x - 1) // bwd]]
             i = first[pid]
             j = second[pid]
             dst[k] = src[k] - (prim[i] if i == j else (prim[i] + prim[j] + 1) >> 1)
@@ -1164,19 +1213,20 @@ def get_block_deltas_from_map(ps, mp, ids=None):
 def _block_choices(src, ref, has_ref, corr, xdim, ydim, block, ids, used, first, second, n_prim, cross_base, bias_base, by0, by1, choice):
     """Block rows by0..by1-1: each block's index of the id with the smallest
     sum of |delta|, into choice. Each primitive in used is computed once per pixel."""
-    bw = (xdim - 2 + block - 1) // block
+    bwd, bht = _block_wh(block, xdim)
+    bw = (xdim - 2 + bwd - 1) // bwd
     n = ids.shape[0]
     sums = np.zeros(bw * n, dtype=np.int64)
     prim = np.zeros(ALL_PRIMITIVES, dtype=np.int64)
     for by in range(by0, by1):
         sums[:] = 0
-        y0 = 1 + by * block
-        y1 = min(ydim, y0 + block)
+        y0 = 1 + by * bht
+        y1 = min(ydim, y0 + bht)
         for y in range(y0, y1):
             for x in range(1, xdim - 1):
                 k = y * xdim + x
                 _all_primitives(src, ref, has_ref, corr, k, xdim, prim)
-                base = (x - 1) // block * n
+                base = (x - 1) // bwd * n
                 for p in range(n):
                     i = first[ids[p]]
                     j = second[ids[p]]
@@ -1201,7 +1251,7 @@ def _block_deltas_from_values(ps, block, ids):
     ids = [int(i) for i in ids]
     arr = np.array(ids, dtype=np.int64)
     used = np.array(sorted(set(int(TABLE_FIRST[i]) for i in ids) | set(int(TABLE_SECOND[i]) for i in ids)), dtype=np.int64)
-    bh = (ydim - 1 + block - 1) // block
+    bh = blocks_down(ydim, block)
     choice = np.zeros(blocks_across(xdim, block) * bh, dtype=np.uint8)
     _in_bands(bh, lambda lo, hi: _block_choices(ps.v, ps.ref, ps.has_ref, ps.corr, xdim, ydim, block, arr, used,
                                                 TABLE_FIRST, TABLE_SECOND, TABLE_PRIMITIVES, CROSS_BASE, BIAS_BASE, lo, hi, choice))
@@ -1211,8 +1261,8 @@ def _block_deltas_from_values(ps, block, ids):
 
 @njit
 def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, cross_base, bias_base):
-    block = np.int64(mp[0])
-    bw = (xdim - 2 + block - 1) // block
+    bwd, bht = _block_wh(np.int64(mp[0]), xdim)
+    bw = (xdim - 2 + bwd - 1) // bwd
     head = 2 + np.int64(mp[1])
     n = xdim * ydim
     dst = np.zeros(n, dtype=np.int64)
@@ -1227,12 +1277,12 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
     for y in range(1, ydim):
         k = y * xdim
         dst[k] = dst[k - xdim] + delta[k]
-        row = head + (y - 1) // block * bw
+        row = head + (y - 1) // bht * bw
         for x in range(1, xdim - 1):
             k += 1
             _bias_prepare(dst, k, xdim, ctx, corr, bsum, bcount)
             _all_primitives(dst, ref, has_ref, corr, k, xdim, prim)
-            pid = ids[mp[row + (x - 1) // block]]
+            pid = ids[mp[row + (x - 1) // bwd]]
             i = first[pid]
             j = second[pid]
             dst[k] = delta[k] + (prim[i] if i == j else (prim[i] + prim[j] + 1) >> 1)
@@ -1559,15 +1609,15 @@ def read_map(inp, delta_type, previous, xdim):
         q = np.arange(n)
         return ((packed[q >> 2] >> ((q & 3) << 1)) & 3).astype(np.uint8)
     if delta_type == 13:
-        block = inp.read_byte()
+        block = inp.read_unsigned_byte()
         n = inp.read_unsigned_byte()
         if not (1 <= n <= PREDICTORS):
             raise IOError("Block map with %d predictors: not one this version reads." % n)
         ids = [inp.read_unsigned_byte() for _ in range(n)]
         if max(ids) >= PREDICTORS:
             raise IOError("Block map with predictor id %d: not one this version reads." % max(ids))
-        if not (BLOCK_MIN <= block <= BLOCK_MAX):
-            raise IOError("Block map with block size %d: not one this version reads." % block)
+        if not valid_shape(block):
+            raise IOError("Block map with block shape %d: not one this version reads." % block)
         prev = None
         if previous is not None:
             prev = np.asarray(previous, dtype=np.uint8)
@@ -1782,19 +1832,20 @@ class DeltaCost:
 def _block_cost_table(src, ref, has_ref, corr, xdim, ydim, block, cost, ctx, lo, rng, pids, first, second, n_prim, cross_base, bias_base, rows, r0, r1, est):
     """Block rows rows[r0..r1-1] of the cost table, into est[(r * bw + bx) * n + q]."""
     n = pids.shape[0]
-    bw = (xdim - 2 + block - 1) // block
+    bwd, bht = _block_wh(block, xdim)
+    bw = (xdim - 2 + bwd - 1) // bwd
     prim = np.zeros(ALL_PRIMITIVES, dtype=np.int64)
     for r in range(r0, r1):
         by = rows[r]
-        y0 = 1 + by * block
-        y1 = min(ydim, y0 + block)
+        y0 = 1 + by * bht
+        y1 = min(ydim, y0 + bht)
         for y in range(y0, y1):
             for x in range(1, xdim - 1):
                 k = y * xdim + x
                 s = src[k]
                 c = ctx[k]
                 _all_primitives(src, ref, has_ref, corr, k, xdim, prim)
-                base = (r * bw + (x - 1) // block) * n
+                base = (r * bw + (x - 1) // bwd) * n
                 for q in range(n):
                     i = first[pids[q]]
                     j = second[pids[q]]
@@ -1808,7 +1859,8 @@ def _prefix_maps(src, ref, has_ref, corr, xdim, ydim, block, cost, ctx, lo, rng,
     """Block rows by0..by1-1 of the prefix maps (DeltaMapper.prefixMaps): row c
     of maps is the map for the first counts[c] ids, entries from heads[c]."""
     n = pids.shape[0]
-    bw = (xdim - 2 + block - 1) // block
+    bwd, bht = _block_wh(block, xdim)
+    bw = (xdim - 2 + bwd - 1) // bwd
     est = np.zeros(bw * n, dtype=np.int64)
     rows = np.zeros(1, dtype=np.int64)
     for by in range(by0, by1):
@@ -1834,7 +1886,7 @@ def block_cost_table(ps, block, dc, ids=None, rows=None):
     [block * n + q] for the ids given, or for every id (ids None); for the
     given block rows only (rows), or all of them."""
     ids = np.array(list(range(PREDICTORS)) if ids is None else ids, dtype=np.int64)
-    bh = (ps.ydim - 1 + block - 1) // block
+    bh = blocks_down(ps.ydim, block)
     rows = np.arange(bh, dtype=np.int64) if rows is None else np.asarray(rows, dtype=np.int64)
     est = np.zeros(blocks_across(ps.xdim, block) * len(rows) * len(ids), dtype=np.int32)   # as Java's int
     _in_bands(len(rows), lambda lo, hi: _block_cost_table(ps.v, ps.ref, ps.has_ref, ps.corr, ps.xdim, ps.ydim, block, dc.cost, dc.context,
@@ -1848,7 +1900,7 @@ def prefix_maps(ps, block, dc, ids, counts):
     id of the prefix with the smallest estimate, one block row at a time
     (DeltaMapper.prefixMaps)."""
     bw = blocks_across(ps.xdim, block)
-    bh = (ps.ydim - 1 + block - 1) // block
+    bh = blocks_down(ps.ydim, block)
     ids = [int(i) for i in ids]
     width = 2 + max(counts) + bw * bh
     maps = np.zeros((len(counts), width), dtype=np.uint8)
@@ -1952,7 +2004,7 @@ def _assign_by_cost(est, stride, cols, ids, xdim, ydim, block):
     """A block map for ids: each block uses the first of them with the
     smallest estimate (cols: each id's column in est)."""
     bw = blocks_across(xdim, block)
-    bh = (ydim - 1 + block - 1) // block
+    bh = blocks_down(ydim, block)
     n = len(ids)
     sub = est.reshape(bw * bh, stride)[:, cols]
     choice = np.argmin(sub, axis=1)          # first minimum
@@ -2000,6 +2052,7 @@ class BlockSurvey:
         self.ids = [None] * 3
         self.bytes = 0
         self.report = ""
+        self.tried = None     # the full survey: every shape tried, by shape
 
 
 def _survey_block_size(ps, block, log):
@@ -2007,7 +2060,7 @@ def _survey_block_size(ps, block, log):
     result = BlockSurvey(block)
     delta, mp = [None] * 3, [None] * 3
     bw = blocks_across(xdim, block)
-    bh = (ydim - 1 + block - 1) // block
+    bh = blocks_down(ydim, block)
     blocks = bw * bh
     # Big images: the greedy order is found on every step-th block row (at
     # most SURVEY_SAMPLE_BLOCKS blocks), the id's cost scaled to match; the
@@ -2015,7 +2068,7 @@ def _survey_block_size(ps, block, log):
     step = (blocks + SURVEY_SAMPLE_BLOCKS - 1) // SURVEY_SAMPLE_BLOCKS if blocks > SURVEY_SAMPLE_BLOCKS else 1
     rows = np.arange(0, bh, step, dtype=np.int64)
     sampled = len(rows) * bw
-    log.append("  block %d%s:" % (block, " (order from %s of %s blocks)" % (format(sampled, ","), format(blocks, ",")) if step > 1 else ""))
+    log.append("  block %s%s:" % (shape_name(block), " (order from %s of %s blocks)" % (format(sampled, ","), format(blocks, ",")) if step > 1 else ""))
     for i in range(3):
         dc = _channel_cost(ps[i], block, delta[:i])
         est = block_cost_table(ps[i], block, dc, rows=rows)
@@ -2045,13 +2098,19 @@ def _survey_block_size(ps, block, log):
     return result
 
 
-def survey_block_sets(channel, xdim, ydim):
+def survey_at_block_size(channel, xdim, ydim, block):
+    """The survey at one block shape only: the same sets survey_block_sets
+    would choose for that shape (DeltaMapper.surveyAtBlockSize)."""
+    return _survey_block_size(pixel_sources(channel, xdim, ydim), block, [])
+
+
+def survey_block_sets(channel, xdim, ydim, survey_shapes=False):
     """The block size and each channel's predictor ids that code smallest
     (DeltaMapper.surveyBlockSets): per channel, predictors in greedy order
     by estimated coded bits (with the map's cost), with the real coded size
     measured for the first n at SURVEY_COUNTS until two in a row are larger
     than the best; block sizes 4, 8, 16, then the untried sizes next to the
-    best."""
+    best; with survey_shapes, then the rectangles and lines (BLOCK_SHAPES)."""
     tried, log = {}, []
     ps = pixel_sources(channel, xdim, ydim)
 
@@ -2078,17 +2137,20 @@ def survey_block_sets(channel, xdim, ydim):
     more = [BLOCK_SEARCH_SIZES[t] for t in (s - 1, s + 1) if 0 <= t < len(BLOCK_SEARCH_SIZES) and BLOCK_SEARCH_SIZES[t] not in tried]
     if more:
         survey_sizes(more)
+    if survey_shapes:
+        survey_sizes([SHAPE_FIRST + t for t in range(len(BLOCK_SHAPES))])
     result = tried[best_of()]
     r = ["Predictor survey: bytes coded (Context-coded deltas + maps) for the first n predictors",
          "in each channel's greedy order (by estimated bits); * marks the n kept for the channel."] + log
-    r.append("Block size:" + "".join("  %d -> %s" % (b, format(tried[b].bytes, ",")) for b in sorted(tried))
-             + "   chose %d (%s bytes)" % (result.block, format(result.bytes, ",")))
+    r.append("Block size:" + "".join("  %s -> %s" % (shape_name(b), format(tried[b].bytes, ",")) for b in sorted(tried))
+             + "   chose %s (%s bytes)" % (shape_name(result.block), format(result.bytes, ",")))
     for i in range(3):
         names = [predictor_name(p) for p in result.ids[i]]
         r.append("Channel %d, %d predictors:" % (i, len(names)))
         for k in range(0, len(names), 6):
             r.append("    " + ", ".join(names[k:k + 6]))
     result.report = "\n".join(r) + "\n"
+    result.tried = tried
     return result
 
 
