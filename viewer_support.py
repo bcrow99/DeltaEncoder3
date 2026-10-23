@@ -53,7 +53,7 @@ MIN_DIM = 4
 def read_image(filename):
     """Reads an image as an (ydim, xdim, 3) uint8 array in R, G, B order
     (gray images are copied to all three; alpha is dropped; an EXIF
-    orientation tag is ignored, as in Java). Raises IOError
+    orientation tag and a JPEG's ICC profile are ignored, as in Java). Raises IOError
     with a message for the user if the file can't be used."""
     import cv2
     try:
@@ -71,6 +71,7 @@ def read_image(filename):
     if w > MAX_DIM or h > MAX_DIM:
         raise IOError("%s is %d x %d; the largest supported dimension is %d." % (filename, w, h, MAX_DIM))
     return np.ascontiguousarray(bgr[:, :, ::-1])
+
 
 
 def show_error(parent, message):
