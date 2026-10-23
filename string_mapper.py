@@ -72,28 +72,15 @@ def get_histogram(values):
 
 
 def get_rank_table(histogram):
-    """rank[i] of each histogram bin, 0 = most frequent.
+    """rank[i] of each histogram bin, 0 = most frequent (StringMapper.getRankTable).
 
-    Replicates the Java exactly, including its tie-breaking: equal counts
-    are made distinct by adding .001 repeatedly (Java Hashtable of Double
-    keys), then sorted. With many ties the nudged keys can drift into the
-    next integer, which changes the order -- so this is done literally, not
-    with a stable sort. Python floats are the same IEEE doubles."""
-    table = {}
-    keys = []
-    for i, c in enumerate(np.asarray(histogram).tolist()):
-        key = float(c)
-        while key in table:
-            key += .001
-        table[key] = i
-        keys.append(key)
-    keys.sort()
-    n = len(keys)
-    rank = np.zeros(n, dtype=np.int64)
-    k = -1
-    for i in range(n - 1, -1, -1):
-        k += 1
-        rank[table[keys[i]]] = k
+    Among equal counts the later bin ranks first, as the Java does."""
+    h = np.asarray(histogram, dtype=np.int64)
+    n = len(h)
+    idx = np.arange(n, dtype=np.int64)
+    order = np.lexsort((-idx, -h))          # count descending, then index descending
+    rank = np.empty(n, dtype=np.int64)
+    rank[order] = np.arange(n, dtype=np.int64)
     return rank
 
 
