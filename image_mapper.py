@@ -1,5 +1,5 @@
 """
-image_mapper.py -- ImageMapper.java (version 2.0): the pixel-pyramid
+image_mapper.py -- ImageMapper.java (version 3.0): the pixel-pyramid
 operators (shrink / gradient expand / sign-bit refinement / padding) that
 DeltaWriter and DeltaReader use for "Average" quantization, plus the older
 dilation, area-resampling and registration utilities merged into the same
@@ -15,9 +15,9 @@ Java semantics kept on purpose:
   - Math.round(double) is round-half-up (floor(x + 0.5), computed exactly):
     _jround below. Python's round() is round-half-even and would differ.
   - (int) casts of doubles truncate toward zero.
-  - The area-resampling transforms do their arithmetic in 32-bit Java int,
-    which can overflow for large shrink factors; _i32 reproduces the wrap
-    and jdiv the truncating division, so results match Java bit for bit.
+  - The area-resampling transforms sum in 64 bits, as the Java now does
+    (in 32-bit int they overflowed for large shrink factors); jdiv is
+    Java's truncating division.
   - Methods that mutate their arguments in Java (smooth's dst, the
     dilate_image* family's is_interpolated and dst) mutate them here too.
 
@@ -37,20 +37,19 @@ Overloads get distinct names:
   expandX(int[][], expand) -> expand_x_int; expandX(double[][]) ->
   expand_x; expandX(double[][], iterations) -> expand_x_iterated.
 
-Behaviour carried over unchanged from the Java (flagged, not fixed, so the
-two stay interchangeable):
-  - avgAreaYTransform(int[][]) and avgAreaTransform(int[][]) reset their
-    copy index at the start of every row, so only the first row of the
-    working array is ever filled (with the LAST source row), and the output
-    rows are all copies of the first working row. avgAreaTransform(int[][])
-    also copies xdim (not new_xdim) columns per output row, so it raises
-    IndexError, as Java throws, when new_xdim < xdim.
-  - expandX(int[][], expand) steps from start toward start + (start - end),
-    i.e. away from the next pixel rather than toward it, and truncates to
-    int after every step (Java's compound += on an int).
-  - translate() multiplies the interpolated value by .5 before rounding, so
-    its output is about half the brightness of its input.
-  - getImageDilation prints progress messages, as the Java does.
+Fixed with ImageMapper.java 3.0 (the two stay interchangeable):
+  - avgAreaYTransform(int[][]) and avgAreaTransform(int[][]) now copy
+    every row (they reset their copy index per row, so used only the last
+    row, and avgAreaTransform copied xdim columns instead of new_xdim).
+  - expandX(int[][], expand) steps toward the next pixel (it stepped away)
+    and rounds each value instead of truncating after every step.
+  - translate() no longer halves its output.
+  - getTranslation's oscillation test compares with the previous increment
+    (it compared with the new one, so it never fired), and the one-pixel
+    test uses the absolute translation.
+  - The dilate_image* family stores the weighted mean as it is (it was
+    truncated to an integer, though the arrays are float).
+getImageDilation prints progress messages, as the Java does.
 """
 
 import math
@@ -89,12 +88,6 @@ def _clamp(v, max_value):
     if v > max_value:
         return max_value
     return v
-
-
-@njit
-def _i32(x):
-    """Wrap to a 32-bit signed Java int."""
-    return ((x + 2147483648) & 0xFFFFFFFF) - 2147483648
 
 
 @njit
@@ -644,7 +637,7 @@ def _dilate(src, is_interpolated, xdim, ydim, neighbor_threshold, dst, table, co
                             value += src[n]
                 if number_of_neighbors > neighbor_threshold:
                     value /= total_weight
-                    dst[k] = _jtrunc(value)
+                    dst[k] = value
                     was_interpolated[k] = True
                 else:
                     dst[k] = 0
@@ -741,8 +734,8 @@ def _area_tables(dim, new_dim):
         number_of_pixels[i] = current_whole_number - previous_whole_number
         start_fraction[i] = _jtrunc(1000. * (1. - (previous_position - previous_whole_number)))
         end_fraction[i] = _jtrunc(1000. * (real_position - current_whole_number))
-    weight = _i32(_i32(_jtrunc(differential * dim)) * 1000)
-    factor = _i32(dim * 1000)
+    weight = _jtrunc(differential * dim) * 1000
+    factor = dim * 1000
     return start_fraction, end_fraction, number_of_pixels, weight, factor
 
 
@@ -758,29 +751,29 @@ def _area_line(source, dest, j0, i0, n_out, stride_in, stride_out, dim,
             dest[i] = source[j]
             i += stride_out
         else:
-            total = _i32(_i32(start_fraction[x] * dim) * source[j])
+            total = start_fraction[x] * dim * source[j]
             j += stride_in
             k = number_of_pixels[x] - 1
             while k > 0:
-                total = _i32(total + _i32(factor * source[j]))
+                total += factor * source[j]
                 j += stride_in
                 k -= 1
-            total = _i32(total + _i32(_i32(end_fraction[x] * dim) * source[j]))
-            total = _i32(jdiv(total, weight))
+            total += end_fraction[x] * dim * source[j]
+            total = jdiv(total, weight)
             dest[i] = total
             i += stride_out
     x = n_out - 1
     if number_of_pixels[x] == 0:
         dest[i] = source[j]
     else:
-        total = _i32(_i32(start_fraction[x] * dim) * source[j])
+        total = start_fraction[x] * dim * source[j]
         j += stride_in
         k = number_of_pixels[x] - 1
         while k > 0:
-            total = _i32(total + _i32(factor * source[j]))
+            total += factor * source[j]
             j += stride_in
             k -= 1
-        total = _i32(jdiv(total, _i32(weight - _i32(end_fraction[x] * dim))))
+        total = jdiv(total, weight - end_fraction[x] * dim)
         dest[i] = total
 
 
@@ -813,38 +806,24 @@ def avg_area_transform(src, xdim, ydim, new_xdim, new_ydim):
 
 
 def avg_area_x_transform_2d(src, new_xdim):
-    """2-D version of avg_area_x_transform (this overload is correct in Java)."""
+    """avg_area_x_transform for a 2-D array."""
     ydim, xdim = src.shape
     flat = np.ascontiguousarray(src, dtype=np.int64).reshape(-1)
     return avg_area_x_transform(flat, xdim, ydim, new_xdim).reshape(ydim, new_xdim)
 
 
-def _java_row_reset_copy(src):
-    """Reproduces the Java's `k = 0` inside the row loop: only the first xdim
-    cells of the working array are written, ending up as the last row."""
-    ydim, xdim = src.shape
-    source = np.zeros(xdim * ydim, dtype=np.int64)
-    source[:xdim] = src[ydim - 1]
-    return source
-
-
 def avg_area_y_transform_2d(src, new_ydim):
-    """int[][] avgAreaYTransform, bug for bug (see the module docstring):
-    every output row is the first row of the transformed working array."""
+    """avg_area_y_transform for a 2-D array."""
     ydim, xdim = src.shape
-    dest = avg_area_y_transform(_java_row_reset_copy(src), xdim, ydim, new_ydim)
-    return np.tile(dest[:xdim], (new_ydim, 1))
+    flat = np.ascontiguousarray(src, dtype=np.int64).reshape(-1)
+    return avg_area_y_transform(flat, xdim, ydim, new_ydim).reshape(new_ydim, xdim)
 
 
 def avg_area_transform_2d(src, new_xdim, new_ydim):
-    """int[][] avgAreaTransform, bug for bug (see the module docstring)."""
+    """avg_area_transform for a 2-D array."""
     ydim, xdim = src.shape
-    dest = avg_area_transform(_java_row_reset_copy(src), xdim, ydim, new_xdim, new_ydim)
-    if xdim > new_xdim:
-        raise IndexError("Index %d out of bounds for length %d" % (new_xdim, new_xdim))
-    dst = np.zeros((new_ydim, new_xdim), dtype=np.int64)
-    dst[:, :xdim] = dest[:xdim]
-    return dst
+    flat = np.ascontiguousarray(src, dtype=np.int64).reshape(-1)
+    return avg_area_transform(flat, xdim, ydim, new_xdim, new_ydim).reshape(new_ydim, new_xdim)
 
 
 # ---- gradients, variance and registration ----
@@ -941,7 +920,7 @@ def contract(source):
 @njit
 def translate(source, x, y):
     """Bilinear sub-pixel shift, x and y in [-1, 1]; one pixel smaller each way.
-    (Keeps the Java's *.5 on the result -- see the module docstring.)"""
+    x = y = 0 is the rounded contract (a half-pixel shift)."""
     ydim, xdim = source.shape
     dest = np.zeros((ydim - 1, xdim - 1), dtype=np.int64)
     x = (x + 1.) * .5
@@ -950,7 +929,7 @@ def translate(source, x, y):
         for j in range(xdim - 1):
             a = float(source[i, j]) * (1. - x) + float(source[i, j + 1]) * x
             b = float(source[i + 1, j]) * (1. - x) + float(source[i + 1, j + 1]) * x
-            dest[i, j] = _jtrunc((a * (1. - y) + b * y) * .5 + .5)
+            dest[i, j] = _jtrunc(a * (1. - y) + b * y + .5)
     return dest
 
 
@@ -1005,21 +984,19 @@ def get_translation(source1, source2):
         _ydim, _xdim = estimate.shape
         w, x, z, b1, b2 = _normal_equations(get_gradient(estimate), current_source, estimate, _ydim, _xdim)
 
-        # As in the Java, "previous" is assigned the new increment before the
-        # comparison, so the oscillation test (status 2) never fires.
-        xincrement = _fdiv(b1 - _fdiv(x * b2, z), w - _fdiv(x * x, z))
-        xtranslation += xincrement
         previous_xincrement = xincrement
-        yincrement = _fdiv(b2 - _fdiv(x * b1, w), z - _fdiv(x * x, w))
-        ytranslation += yincrement
         previous_yincrement = yincrement
+        xincrement = _fdiv(b1 - _fdiv(x * b2, z), w - _fdiv(x * x, z))
+        yincrement = _fdiv(b2 - _fdiv(x * b1, w), z - _fdiv(x * x, w))
+        xtranslation += xincrement
+        ytranslation += yincrement
 
         if abs(xincrement) < xincrement_min or abs(yincrement) < yincrement_min:
             return [1.0, xtranslation, ytranslation]
         elif ((xincrement < 0 and previous_xincrement > 0) or (xincrement > 0 and previous_xincrement < 0)
               or (yincrement < 0 and previous_yincrement > 0) or (yincrement > 0 and previous_yincrement < 0)):
             return [2.0, xtranslation, ytranslation]
-        elif xtranslation >= 1. or ytranslation >= 1.:
+        elif abs(xtranslation) >= 1. or abs(ytranslation) >= 1.:
             return [4.0, xtranslation, ytranslation]
         else:
             estimate = translate(source2, xtranslation, ytranslation)
@@ -1029,26 +1006,22 @@ def get_translation(source1, source2):
 
 @njit
 def expand_x_int(src, expand):
-    """Insert `expand` stepped values between horizontal neighbours (int[][]
-    expandX, bug for bug -- see the module docstring)."""
+    """Insert `expand` values between horizontal neighbours, evenly spaced
+    between them and rounded (Java Math.round)."""
     ydim, xdim = src.shape
     _xdim = (xdim - 1) * expand + xdim
     dst = np.zeros((ydim, _xdim), dtype=np.int64)
     for i in range(ydim):
         k = 0
-        end_value = 0
         for j in range(xdim - 1):
             start_value = src[i, j]
             end_value = src[i, j + 1]
             dst[i, k] = start_value
             k += 1
-            delta = float(start_value - end_value)
-            increment = delta / (expand + 1)
-            for _ in range(expand):
-                start_value = _jtrunc(start_value + increment)
-                dst[i, k] = start_value
+            for m in range(1, expand + 1):
+                dst[i, k] = _jround(start_value + float(end_value - start_value) * m / (expand + 1))
                 k += 1
-        dst[i, k] = end_value
+        dst[i, k] = src[i, xdim - 1]
     return dst
 
 
