@@ -53,14 +53,14 @@ after that it loads from the cache in `__pycache__`.
 | `delta_writer2.py` | DeltaWriter2 | `DeltaCoder2`: delta types 6–13 only, String* datatype, map-coding report |
 | `simple_writer.py` | SimpleWriter | `SimpleCoder`: unary strings, delta type from the menu |
 | `simple_reader.py` | SimpleReader | `SimpleDecoder` |
-| `block_writer.py` | BlockWriter | `BlockCoder`: block map with context-coded deltas, best block size and predictors |
+| `block_writer.py` | BlockWriter | `BlockCoder`: block map with mixed-context-coded deltas, best block size and predictors |
 | `block_reader.py` | BlockReader | `BlockDecoder` |
 | `packet_writer.py` | PacketWriter | `PacketCoder`: unary strings split into separately compressed packets |
 | `packet_reader.py` | PacketReader | `PacketDecoder` |
 | `pixel_writer.py` | PixelWriter | `PixelCoder`: context-adaptive arithmetic coding of the pixels, block size search |
 | `pixel_reader.py` | PixelReader | `PixelDecoder` |
 | `viewer_support.py` | ViewerSupport | image window with zoom, dialogs, image loading, background jobs |
-| `delta_mapper.py` | DeltaMapper | channel sets, delta types 0–13, maps, context-coded deltas, block search |
+| `delta_mapper.py` | DeltaMapper | channel sets, delta types 0–13, maps, context-coded and mixed-context-coded deltas, block search |
 | `arithmetic_mapper.py` | ArithmeticMapper | range coder; static, adaptive and context coders; frequency tables |
 | `string_mapper.py` | StringMapper | unary strings and their bit-run compression |
 | `code_mapper.py` | CodeMapper | Huffman ("regular"), Shannon estimate, Deflate |

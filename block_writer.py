@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-block_writer.py version 2.0 -- BlockWriter.java for Python (PySide6).
+block_writer.py version 2.1 -- BlockWriter.java for Python (PySide6).
 
 A writer with one delta type and one entropy coder: the block map (delta
-type 13) with Context-coded deltas and a coded map. Each block uses one
+type 13) with mixed-context-coded deltas (delta_mapper.pack_mixed_deltas)
+and a coded map. Each block uses one
 predictor from its channel's set, and a set can be any of the 256
 predictors delta_mapper has ids for (id 255 is the least-squares predictor,
 LS). The startup analysis (and Find Best)
@@ -13,8 +14,10 @@ blocks assigned by the estimate, and the real coded size measured), and
 also codes with each named set (find_best_block); it keeps whichever is
 smallest -- actual sizes, not estimates. The sets are surveyed per block
 shape: a shape picked by hand uses its own. Saves (to the file
-"foo", as the Java version does) in Block format 'B' version 3, read by
-block_reader.py and BlockReader.java.
+"foo", as the Java version does) in Block format 'B' version 4, read by
+block_reader.py and BlockReader.java. The analysis measures sizes with the
+Context coder (pack_context_deltas); the file uses the mixed coder, about
+1% smaller.
 
     python3 block_writer.py [image]
 
@@ -33,12 +36,26 @@ import code_mapper as cm
 import delta_mapper as dm
 import resize_mapper as rm
 import viewer_support as vs
-from delta_writer import context_code
 from java_io import DataOutput
 
 SURVEYED = -1
 FORMAT_ID = ord('B')
-FORMAT_VERSION = 3   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps
+FORMAT_VERSION = 4   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: mixed context coding
+
+
+def mixed_code(delta, values, xdim):
+    """Each channel's deltas mixed-context coded (pack_mixed_deltas), channel
+    i's contexts using channels 0..i-1. Checks each decodes back."""
+    coded = [None] * 3
+
+    def one(i):
+        coded[i] = dm.pack_mixed_deltas(delta[i], values[i], delta[:i], xdim)
+        back = dm.unpack_mixed_deltas(coded[i], values[i], delta[:i], xdim)
+        if not np.array_equal(back, delta[i]):
+            print("WARNING: channel %d mixed-coded deltas do not decode back." % i)
+
+    vs.parallel(3, one)
+    return coded
 
 
 def best_set(channel_sum):
@@ -202,6 +219,7 @@ class BlockCoder:
             decoded[i] = ch
         vs.channels(True, 3, channel)
         self.delta_list, self.map_list, self.delta_xdim = deltas, maps, w
+        self.value_list = raw       # the channels as the reader rebuilds them (the mixed coder's contexts use them)
 
         # As the reader: recombine the channel set first, then resize, then shift.
         bgr = dm.get_blue_green_red(self.min_set_id, *decoded)
@@ -225,11 +243,12 @@ class BlockCoder:
         """Header: FORMAT_ID, FORMAT_VERSION, width, height (unsigned shorts),
         pixel_shift, pixel_quant, channel set. Then per channel: int min, int
         init, the block map (write_map, type 13; it carries the block size and
-        the channel's predictor ids), then the context-coded deltas. Channels 1 and 2 use
-        the ones before them as context, so the reader decodes in order.
+        the channel's predictor ids), then the deltas, mixed-context coded
+        (pack_mixed_deltas). Channels 1 and 2 use the ones before them as
+        context, so the reader decodes in order.
         Returns the file size."""
         timer = vs.Timer()
-        coded = context_code(self.delta_list, self.delta_xdim)
+        coded = mixed_code(self.delta_list, self.value_list, self.delta_xdim)
         print("Entropy coding took " + timer.elapsed())
 
         ids = dm.get_channels(self.min_set_id)

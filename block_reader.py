@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-block_reader.py version 2.0 -- BlockReader.java for Python (PySide6).
+block_reader.py version 2.1 -- BlockReader.java for Python (PySide6).
 
-Reads Block format 'B' version 3 files, from block_writer.py or
-BlockWriter.java: block map deltas (delta type 13), Context coded. See
-block_writer.BlockCoder.save for the layout.
+Reads Block format 'B' versions 3 and 4, from block_writer.py or
+BlockWriter.java: block map deltas (delta type 13), Context coded (version
+3) or mixed-context coded (version 4). See block_writer.BlockCoder.save for
+the layout.
 
     python3 block_reader.py file
 
@@ -23,7 +24,8 @@ import viewer_support as vs
 from java_io import DataInput
 
 FORMAT_ID = ord('B')
-FORMAT_VERSION = 3   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; older files are not read
+FORMAT_VERSION = 4   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: mixed context coding
+OLDEST_VERSION = 3   # older files are not read (the block predictors changed in version 3)
 
 
 class BlockDecoder:
@@ -38,8 +40,10 @@ class BlockDecoder:
         ident, version = inp.read_unsigned_byte(), inp.read_unsigned_byte()
         if ident != FORMAT_ID:
             raise IOError(self.filename + " is not a Block Writer file.")
-        if version != FORMAT_VERSION:
-            raise IOError("%s is Block format version %d; this reader reads version %d only (the block predictors changed in it)." % (self.filename, version, FORMAT_VERSION))
+        if not OLDEST_VERSION <= version <= FORMAT_VERSION:
+            raise IOError("%s is Block format version %d; this reader reads versions %d to %d (the block predictors changed in version %d)."
+                          % (self.filename, version, OLDEST_VERSION, FORMAT_VERSION, OLDEST_VERSION))
+        self.version = version
         self.xdim = inp.read_unsigned_short()
         self.ydim = inp.read_unsigned_short()
         self.pixel_shift, self.pixel_quant, self.set_id = [inp.read_byte() for _ in range(3)]
@@ -52,7 +56,10 @@ class BlockDecoder:
             self.min[i] = inp.read_int()
             self.init[i] = inp.read_int()
             self.map[i] = dm.read_map(inp, 13, self.map[i - 1] if i > 0 else None, w)
-            self.delta[i] = dm.read_context_deltas(inp, w * h, self.delta[:i], w)
+            if version >= 4:
+                self.delta[i] = dm.read_mixed_deltas(inp)   # decoded with the values (decode)
+            else:
+                self.delta[i] = dm.read_context_deltas(inp, w * h, self.delta[:i], w)
         print("Image:        %d x %d" % (self.xdim, self.ydim))
         print("Channel set:  " + dm.SET_NAMES[self.set_id])
         print("Block map:    size %d; predictors %s" % (int(self.map[0][0]), ", ".join(dm.describe_map_set(m) for m in self.map)))
@@ -67,9 +74,14 @@ class BlockDecoder:
 
         raw = [None] * 3
         # In order: each channel's predictors may use the one before it.
+        deltas = [None] * 3
         for i in range(3):
-            raw[i] = dm.get_values_from_deltas(self.delta[i], w, h, self.init[i], 13, self.map[i], 0,
-                                               ref=raw[i - 1] if i > 0 else None)
+            ref = raw[i - 1] if i > 0 else None
+            if self.version >= 4:
+                value, coded = self.delta[i]
+                deltas[i], raw[i] = dm.get_values_from_mixed_deltas(value, coded, deltas[:i], w, h, self.init[i], self.map[i], ref)
+            else:
+                raw[i] = dm.get_values_from_deltas(self.delta[i], w, h, self.init[i], 13, self.map[i], 0, ref=ref)
             channel[i] = raw[i] + self.min[i] if ids[i] > 2 else raw[i]
         bgr = dm.get_blue_green_red(self.set_id, *channel)
         if self.pixel_quant != 0:

@@ -1489,7 +1489,11 @@ def _block_deltas_from_values(ps, block, ids):
 
 
 @njit
-def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, cross_base, bias_base, use_ls):
+def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, cross_base, bias_base, use_ls,
+                mixed, data, value, cb, fwd, c9b, m, act_table, n_contexts):
+    # mixed: each delta is decoded (into delta) just before it is used, from
+    # the deltas and values so far (get_values_from_mixed_deltas).
+    state = _mix_state(data, m, value.shape[0], n_contexts)
     bwd, bht = _block_wh(np.int64(mp[0]), xdim)
     bw = (xdim - 2 + bwd - 1) // bwd
     head = 2 + np.int64(mp[1])
@@ -1501,15 +1505,23 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
     bcount = np.zeros((4, 729), dtype=np.int64)
     prim = np.zeros(ALL_PRIMITIVES, dtype=np.int64)
     row, col, win, cur, ring, z, a, b, coef, dg = _ls_state(xdim, has_ref)
+    if mixed:
+        _mix_decode_one(state, data, 0, delta, dst, value, xdim, cb, fwd, c9b, m, act_table)
     dst[0] = init
     for x in range(1, xdim):
+        if mixed:
+            _mix_decode_one(state, data, x, delta, dst, value, xdim, cb, fwd, c9b, m, act_table)
         dst[x] = dst[x - 1] + delta[x]
     for y in range(1, ydim):
         k = y * xdim
+        if mixed:
+            _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table)
         dst[k] = dst[k - xdim] + delta[k]
         mrow = head + (y - 1) // bht * bw
         for x in range(1, xdim - 1):
             k += 1
+            if mixed:
+                _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table)
             pid = ids[mp[mrow + (x - 1) // bwd]]
             if use_ls:
                 corr[4, k] = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg,
@@ -1521,18 +1533,41 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
             dst[k] = delta[k] + (prim[i] if i == j else (prim[i] + prim[j] + 1) >> 1)
             _bias_commit(dst, k, xdim, ctx, bsum, bcount, bias_base)
         k += 1
+        if mixed:
+            _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table)
         dst[k] = dst[k - 1] + delta[k]
     return dst
 
 
-def get_values_from_block_deltas(delta, xdim, ydim, init, mp, ref):
+def _from_block_args(xdim, mp, ref):
     mp = np.asarray(mp, dtype=np.uint8)
     has_ref = ref is not None
     r = np.asarray(ref, dtype=np.int64) if has_ref else np.zeros(1, dtype=np.int64)
     ids = np.array(get_map_ids(mp), dtype=np.int64)
     use_ls = bool(np.any((TABLE_FIRST[ids] == LS_FIRST) | (TABLE_SECOND[ids] == LS_FIRST)))
+    return mp, r, has_ref, ids, use_ls
+
+
+def get_values_from_block_deltas(delta, xdim, ydim, init, mp, ref):
+    mp, r, has_ref, ids, use_ls = _from_block_args(xdim, mp, ref)
+    none = np.zeros(1, dtype=np.int64)
     return _from_block(np.asarray(delta, dtype=np.int64), r, has_ref, xdim, ydim, init, mp,
-                       ids, TABLE_FIRST, TABLE_SECOND, CROSS_BASE, BIAS_BASE, use_ls)
+                       ids, TABLE_FIRST, TABLE_SECOND, CROSS_BASE, BIAS_BASE, use_ls,
+                       False, np.zeros(1, dtype=np.uint8), none, none, none, none, 2, MIX_ACTIVITY_TABLE, 1)
+
+
+def get_values_from_mixed_deltas(value, coded, previous, xdim, ydim, init, mp, ref):
+    """Decodes a channel pack_mixed_deltas coded (value, coded: from
+    read_mixed_deltas) while rebuilding it from its block map, as
+    get_values_from_block_deltas does. previous: the deltas of the channels
+    decoded before it; ref: the previous channel's values. Returns (deltas, values)."""
+    mp, r, has_ref, ids, use_ls = _from_block_args(xdim, mp, ref)
+    n = xdim * ydim
+    cb, fwd, c9b, m = _mix_setup(previous, xdim, n)
+    delta = np.zeros(n, dtype=np.int64)
+    values = _from_block(delta, r, has_ref, xdim, ydim, init, mp, ids, TABLE_FIRST, TABLE_SECOND, CROSS_BASE, BIAS_BASE,
+                         use_ls, True, coded, value, cb, fwd, c9b, m, MIX_ACTIVITY_TABLE, CONTEXTS)
+    return delta, values
 
 
 # =============================================================================
@@ -1932,12 +1967,7 @@ def pack_context_deltas(delta, previous, xdim):
     """int min, the rank table (value -> rank, see write_table), int coded
     length, coded bytes. previous: the deltas of the channels before."""
     delta = np.asarray(delta, dtype=np.int64)
-    lo = int(delta.min())
-    count = np.bincount(delta - lo)
-    order = sorted(range(len(count)), key=lambda v: (-count[v], v))
-    rank = np.zeros(len(count), dtype=np.int64)
-    rank[order] = np.arange(len(count))
-    symbol = rank[delta - lo]
+    symbol, lo, rank = _rank_symbols(delta)
     prev2d = _previous_2d(previous, len(delta))
     ctx = np.zeros(len(delta), dtype=np.int64)
     _in_bands(len(delta), lambda k0, k1: _delta_contexts(delta, prev2d, xdim, ACTIVITY_LIMIT, CROSS_LIMIT, k0, k1, ctx))
@@ -1955,6 +1985,298 @@ def read_context_deltas(inp, n, previous, xdim):
     value[rank] = np.arange(len(rank)) + lo
     return _decode_context_deltas(coded, n, value, _previous_2d(previous, n), xdim,
                                   ACTIVITY_LIMIT, CROSS_LIMIT, am._highest_one_bit(len(rank)))
+
+
+# =============================================================================
+# Mixed context coding (Block format 4; DeltaMapper.packMixedDeltas)
+# =============================================================================
+#
+# The deltas as ranks (as pack_context_deltas), coded with a mixture of
+# adaptive context models. Each model is the context coder's (counts from 1,
+# +CONTEXT_INCREMENT, halved above CONTEXT_LIMIT), with its own context:
+#   0  activity (as _delta_context) plus CALIC's gradients of this channel's
+#      values, dh + dv, halved; cross as _delta_context
+#   1  activity plus half the earlier channels' |deltas| to the E, SW, S and
+#      SE (those channels are fully known); cross as _delta_context
+#   2  activity; cross from the earlier channels' 3x3 neighbourhood, / 3
+# The first channel mixes model 0 and _delta_context's context (models 1
+# and 2 would both equal that one).
+# Mixture: C_i(s) = cum_i(s) * 2^MIX_R_BITS // total_i,
+# M(s) = (sum_i w_i C_i(s)) >> MIX_W_BITS + s, out of 2^MIX_R_BITS + n_symbols
+# (so every symbol has at least 1). The weights are ints summing to
+# 2^MIX_W_BITS, one set per channel, moved after each symbol along the
+# code-length gradient: w_i += w_i (q_i - q) / (q MIX_RATE) (Java division),
+# at least MIX_WMIN, then rescaled (the remainder to the largest, first on a
+# tie). Cumulative counts by a linear scan from rank 0 (ranks are most
+# frequent first, so the scan is short). Model 0 needs the values decoded so
+# far, so the decoder decodes each delta as it rebuilds the channel
+# (get_values_from_mixed_deltas).
+
+MIX_R_BITS = 16
+MIX_W_BITS = 16
+MIX_WMIN = 256
+MIX_RATE = 32
+
+
+def _bucket_table(limit, size):
+    """The bucket of each value 0..size-1 (values past the end use the last entry)."""
+    t = np.zeros(size, dtype=np.int64)
+    for v in range(size):
+        b = 0
+        while b + 1 < len(limit) and v >= limit[b + 1]:
+            b += 1
+        t[v] = b
+    return t
+
+
+MIX_ACTIVITY_TABLE = _bucket_table(ACTIVITY_LIMIT, 256)
+MIX_CROSS_TABLE = _bucket_table(CROSS_LIMIT, 64)
+
+
+def _rank_symbols(delta):
+    """(each delta's rank, most frequent value first, ties: smaller first; the minimum; the rank table)."""
+    delta = np.asarray(delta, dtype=np.int64)
+    lo = int(delta.min())
+    count = np.bincount(delta - lo)
+    order = sorted(range(len(count)), key=lambda v: (-count[v], v))
+    rank = np.zeros(len(count), dtype=np.int64)
+    rank[order] = np.arange(len(count))
+    return rank[delta - lo], lo, rank
+
+
+@njit
+def _mix_earlier(previous, xdim, ydim, cross_table):
+    """From the earlier channels' deltas: the cross bucket, the forward sum
+    (E, SW, S, SE) and the 3x3 cross bucket, per pixel."""
+    n = xdim * ydim
+    cross = np.zeros(n, dtype=np.int64)
+    for p in range(previous.shape[0]):
+        for k in range(n):
+            cross[k] += abs(previous[p, k])
+    top = cross_table.shape[0] - 1
+    cb = np.zeros(n, dtype=np.int64)
+    fwd = np.zeros(n, dtype=np.int64)
+    c9b = np.zeros(n, dtype=np.int64)
+    for y in range(ydim):
+        for x in range(xdim):
+            k = y * xdim + x
+            s9 = 0
+            for yy in range(max(0, y - 1), min(ydim, y + 2)):
+                for xx in range(max(0, x - 1), min(xdim, x + 2)):
+                    s9 += cross[yy * xdim + xx]
+            f = 0
+            if x + 1 < xdim:
+                f += cross[k + 1]
+            if y + 1 < ydim:
+                f += cross[k + xdim]
+                if x > 0:
+                    f += cross[k + xdim - 1]
+                if x + 1 < xdim:
+                    f += cross[k + xdim + 1]
+            cb[k] = cross_table[min(cross[k], top)]
+            c9b[k] = cross_table[min(s9 // 3, top)]
+            fwd[k] = f
+    return cb, fwd, c9b
+
+
+@njit
+def _mix_contexts(k, d, v, xdim, cb, fwd, c9b, m, act_table, ctx):
+    """The models' contexts at pixel k (d and v are read below k only)."""
+    x = k % xdim
+    act = 0
+    if x > 0:
+        act += abs(d[k - 1])
+    if k >= xdim:
+        act += abs(d[k - xdim])
+        if x > 0:
+            act += abs(d[k - xdim - 1])
+        if x < xdim - 1:
+            act += abs(d[k - xdim + 1])
+    g = 0
+    if x >= 2 and k >= 2 * xdim and x < xdim - 1:
+        W = v[k - 1]
+        N = v[k - xdim]
+        NW = v[k - xdim - 1]
+        NE = v[k - xdim + 1]
+        g = (abs(W - v[k - 2]) + abs(N - NW) + abs(N - NE)
+             + abs(W - NW) + abs(N - v[k - 2 * xdim]) + abs(NE - v[k - 2 * xdim + 1]))
+    top = act_table.shape[0] - 1
+    c = cb[k]
+    ctx[0] = act_table[min((act + g) >> 1, top)] * 5 + c
+    if m == 3:
+        ctx[1] = act_table[min(act + (fwd[k] >> 1), top)] * 5 + c
+        ctx[2] = act_table[min(act, top)] * 5 + c9b[k]
+    else:
+        ctx[1] = act_table[min(act, top)] * 5 + c
+
+
+@njit
+def _mix_init(m, n_symbols, n_contexts):
+    f = np.ones((m, n_contexts, n_symbols), dtype=np.int64)
+    total = np.full((m, n_contexts), n_symbols, dtype=np.int64)
+    w = np.full(m, (1 << MIX_W_BITS) // m, dtype=np.int64)
+    w[0] += (1 << MIX_W_BITS) - w.sum()
+    return f, total, w
+
+
+@njit
+def _mix_update(f, total, w, ctx, m, s, n_symbols, q):
+    """Moves the weights (q: each model's scaled count of s), then counts s."""
+    qm = 0
+    for j in range(m):
+        qm += w[j] * q[j]
+    qm >>= MIX_W_BITS
+    if qm < 1:
+        qm = 1
+    t = 0
+    for j in range(m):
+        w[j] += jdiv(w[j] * (q[j] - qm), qm * MIX_RATE)
+        if w[j] < MIX_WMIN:
+            w[j] = MIX_WMIN
+        t += w[j]
+    t2 = 0
+    big = 0
+    for j in range(m):
+        w[j] = (w[j] << MIX_W_BITS) // t
+        t2 += w[j]
+        if w[j] > w[big]:
+            big = j
+    w[big] += (1 << MIX_W_BITS) - t2
+    for j in range(m):
+        c = ctx[j]
+        f[j, c, s] += am.CONTEXT_INCREMENT
+        total[j, c] += am.CONTEXT_INCREMENT
+        if total[j, c] > am.CONTEXT_LIMIT:
+            u = 0
+            for i in range(n_symbols):
+                f[j, c, i] = (f[j, c, i] + 1) >> 1
+                u += f[j, c, i]
+            total[j, c] = u
+
+
+@njit
+def _mix_encode(symbol, d, v, xdim, n_symbols, cb, fwd, c9b, m, act_table, n_contexts):
+    n = symbol.shape[0]
+    f, total, w = _mix_init(m, n_symbols, n_contexts)
+    st, out = am._enc_init(n)
+    ctx = np.zeros(3, dtype=np.int64)
+    q = np.zeros(m, dtype=np.int64)
+    T = (1 << MIX_R_BITS) + n_symbols
+    for k in range(n):
+        _mix_contexts(k, d, v, xdim, cb, fwd, c9b, m, act_table, ctx)
+        s = symbol[k]
+        a = 0
+        b = 0
+        for j in range(m):
+            c = ctx[j]
+            cs = 0
+            for i in range(s):
+                cs += f[j, c, i]
+            C0 = (cs << MIX_R_BITS) // total[j, c]
+            C1 = ((cs + f[j, c, s]) << MIX_R_BITS) // total[j, c]
+            a += w[j] * C0
+            b += w[j] * C1
+            q[j] = C1 - C0
+        lo = (a >> MIX_W_BITS) + s
+        hi = (b >> MIX_W_BITS) + s + 1
+        out = am._encode(st, out, lo, hi - lo, T)
+        _mix_update(f, total, w, ctx, m, s, n_symbols, q)
+    return am._finish(st, out)
+
+
+@njit
+def _mix_state(data, m, n_symbols, n_contexts):
+    f, total, w = _mix_init(m, n_symbols, n_contexts)
+    return (am._dec_init(data), f, total, w, np.zeros(3, dtype=np.int64), np.zeros(m, dtype=np.int64),
+            np.zeros(m, dtype=np.int64), np.zeros(m, dtype=np.int64), np.zeros(m, dtype=np.int64))
+
+
+@njit
+def _mix_decode_one(state, data, k, d, v, value, xdim, cb, fwd, c9b, m, act_table):
+    """Decodes delta k into d[k] (d and v must be filled below k)."""
+    dt, f, total, w, ctx, cum, C0, C1, q = state
+    n_symbols = value.shape[0]
+    _mix_contexts(k, d, v, xdim, cb, fwd, c9b, m, act_table, ctx)
+    t = am._target(dt, (1 << MIX_R_BITS) + n_symbols)
+    for j in range(m):
+        cum[j] = 0
+        C1[j] = 0
+    s = 0
+    lo = 0
+    while True:
+        a = 0
+        for j in range(m):
+            c = ctx[j]
+            C0[j] = C1[j]
+            cum[j] += f[j, c, s]
+            C1[j] = (cum[j] << MIX_R_BITS) // total[j, c]
+            a += w[j] * C1[j]
+        hi = (a >> MIX_W_BITS) + s + 1
+        if t < hi or s == n_symbols - 1:
+            break
+        lo = hi
+        s += 1
+    for j in range(m):
+        q[j] = C1[j] - C0[j]
+    am._decode(dt, data, lo, hi - lo)
+    _mix_update(f, total, w, ctx, m, s, n_symbols, q)
+    d[k] = value[s]
+
+
+@njit
+def _mix_decode_known(data, value, v, xdim, cb, fwd, c9b, m, act_table, n_contexts):
+    """Decodes every delta with the channel's values already known (a check of the coding)."""
+    n = v.shape[0]
+    d = np.zeros(n, dtype=np.int64)
+    state = _mix_state(data, m, value.shape[0], n_contexts)
+    for k in range(n):
+        _mix_decode_one(state, data, k, d, v, value, xdim, cb, fwd, c9b, m, act_table)
+    return d
+
+
+def _mix_setup(previous, xdim, n):
+    """(cb, fwd, c9b, number of models) for a channel with the earlier channels' deltas previous."""
+    if not previous:
+        z = np.zeros(n, dtype=np.int64)
+        return z, z, z, 2
+    prev2d = _previous_2d(previous, n)
+    cb, fwd, c9b = _mix_earlier(prev2d, xdim, n // xdim, MIX_CROSS_TABLE)
+    return cb, fwd, c9b, 3
+
+
+def pack_mixed_deltas(delta, values, previous, xdim):
+    """A channel's deltas, mixed-context coded: int min, the rank table (as
+    pack_context_deltas), int coded length, coded bytes. values: the channel
+    as the decoder rebuilds it (before any minimum is added back); previous:
+    the deltas of the channels coded before it."""
+    delta = np.asarray(delta, dtype=np.int64)
+    symbol, lo, rank = _rank_symbols(delta)
+    cb, fwd, c9b, m = _mix_setup(previous, xdim, len(delta))
+    coded = _mix_encode(symbol, delta, np.asarray(values, dtype=np.int64), xdim, len(rank),
+                        cb, fwd, c9b, m, MIX_ACTIVITY_TABLE, CONTEXTS)
+    out = DataOutput()
+    out.write_int(lo); write_table(out, rank); out.write_int(len(coded)); out.write(coded.tobytes())
+    return out.to_bytes()
+
+
+def read_mixed_deltas(inp):
+    """Reads what pack_mixed_deltas wrote, without decoding it:
+    (the value of each rank, the coded bytes)."""
+    lo = inp.read_int()
+    rank = read_table(inp)
+    coded = np.frombuffer(inp.read_fully(inp.read_int()), dtype=np.uint8)
+    value = np.zeros(len(rank), dtype=np.int64)
+    value[rank] = np.arange(len(rank)) + lo
+    return value, coded
+
+
+def unpack_mixed_deltas(packed, values, previous, xdim):
+    """Decodes pack_mixed_deltas' bytes given the channel's values (for
+    checking the coding; a reader rebuilds the values as it decodes)."""
+    value, coded = read_mixed_deltas(DataInput(packed))
+    values = np.asarray(values, dtype=np.int64)
+    cb, fwd, c9b, m = _mix_setup(previous, xdim, len(values))
+    return _mix_decode_known(coded, value, values, xdim, cb, fwd, c9b, m, MIX_ACTIVITY_TABLE, CONTEXTS)
 
 
 # =============================================================================
