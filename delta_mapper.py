@@ -13,6 +13,8 @@ import math
 import os
 from concurrent.futures import ThreadPoolExecutor
 
+import threading
+
 import numpy as np
 
 from numba_support import njit, jdiv
@@ -1084,9 +1086,12 @@ def _bias_corrections(v, xdim, ydim, bias_base):
 # columns either side, and the LS_RADIUS pixels to the left -- from 8
 # neighbours and, after the first channel, the previous channel at the
 # pixel, to its left and above. The window's sums are exact integers, kept
-# as it slides; the fit (ridge 1, Gaussian elimination with partial
-# pivoting) is done in the Java's order, so both get the same values.
-# _ls_next must be called for every interior pixel in raster order.
+# as it slides (each pixel's products computed once, kept in a ring of
+# LS_RADIUS + 1 rows); the fit (ridge 1, solved by L D L^T) is done in the
+# Java's order, so both get the same values.
+# _ls_next must be called for every interior pixel in raster order, from
+# row 1 or from a row given to _ls_start; because the sums are exact, the
+# encoder computes bands of rows independently (_ls_plane).
 
 @njit
 def _ls_at(v, y, x, xdim):
@@ -1113,14 +1118,20 @@ def _ls_features(v, ref, has_ref, xdim, nf, y, x, z):
 
 
 @njit
-def _ls_add(v, ref, has_ref, xdim, nf, sums, off, y, x, sign, z):
+def _ls_slot(y, x, xdim, nt):
+    return ((y % (LS_RADIUS + 1)) * xdim + x) * nt
+
+
+@njit
+def _ls_products(v, ref, has_ref, xdim, nf, y, x, z, ring):
+    """Pixel (y, x)'s products into its slot in ring."""
     _ls_features(v, ref, has_ref, xdim, nf, y, x, z)
     m = nf + 2
-    t = off
+    t = _ls_slot(y, x, xdim, m * (m + 1) // 2)
     for i in range(m):
-        zi = sign * z[i]
+        zi = z[i]
         for j in range(i, m):
-            sums[t] += zi * z[j]
+            ring[t] = zi * z[j]
             t += 1
 
 
@@ -1130,12 +1141,31 @@ def _ls_state(xdim, has_ref):
     m = nf + 2
     nt = m * (m + 1) // 2
     return (np.full(1, -1, dtype=np.int64), np.zeros(xdim * nt, dtype=np.int64), np.zeros(nt, dtype=np.int64),
-            np.zeros(nt, dtype=np.int64), np.zeros(m, dtype=np.int64), np.zeros((nf + 1, nf + 1)), np.zeros(nf + 1), np.zeros(nf + 1))
+            np.zeros(nt, dtype=np.int64), np.zeros((LS_RADIUS + 1) * xdim * nt, dtype=np.int32), np.zeros(m, dtype=np.int64),
+            np.zeros((nf + 1, nf + 1)), np.zeros(nf + 1), np.zeros(nf + 1), np.zeros(nf + 1))
 
 
 @njit
-def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, z, a, b, coef):
-    """The least-squares primitive at interior pixel k."""
+def _ls_start(v, ref, has_ref, xdim, y0, row, col, ring, z):
+    """Sets the window up as if the rows before y0 had been gone through."""
+    nf = 11 if has_ref else 8
+    m = nf + 2
+    nt = m * (m + 1) // 2
+    for ty in range(max(1, y0 - 1 - LS_RADIUS), y0):
+        for tx in range(1, xdim - 1):
+            _ls_products(v, ref, has_ref, xdim, nf, ty, tx, z, ring)
+            if ty <= y0 - 2:
+                c = tx * nt
+                sl = _ls_slot(ty, tx, xdim, nt)
+                for t in range(nt):
+                    col[c + t] += ring[sl + t]
+    row[0] = y0 - 1
+
+
+@njit
+def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg, fit):
+    """Moves the window to interior pixel k and, if fit, returns the
+    least-squares primitive there (the decoder fits only where it is used)."""
     nf = 11 if has_ref else 8
     m = nf + 2
     nt = m * (m + 1) // 2
@@ -1143,13 +1173,20 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, z, a, b, coef):
     y = k // xdim
     x = k % xdim
     if y != row[0]:
-        row[0] = y
         if y - 1 >= 1:
+            _ls_products(v, ref, has_ref, xdim, nf, y - 1, xdim - 2, z, ring)
             for tx in range(1, xdim - 1):
-                _ls_add(v, ref, has_ref, xdim, nf, col, tx * nt, y - 1, tx, 1, z)
+                c = tx * nt
+                sl = _ls_slot(y - 1, tx, xdim, nt)
+                for t in range(nt):
+                    col[c + t] += ring[sl + t]
         if y - 1 - r >= 1:
             for tx in range(1, xdim - 1):
-                _ls_add(v, ref, has_ref, xdim, nf, col, tx * nt, y - 1 - r, tx, -1, z)
+                c = tx * nt
+                sl = _ls_slot(y - 1 - r, tx, xdim, nt)
+                for t in range(nt):
+                    col[c + t] -= ring[sl + t]
+        row[0] = y
         win[:] = 0
         cur[:] = 0
         for tx in range(1, min(xdim - 2, 1 + r) + 1):
@@ -1157,14 +1194,23 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, z, a, b, coef):
                 win[t] += col[tx * nt + t]
     else:
         if x + r <= xdim - 2:
+            c = (x + r) * nt
             for t in range(nt):
-                win[t] += col[(x + r) * nt + t]
+                win[t] += col[c + t]
         if x - r - 1 >= 1:
+            c = (x - r - 1) * nt
             for t in range(nt):
-                win[t] -= col[(x - r - 1) * nt + t]
-        _ls_add(v, ref, has_ref, xdim, nf, cur, 0, y, x - 1, 1, z)
+                win[t] -= col[c + t]
+        _ls_products(v, ref, has_ref, xdim, nf, y, x - 1, z, ring)
+        sl = _ls_slot(y, x - 1, xdim, nt)
+        for t in range(nt):
+            cur[t] += ring[sl + t]
         if x - 1 - r >= 1:
-            _ls_add(v, ref, has_ref, xdim, nf, cur, 0, y, x - 1 - r, -1, z)
+            sl = _ls_slot(y, x - 1 - r, xdim, nt)
+            for t in range(nt):
+                cur[t] -= ring[sl + t]
+    if not fit:
+        return 0
 
     n = nf + 1
     pa = _ls_at(v, y, x - 1, xdim); pb = _ls_at(v, y - 1, x, xdim)
@@ -1172,35 +1218,37 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, z, a, b, coef):
     cnt = win[nf * m - nf * (nf - 1) // 2] + cur[nf * m - nf * (nf - 1) // 2]
     if cnt < 2 * n:
         return pa
+    # The normal equations' lower triangle (ridge 1), then L D L^T as in the Java.
     for i in range(n):
         base = i * m - i * (i - 1) // 2
         for j in range(i, n):
-            sv = float(win[base + j - i] + cur[base + j - i])
-            a[i, j] = sv
-            a[j, i] = sv
+            a[j, i] = float(win[base + j - i] + cur[base + j - i])
         b[i] = float(win[base + m - 1 - i] + cur[base + m - 1 - i])
         a[i, i] += 1.0
-    for c in range(n):
-        piv = c
-        for q in range(c + 1, n):
-            if abs(a[q, c]) > abs(a[piv, c]):
-                piv = q
-        if abs(a[piv, c]) < 1e-9:
+    for j in range(n):
+        sv = a[j, j]
+        for q in range(j):
+            sv -= a[j, q] * a[j, q] * dg[q]
+        if sv < 1e-9:
             return pa
-        if piv != c:
-            for j in range(n):
-                t_ = a[c, j]; a[c, j] = a[piv, j]; a[piv, j] = t_
-            u = b[c]; b[c] = b[piv]; b[piv] = u
-        for q in range(c + 1, n):
-            f = a[q, c] / a[c, c]
-            for j in range(c, n):
-                a[q, j] -= f * a[c, j]
-            b[q] -= f * b[c]
-    for i in range(n - 1, -1, -1):
+        dg[j] = sv
+        for i in range(j + 1, n):
+            t_ = a[i, j]
+            for q in range(j):
+                t_ -= a[i, q] * a[j, q] * dg[q]
+            a[i, j] = t_ / sv
+    for i in range(n):
         sv = b[i]
-        for j in range(i + 1, n):
-            sv -= a[i, j] * coef[j]
-        coef[i] = sv / a[i, i]
+        for q in range(i):
+            sv -= a[i, q] * coef[q]
+        coef[i] = sv
+    for i in range(n):
+        coef[i] /= dg[i]
+    for i in range(n - 1, -1, -1):
+        sv = coef[i]
+        for q in range(i + 1, n):
+            sv -= a[q, i] * coef[q]
+        coef[i] = sv
     _ls_features(v, ref, has_ref, xdim, nf, y, x, z)
     p = 0.0
     for i in range(n):
@@ -1215,14 +1263,37 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, z, a, b, coef):
 
 
 @njit
-def _ls_plane(v, ref, has_ref, xdim, ydim):
-    """The encoder's least-squares primitive for the whole channel."""
-    out = np.zeros(v.shape[0], dtype=np.int16)
-    row, col, win, cur, z, a, b, coef = _ls_state(xdim, has_ref)
-    for y in range(1, ydim):
+def _ls_band(v, ref, has_ref, xdim, y0, y1, out):
+    row, col, win, cur, ring, z, a, b, coef, dg = _ls_state(xdim, has_ref)
+    _ls_start(v, ref, has_ref, xdim, y0, row, col, ring, z)
+    for y in range(y0, y1):
         for x in range(1, xdim - 1):
             k = y * xdim + x
-            out[k] = _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, z, a, b, coef)
+            out[k] = _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg, True)
+
+
+_LS_CACHE = []        # recently computed planes: (xdim, channel copy, previous channel copy or None, plane)
+_LS_CACHE_SIZE = 3    # a channel set's three
+_LS_CACHE_LOCK = threading.Lock()
+_LS_POOL = ThreadPoolExecutor(_CPUS)   # its own: PixelSources are made in _ROW_POOL's threads
+
+
+def _ls_plane(v, ref, has_ref, xdim, ydim):
+    """The encoder's least-squares primitive for the whole channel
+    (DeltaMapper.leastSquaresPlane): bands of rows in parallel, reused if
+    the same channel (and previous channel) was just done."""
+    r = ref if has_ref else None
+    with _LS_CACHE_LOCK:
+        for xd, cv, cr, plane in _LS_CACHE:
+            if xd == xdim and np.array_equal(cv, v) and ((cr is None and r is None) or (cr is not None and r is not None and np.array_equal(cr, r))):
+                return plane
+    out = np.zeros(v.shape[0], dtype=np.int16)
+    band = max(4 * (LS_RADIUS + 1), (ydim - 1 + _CPUS - 1) // _CPUS)
+    for f in [_LS_POOL.submit(_ls_band, v, ref, has_ref, xdim, y0, min(ydim, y0 + band), out) for y0 in range(1, ydim, band)]:
+        f.result()
+    with _LS_CACHE_LOCK:
+        _LS_CACHE.append((xdim, v.copy(), None if r is None else r.copy(), out))
+        del _LS_CACHE[:-_LS_CACHE_SIZE]
     return out
 
 
@@ -1429,7 +1500,7 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
     bsum = np.zeros((4, 729), dtype=np.int64)
     bcount = np.zeros((4, 729), dtype=np.int64)
     prim = np.zeros(ALL_PRIMITIVES, dtype=np.int64)
-    row, col, win, cur, z, a, b, coef = _ls_state(xdim, has_ref)
+    row, col, win, cur, ring, z, a, b, coef, dg = _ls_state(xdim, has_ref)
     dst[0] = init
     for x in range(1, xdim):
         dst[x] = dst[x - 1] + delta[x]
@@ -1439,11 +1510,12 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
         mrow = head + (y - 1) // bht * bw
         for x in range(1, xdim - 1):
             k += 1
+            pid = ids[mp[mrow + (x - 1) // bwd]]
             if use_ls:
-                corr[4, k] = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, cur, z, a, b, coef)
+                corr[4, k] = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg,
+                                      first[pid] == LS_FIRST or second[pid] == LS_FIRST)
             _bias_prepare(dst, k, xdim, ctx, corr, bsum, bcount)
             _all_primitives(dst, ref, has_ref, corr, k, xdim, prim)
-            pid = ids[mp[mrow + (x - 1) // bwd]]
             i = first[pid]
             j = second[pid]
             dst[k] = delta[k] + (prim[i] if i == j else (prim[i] + prim[j] + 1) >> 1)
