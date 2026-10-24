@@ -790,11 +790,13 @@ _SHAPE_H = np.array([h for _, h in BLOCK_SHAPES], dtype=np.int64)
 BLOCK_SEARCH_SIZES = [4, 6, 8, 12, 16, 24, 32]
 
 # Primitives: 0-21 on a, b, c, d (_block_predictor); 22-27 selection; 28-35
-# cross-channel; 36-39 longer reach; 40-41 clamped; 42-45 bias-corrected.
+# cross-channel; 36-39 longer reach; 40-41 clamped; 42-45 bias-corrected;
+# 46 least squares (LS: see _ls_next).
 PRIMITIVES = 22
-SELECTION_FIRST, CROSS_FIRST, REACH_FIRST, CLAMP_FIRST, BIAS_FIRST, ALL_PRIMITIVES = 22, 28, 36, 40, 42, 46
-GROUP_NAMES = ["selection", "cross-channel", "longer reach", "clamped", "bias-corrected"]
-GROUP_FIRST = [SELECTION_FIRST, CROSS_FIRST, REACH_FIRST, CLAMP_FIRST, BIAS_FIRST, ALL_PRIMITIVES]
+SELECTION_FIRST, CROSS_FIRST, REACH_FIRST, CLAMP_FIRST, BIAS_FIRST, LS_FIRST, ALL_PRIMITIVES = 22, 28, 36, 40, 42, 46, 47
+LS_RADIUS = 10   # the least-squares window: rows above, columns either side, pixels to the left
+GROUP_NAMES = ["selection", "cross-channel", "longer reach", "clamped", "bias-corrected", "least squares"]
+GROUP_FIRST = [SELECTION_FIRST, CROSS_FIRST, REACH_FIRST, CLAMP_FIRST, BIAS_FIRST, LS_FIRST, ALL_PRIMITIVES]
 PRIMITIVE_NAMES = [
     "a", "b", "c", "d", "(a+b)/2", "(b+c)/2", "(a+c)/2", "(b+d)/2",
     "(c+d)/2", "(a+b+c+d)/4", "a+b-c", "MED", "(3a+b)/4", "(a+3b)/4", "(3a+d)/4", "(3b+a)/4",
@@ -804,11 +806,12 @@ EXTRA_PRIMITIVE_NAMES = [
     "a+(R-Ra)", "b+(R-Rb)", "d+(R-Rd)", "MED+(R-MED_R)", "(a+b)/2+(R-..)", "a+b-c+(R-..)", "MED+(R-MED_R)/2", "(a+b)/2+(R-..)/2",
     "2a-aa", "2b-bb", "GAP", "GAP/8",
     "clamp(a+b-c)", "clamp(a+d-b)",
-    "MED+bias", "(a+b)/2+bias", "a+bias", "b+bias"]
+    "MED+bias", "(a+b)/2+bias", "a+bias", "b+bias",
+    "LS"]
 CROSS_BASE = np.array([0, 1, 3, 11, 4, 10, 11, 4], dtype=np.int64)   # the last two with half the error
 BIAS_BASE = np.array([11, 4, 0, 1], dtype=np.int64)
 
-# PREDICTOR_TABLE as pairs of primitives (equal for a primitive alone).
+# PREDICTOR_TABLE as pairs of primitives (equal for a primitive alone); id 255 is LS.
 PREDICTOR_PAIRS = [
     0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 11, 11, 13, 13,
     16, 16, 18, 18, 19, 19, 23, 23, 24, 24, 25, 25, 28, 28, 29, 29, 30, 30, 31, 31, 32, 32, 34, 34,
@@ -831,10 +834,10 @@ PREDICTOR_PAIRS = [
     39, 37, 40, 0, 40, 1, 40, 3, 40, 7, 40, 11, 40, 16, 40, 19, 40, 25, 40, 34, 40, 36, 40, 37,
     40, 39, 42, 0, 42, 1, 42, 3, 42, 4, 42, 6, 42, 7, 42, 16, 42, 18, 42, 23, 42, 29, 42, 34,
     42, 35, 42, 36, 42, 37, 42, 39, 42, 40, 45, 0, 45, 3, 45, 4, 45, 5, 45, 6, 45, 7, 45, 16,
-    45, 23, 45, 34, 45, 39]
+    45, 23, 45, 34, 45, 39, 46, 46]
 TABLE_FIRST = np.array(PREDICTOR_PAIRS[0::2], dtype=np.int64)
 TABLE_SECOND = np.array(PREDICTOR_PAIRS[1::2], dtype=np.int64)
-PREDICTORS = len(TABLE_FIRST)   # 255
+PREDICTORS = len(TABLE_FIRST)   # 256
 TABLE_PRIMITIVES = int(max(TABLE_FIRST.max(), TABLE_SECOND.max())) + 1
 
 # Named sets: the first 4, 8, 16 and 32 of one greedy order (DeltaMapper.BLOCK_ORDER).
@@ -1074,6 +1077,155 @@ def _bias_corrections(v, xdim, ydim, bias_base):
     return corr
 
 
+# ---- The least-squares primitive (DeltaMapper.LeastSquares) -------------------
+#
+# At each pixel, the linear predictor (with a constant term) that best fits
+# the pixels in a causal window -- the LS_RADIUS rows above, LS_RADIUS
+# columns either side, and the LS_RADIUS pixels to the left -- from 8
+# neighbours and, after the first channel, the previous channel at the
+# pixel, to its left and above. The window's sums are exact integers, kept
+# as it slides; the fit (ridge 1, Gaussian elimination with partial
+# pivoting) is done in the Java's order, so both get the same values.
+# _ls_next must be called for every interior pixel in raster order.
+
+@njit
+def _ls_at(v, y, x, xdim):
+    if y < 0:
+        y = 0
+    if x < 0:
+        x = 0
+    elif x > xdim - 1:
+        x = xdim - 1
+    return v[y * xdim + x]
+
+
+@njit
+def _ls_features(v, ref, has_ref, xdim, nf, y, x, z):
+    z[0] = _ls_at(v, y, x - 1, xdim); z[1] = _ls_at(v, y - 1, x, xdim)
+    z[2] = _ls_at(v, y - 1, x - 1, xdim); z[3] = _ls_at(v, y - 1, x + 1, xdim)
+    z[4] = _ls_at(v, y, x - 2, xdim); z[5] = _ls_at(v, y - 2, x, xdim)
+    z[6] = _ls_at(v, y - 1, x + 2, xdim); z[7] = _ls_at(v, y - 2, x + 1, xdim)
+    if has_ref:
+        k = y * xdim + x
+        z[8] = ref[k]; z[9] = ref[k - 1]; z[10] = ref[k - xdim]
+    z[nf] = 1
+    z[nf + 1] = v[y * xdim + x]
+
+
+@njit
+def _ls_add(v, ref, has_ref, xdim, nf, sums, off, y, x, sign, z):
+    _ls_features(v, ref, has_ref, xdim, nf, y, x, z)
+    m = nf + 2
+    t = off
+    for i in range(m):
+        zi = sign * z[i]
+        for j in range(i, m):
+            sums[t] += zi * z[j]
+            t += 1
+
+
+@njit
+def _ls_state(xdim, has_ref):
+    nf = 11 if has_ref else 8
+    m = nf + 2
+    nt = m * (m + 1) // 2
+    return (np.full(1, -1, dtype=np.int64), np.zeros(xdim * nt, dtype=np.int64), np.zeros(nt, dtype=np.int64),
+            np.zeros(nt, dtype=np.int64), np.zeros(m, dtype=np.int64), np.zeros((nf + 1, nf + 1)), np.zeros(nf + 1), np.zeros(nf + 1))
+
+
+@njit
+def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, z, a, b, coef):
+    """The least-squares primitive at interior pixel k."""
+    nf = 11 if has_ref else 8
+    m = nf + 2
+    nt = m * (m + 1) // 2
+    r = LS_RADIUS
+    y = k // xdim
+    x = k % xdim
+    if y != row[0]:
+        row[0] = y
+        if y - 1 >= 1:
+            for tx in range(1, xdim - 1):
+                _ls_add(v, ref, has_ref, xdim, nf, col, tx * nt, y - 1, tx, 1, z)
+        if y - 1 - r >= 1:
+            for tx in range(1, xdim - 1):
+                _ls_add(v, ref, has_ref, xdim, nf, col, tx * nt, y - 1 - r, tx, -1, z)
+        win[:] = 0
+        cur[:] = 0
+        for tx in range(1, min(xdim - 2, 1 + r) + 1):
+            for t in range(nt):
+                win[t] += col[tx * nt + t]
+    else:
+        if x + r <= xdim - 2:
+            for t in range(nt):
+                win[t] += col[(x + r) * nt + t]
+        if x - r - 1 >= 1:
+            for t in range(nt):
+                win[t] -= col[(x - r - 1) * nt + t]
+        _ls_add(v, ref, has_ref, xdim, nf, cur, 0, y, x - 1, 1, z)
+        if x - 1 - r >= 1:
+            _ls_add(v, ref, has_ref, xdim, nf, cur, 0, y, x - 1 - r, -1, z)
+
+    n = nf + 1
+    pa = _ls_at(v, y, x - 1, xdim); pb = _ls_at(v, y - 1, x, xdim)
+    pc = _ls_at(v, y - 1, x - 1, xdim); pd = _ls_at(v, y - 1, x + 1, xdim)
+    cnt = win[nf * m - nf * (nf - 1) // 2] + cur[nf * m - nf * (nf - 1) // 2]
+    if cnt < 2 * n:
+        return pa
+    for i in range(n):
+        base = i * m - i * (i - 1) // 2
+        for j in range(i, n):
+            sv = float(win[base + j - i] + cur[base + j - i])
+            a[i, j] = sv
+            a[j, i] = sv
+        b[i] = float(win[base + m - 1 - i] + cur[base + m - 1 - i])
+        a[i, i] += 1.0
+    for c in range(n):
+        piv = c
+        for q in range(c + 1, n):
+            if abs(a[q, c]) > abs(a[piv, c]):
+                piv = q
+        if abs(a[piv, c]) < 1e-9:
+            return pa
+        if piv != c:
+            for j in range(n):
+                t_ = a[c, j]; a[c, j] = a[piv, j]; a[piv, j] = t_
+            u = b[c]; b[c] = b[piv]; b[piv] = u
+        for q in range(c + 1, n):
+            f = a[q, c] / a[c, c]
+            for j in range(c, n):
+                a[q, j] -= f * a[c, j]
+            b[q] -= f * b[c]
+    for i in range(n - 1, -1, -1):
+        sv = b[i]
+        for j in range(i + 1, n):
+            sv -= a[i, j] * coef[j]
+        coef[i] = sv / a[i, i]
+    _ls_features(v, ref, has_ref, xdim, nf, y, x, z)
+    p = 0.0
+    for i in range(n):
+        p += coef[i] * z[i]
+    lo = min(min(pa, pb), min(pc, pd))
+    hi = max(max(pa, pb), max(pc, pd))
+    if p < lo - 2:
+        p = lo - 2
+    if p > hi + 2:
+        p = hi + 2
+    return int(np.floor(p + 0.5))
+
+
+@njit
+def _ls_plane(v, ref, has_ref, xdim, ydim):
+    """The encoder's least-squares primitive for the whole channel."""
+    out = np.zeros(v.shape[0], dtype=np.int16)
+    row, col, win, cur, z, a, b, coef = _ls_state(xdim, has_ref)
+    for y in range(1, ydim):
+        for x in range(1, xdim - 1):
+            k = y * xdim + x
+            out[k] = _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, z, a, b, coef)
+    return out
+
+
 @njit
 def _primitive(q, v, ref, has_ref, corr, k, xdim, cross_base, bias_base):
     """Primitive q at interior pixel k of channel v (ref: the previous channel)."""
@@ -1106,6 +1258,8 @@ def _primitive(q, v, ref, has_ref, corr, k, xdim, cross_base, bias_base):
         hi = max(max(a, b), max(c, d))
         p = a + b - c if q == CLAMP_FIRST else a + d - b
         return max(lo, min(hi, p))
+    if q >= LS_FIRST:
+        return np.int64(corr[4, k])
     s = q - BIAS_FIRST
     return _block_predictor(bias_base[s], a, b, c, d) + np.int64(corr[s, k])
 
@@ -1155,6 +1309,7 @@ def _all_primitives(v, ref, has_ref, corr, k, xdim, prim):
     prim[40] = max(lo, min(hi, a + b - c)); prim[41] = max(lo, min(hi, a + d - b))
     prim[42] = med + np.int64(corr[0, k]); prim[43] = prim[4] + np.int64(corr[1, k])
     prim[44] = a + np.int64(corr[2, k]); prim[45] = b + np.int64(corr[3, k])
+    prim[46] = np.int64(corr[4, k]) if corr.shape[0] > 4 else a   # LS (row 4: see PixelSource)
 
 
 @njit
@@ -1169,14 +1324,17 @@ def _predict(pid, first, second, v, ref, has_ref, corr, k, xdim, cross_base, bia
 
 class PixelSource:
     """What the table's primitives need for a channel (DeltaMapper.PixelSource,
-    encoder side): the channel, the previous channel, the bias corrections."""
+    encoder side): the channel, the previous channel, the bias corrections
+    (corr rows 0-3) and the least-squares primitive (row 4)."""
 
     def __init__(self, v, ref, xdim, ydim):
         self.v = np.asarray(v, dtype=np.int64)
         self.has_ref = ref is not None
         self.ref = np.asarray(ref, dtype=np.int64) if ref is not None else np.zeros(1, dtype=np.int64)
         self.xdim, self.ydim = xdim, ydim
-        self.corr = _bias_corrections(self.v, xdim, ydim, BIAS_BASE)
+        corr = _bias_corrections(self.v, xdim, ydim, BIAS_BASE)
+        ls = _ls_plane(self.v, self.ref, self.has_ref, xdim, ydim)
+        self.corr = np.concatenate([corr, ls[None, :]])
 
 
 @njit
@@ -1260,29 +1418,32 @@ def _block_deltas_from_values(ps, block, ids):
 
 
 @njit
-def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, cross_base, bias_base):
+def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, cross_base, bias_base, use_ls):
     bwd, bht = _block_wh(np.int64(mp[0]), xdim)
     bw = (xdim - 2 + bwd - 1) // bwd
     head = 2 + np.int64(mp[1])
     n = xdim * ydim
     dst = np.zeros(n, dtype=np.int64)
-    corr = np.zeros((4, n), dtype=np.int16)
+    corr = np.zeros((5, n), dtype=np.int16)   # bias corrections, then LS (computed only if the map uses it)
     ctx = np.zeros(1, dtype=np.int64)
     bsum = np.zeros((4, 729), dtype=np.int64)
     bcount = np.zeros((4, 729), dtype=np.int64)
     prim = np.zeros(ALL_PRIMITIVES, dtype=np.int64)
+    row, col, win, cur, z, a, b, coef = _ls_state(xdim, has_ref)
     dst[0] = init
     for x in range(1, xdim):
         dst[x] = dst[x - 1] + delta[x]
     for y in range(1, ydim):
         k = y * xdim
         dst[k] = dst[k - xdim] + delta[k]
-        row = head + (y - 1) // bht * bw
+        mrow = head + (y - 1) // bht * bw
         for x in range(1, xdim - 1):
             k += 1
+            if use_ls:
+                corr[4, k] = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, cur, z, a, b, coef)
             _bias_prepare(dst, k, xdim, ctx, corr, bsum, bcount)
             _all_primitives(dst, ref, has_ref, corr, k, xdim, prim)
-            pid = ids[mp[row + (x - 1) // bwd]]
+            pid = ids[mp[mrow + (x - 1) // bwd]]
             i = first[pid]
             j = second[pid]
             dst[k] = delta[k] + (prim[i] if i == j else (prim[i] + prim[j] + 1) >> 1)
@@ -1296,8 +1457,10 @@ def get_values_from_block_deltas(delta, xdim, ydim, init, mp, ref):
     mp = np.asarray(mp, dtype=np.uint8)
     has_ref = ref is not None
     r = np.asarray(ref, dtype=np.int64) if has_ref else np.zeros(1, dtype=np.int64)
+    ids = np.array(get_map_ids(mp), dtype=np.int64)
+    use_ls = bool(np.any((TABLE_FIRST[ids] == LS_FIRST) | (TABLE_SECOND[ids] == LS_FIRST)))
     return _from_block(np.asarray(delta, dtype=np.int64), r, has_ref, xdim, ydim, init, mp,
-                       np.array(get_map_ids(mp), dtype=np.int64), TABLE_FIRST, TABLE_SECOND, CROSS_BASE, BIAS_BASE)
+                       ids, TABLE_FIRST, TABLE_SECOND, CROSS_BASE, BIAS_BASE, use_ls)
 
 
 # =============================================================================

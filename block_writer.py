@@ -4,8 +4,9 @@ block_writer.py version 2.0 -- BlockWriter.java for Python (PySide6).
 
 A writer with one delta type and one entropy coder: the block map (delta
 type 13) with Context-coded deltas and a coded map. Each block uses one
-predictor from its channel's set, and a set can be any of the 255
-predictors delta_mapper has ids for. The startup analysis (and Find Best)
+predictor from its channel's set, and a set can be any of the 256
+predictors delta_mapper has ids for (id 255 is the least-squares predictor,
+LS). The startup analysis (and Find Best)
 picks the channel set, then surveys the sets (delta_mapper.survey_block_sets:
 per channel, predictors added in greedy order by estimated coded bits,
 blocks assigned by the estimate, and the real coded size measured), and
