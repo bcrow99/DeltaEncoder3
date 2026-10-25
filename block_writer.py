@@ -1,24 +1,23 @@
 #!/usr/bin/env python3
 """
-block_writer.py version 2.1 -- BlockWriter.java for Python (PySide6).
+block_writer.py version 2.2 -- BlockWriter.java for Python (PySide6).
 
 A writer with one delta type and one entropy coder: the block map (delta
 type 13) with mixed-context-coded deltas (delta_mapper.pack_mixed_deltas)
-and a coded map. Each block uses one
-predictor from its channel's set, and a set can be any of the 256
-predictors delta_mapper has ids for (id 255 is the least-squares predictor,
-LS). The sets come from the predictor table alone: the startup analysis
-(and Find Best) picks the channel set, then surveys each channel's set
-(delta_mapper.survey_block_sets: predictors added in greedy order by
+and a coded map. Each block uses one predictor from its channel's set, and
+a set can be any of the 256 predictors delta_mapper has ids for (id 255 is
+the least-squares predictor, LS). There are no block settings to choose:
+the survey makes them from the predictor table alone. It picks the channel
+set, then, channel by channel, the block size (a square of 4, 6, 8, 12 or 16) and
+the predictor set that code the channel smallest
+(delta_mapper.survey_channels: predictors added in greedy order by
 estimated coded bits, the estimate's reference deltas from the whole table,
 blocks assigned by the estimate, and the real coded size measured at each
-count), and keeps the block shape that codes smallest -- actual sizes, not
-estimates. The sets are surveyed per block shape: a shape picked by hand
-uses its own. Saves (to the file
-"foo", as the Java version does) in Block format 'B' version 4, read by
-block_reader.py and BlockReader.java. The analysis measures sizes with the
-Context coder (pack_context_deltas); the file uses the mixed coder, about
-1% smaller.
+count). It runs at startup and again after any change to the quantization
+(Pixel Resolution or Color Resolution). Saves (to the file "foo", as the
+Java version does) in Block format 'B' version 5, read by block_reader.py
+and BlockReader.java. The survey measures sizes with the Context coder
+(pack_context_deltas); the file uses the mixed coder, about 1% smaller.
 
     python3 block_writer.py [image]
 
@@ -30,6 +29,7 @@ The coding (class BlockCoder) is separate from the window:
 
 import os
 import sys
+import time
 
 import numpy as np
 
@@ -40,7 +40,9 @@ import viewer_support as vs
 from java_io import DataOutput
 
 FORMAT_ID = ord('B')
-FORMAT_VERSION = 4   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: mixed context coding
+FORMAT_VERSION = 5   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: mixed context coding; 5: a block size per channel
+
+QUANT_SETTLE_MS = 400   # how long a quantization slider must rest before the survey runs again
 
 
 def mixed_code(delta, values, xdim):
@@ -74,9 +76,9 @@ def best_set(channel_sum):
 # =============================================================================
 
 class BlockCoder:
-    """Holds an image and the settings; survey() picks the block size and
-    predictor set, apply() makes the deltas (and the preview), save() codes
-    and writes the file."""
+    """Holds an image and the quantization; survey() picks each channel's
+    block size and predictor set, apply() makes the deltas (and the
+    preview), save() codes and writes the file."""
 
     def __init__(self, rgb, file_length=0):
         self.image_ydim, self.image_xdim = rgb.shape[:2]
@@ -87,31 +89,34 @@ class BlockCoder:
         self.pixel_shift = 3
         self.correction = 0         # preview only
         self.min_set_id = 0
-        self.block_size = dm.BLOCK_DEFAULT   # the square's size
-        self.block_shape = 0        # 0: square (block_size); i + 1: dm.BLOCK_SHAPES[i]
-        self.survey_shapes = True   # Find Best also tries the rectangles and lines
-        self.survey_sets = None     # each channel's surveyed predictor ids, by block shape: every
-                                    # shape the last analysis tried, plus any surveyed since
+
+        # The last survey: each channel's block size and predictor ids, in
+        # coding order (None before the first), and the quantization it was
+        # made for.
+        self.survey_blocks = None
+        self.survey_ids = None
+        self.survey_deltas = self.survey_maps = None
+        self.survey_quant = self.survey_shift = -1
+        self.survey_time = None     # the survey's seconds, printed with the next apply's listing
 
         self.channel_sum = [0] * 6
         self.channel_min = [0] * 6
         self.channel_init = [0] * 6
         self.applied = False
 
-    def block(self):
-        """The block map's shape code (dm.block_width / dm.block_height)."""
-        return self.block_size if self.block_shape == 0 else dm.SHAPE_FIRST + self.block_shape - 1
-
-    def quantized_channels(self, size):
+    def quantized_channels(self, size, quant=None, shift=None):
         """(the six candidate channels after resizing and quantizing, their
-        minimums, their first values)."""
+        minimums, their first values), at this quantization (the coder's by
+        default)."""
+        quant = self.pixel_quant if quant is None else quant
+        shift = self.pixel_shift if shift is None else shift
         q = [None] * 3
 
         def one(i):
             ch = self.source[i]
-            if self.pixel_quant != 0:
+            if quant != 0:
                 ch = rm.resize(ch, self.image_xdim, size[0], size[1])
-            q[i] = dm.quantize_channel(ch, self.pixel_shift)
+            q[i] = dm.quantize_channel(ch, shift)
         vs.parallel(3, one)
         qc, mins = dm.get_candidate_channels(q[0], q[1], q[2])
         return qc, list(mins), [int(c[0]) for c in qc]
@@ -126,58 +131,51 @@ class BlockCoder:
         vs.parallel(6, one)
         return s
 
-    def survey(self):
-        """Picks the channel set with the smallest entropy estimate, then
-        surveys each channel's predictor set from the table at each block
-        shape (dm.survey_block_sets, kept in survey_sets) (Java: init). Sets
-        and returns the block shape that codes smallest."""
-        timer = vs.Timer()
-        size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
-        qc, _, _ = self.quantized_channels(size)
-        set_id = best_set(self.channel_sums(qc, size))
-        ids = dm.get_channels(set_id)
-        print("Channel set: " + dm.SET_NAMES[set_id])
-        survey = dm.survey_block_sets([qc[i] for i in ids], size[0], size[1], self.survey_shapes, whole_table=True)
-        self.survey_sets = {b: t.ids for b, t in survey.tried.items()}
-        print(survey.report, end="")
-        print(dm.describe_group_use(survey, dm.get_block_deltas_by_cost([qc[i] for i in ids], size[0], size[1], survey.block, survey.ids,
-                                                                        whole_table=True)), end="")
-        print("Surveyed sets (block %s): %s bytes." % (dm.shape_name(survey.block), format(survey.bytes, ",")))
-        print("Analysis took " + timer.elapsed())
-        print()
-        block = survey.block
-        if block < dm.SHAPE_FIRST:
-            self.block_size, self.block_shape = block, 0
-        else:
-            self.block_shape = block - dm.SHAPE_FIRST + 1
-        return block
+    def survey_current(self):
+        """Whether the last survey was made for the current quantization."""
+        return self.survey_blocks is not None and self.survey_quant == self.pixel_quant and self.survey_shift == self.pixel_shift
 
-    def needs_survey(self):
-        """Whether there are no surveyed sets yet for this shape."""
-        return self.survey_sets is None or self.block() not in self.survey_sets
-
-    def survey_shape(self, block=None):
-        """Surveys each channel's predictor ids at one block shape (the
-        current one by default), for the current quantization and channel
-        set, and keeps them in survey_sets (Java: surveyShape)."""
-        block = self.block() if block is None else block
-        timer = vs.Timer()
-        size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
-        qc, _, _ = self.quantized_channels(size)
+    def survey(self, quant=None, shift=None):
+        """Surveys the channel set, then each channel's block size and
+        predictor set, for this quantization (the coder's by default)
+        (dm.survey_channels; Java: survey). Returns each channel's block size."""
+        quant = self.pixel_quant if quant is None else quant
+        shift = self.pixel_shift if shift is None else shift
+        start = time.perf_counter()
+        size = dm.get_quantized_size(self.image_xdim, self.image_ydim, quant)
+        qc, _, _ = self.quantized_channels(size, quant, shift)
         ids = dm.get_channels(best_set(self.channel_sums(qc, size)))
-        survey = dm.survey_at_block_size([qc[i] for i in ids], size[0], size[1], block, whole_table=True)
-        print("Surveyed sets for block %s: %s bytes, %d, %d and %d predictors (took %s)" % (dm.shape_name(block), format(survey.bytes, ","),
-              len(survey.ids[0]), len(survey.ids[1]), len(survey.ids[2]), timer.elapsed()))
-        if self.survey_sets is None:
-            self.survey_sets = {}
-        self.survey_sets[block] = survey.ids
-        return survey.ids
+        survey = dm.survey_channels([qc[i] for i in ids], size[0], size[1], dm.SURVEY_CHANNEL_SIZES, whole_table=True)
+        self.survey_blocks, self.survey_ids = list(survey.blocks), survey.ids
+        self.survey_deltas, self.survey_maps = survey.deltas, survey.maps     # what apply codes
+        self.survey_quant, self.survey_shift = quant, shift
+        self.survey_time = time.perf_counter() - start
+        return self.survey_blocks
+
+    def size_text(self):
+        """Each channel's block size and number of blocks (the Block menu's Size)."""
+        if not self.applied:
+            return "No survey yet."
+        return "".join(dm.describe_block_size(self.min_set_id, i, self.map_list[i], self.delta_xdim) + "\n" for i in range(3))
+
+    def predictor_text(self):
+        """Each channel's predictors, most used first, with their numbers of
+        blocks (the Block menu's Predictors)."""
+        if not self.applied:
+            return "No survey yet."
+        return "\n".join("Channel %d - %s:\n" % (i, dm.channel_name(self.min_set_id, i)) + dm.describe_block_predictors(self.map_list[i], "  ")
+                         for i in range(3))
 
     def apply(self):
         """Quantizes, picks the channel set, makes the block map deltas (what
-        Save codes), then rebuilds the image from them. Returns the preview
-        as an (ydim, xdim, 3) uint8 array."""
+        Save codes), then rebuilds the image from them. After a new survey it
+        prints the channel set and each channel's blocks and predictors.
+        Returns the preview as an (ydim, xdim, 3) uint8 array."""
         self.applied = False
+        # A survey for this quantization first, if there isn't one (a coder
+        # whose fields were set directly, or a survey that failed).
+        if not self.survey_current():
+            self.survey()
         size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
         w, h = size
         qc, self.channel_min, self.channel_init = self.quantized_channels(size)
@@ -185,27 +183,26 @@ class BlockCoder:
         self.min_set_id = best_set(self.channel_sum)
         ids = dm.get_channels(self.min_set_id)
         deltas, maps, decoded = ([None] * 3 for _ in range(3))
-        # The surveyed sets, blocks assigned by estimated coded size as the
-        # survey does (channels in order). With none yet for this shape (an
-        # analysis that failed, or a coder used without one), they are
-        # surveyed now.
-        survey_ids = self.survey_shape() if self.needs_survey() else self.survey_sets[self.block()]
-        surveyed = dm.get_block_deltas_by_cost([qc[j] for j in ids], w, h, self.block(), survey_ids, whole_table=True)
+        # The deltas and maps the survey chose (for this quantization, so for
+        # these channels): each channel's block size and set, blocks assigned
+        # by estimated coded size.
 
-        raw = [None] * 3   # decoded, before the minimum: the next channel's reference
-
-        def channel(i):
+        # The reader rebuilds each channel exactly as quantized (before the
+        # minimum is added back), so the preview and the mixed coder use the
+        # quantized channels as they are: no need to decode the deltas here.
+        raw = [np.asarray(qc[j], dtype=np.int64) for j in ids]
+        for i in range(3):
             j = ids[i]
-            d, m = surveyed[i]
-            deltas[i], maps[i] = d, m
-            ch = dm.get_values_from_deltas(d, w, h, self.channel_init[j], 13, m, 0, ref=raw[i - 1] if i > 0 else None)
-            raw[i] = ch
-            if j > 2:
-                ch = ch + self.channel_min[j]
-            decoded[i] = ch
-        vs.channels(True, 3, channel)
+            deltas[i], maps[i] = self.survey_deltas[i], self.survey_maps[i]
+            decoded[i] = raw[i] + self.channel_min[j] if j > 2 else raw[i]
         self.delta_list, self.map_list, self.delta_xdim = deltas, maps, w
         self.value_list = raw       # the channels as the reader rebuilds them (the mixed coder's contexts use them)
+
+        if self.survey_time is not None:
+            print(dm.describe_block_maps(self.min_set_id, self.map_list, self.delta_xdim), end="")
+            print("Analysis took " + vs.format_duration(self.survey_time))
+            print()
+            self.survey_time = None
 
         # As the reader: recombine the channel set first, then resize, then shift.
         bgr = dm.get_blue_green_red(self.min_set_id, *decoded)
@@ -228,14 +225,12 @@ class BlockCoder:
     def save(self, filename="foo"):
         """Header: FORMAT_ID, FORMAT_VERSION, width, height (unsigned shorts),
         pixel_shift, pixel_quant, channel set. Then per channel: int min, int
-        init, the block map (write_map, type 13; it carries the block size and
-        the channel's predictor ids), then the deltas, mixed-context coded
+        init, the block map (write_map, type 13; it carries the channel's
+        block size and predictor ids; its context lines up the previous
+        channel's map, align_map), then the deltas, mixed-context coded
         (pack_mixed_deltas). Channels 1 and 2 use the ones before them as
-        context, so the reader decodes in order.
-        Returns the file size."""
-        timer = vs.Timer()
+        context, so the reader decodes in order. Returns the file size."""
         coded = mixed_code(self.delta_list, self.value_list, self.delta_xdim)
-        print("Entropy coding took " + timer.elapsed())
 
         ids = dm.get_channels(self.min_set_id)
         out = DataOutput()
@@ -251,7 +246,7 @@ class BlockCoder:
         with open(filename, "wb") as f:
             f.write(out.to_bytes())
         raw = self.image_xdim * self.image_ydim * 3
-        print("Block %s, predictors %s: %d bytes" % (dm.shape_name(self.block()), ", ".join(dm.describe_map_set(m) for m in self.map_list), out.size()))
+        print("Saved %s: %s bytes" % (os.path.basename(filename), format(out.size(), ",")))
         print("Original compression rate: %.4f" % (self.file_length / raw))
         print("Output  compression rate:  %.4f" % (out.size() / raw))
         print()
@@ -275,6 +270,7 @@ _open_writers = []
 
 class BlockWriter:
     def __init__(self, filename):
+        from PySide6.QtCore import QTimer
         from PySide6.QtGui import QAction, QKeySequence
 
         self.filename = filename
@@ -285,12 +281,20 @@ class BlockWriter:
             return
         self.coder = c = BlockCoder(rgb, os.path.getsize(filename))
         self.updating = False
+        self.analysing = False
         print("Loaded %s, %d x %d" % (filename, c.image_xdim, c.image_ydim))
 
         self.view = view = vs.ImageWindow("Block Writer  " + filename, c.image_xdim, c.image_ydim)
         bar = view.menuBar()
         _open_writers.append(self)
         view.destroyed.connect(lambda *_: _open_writers.remove(self) if self in _open_writers else None)
+
+        # A quantization change surveys again, once the slider has stopped
+        # moving for QUANT_SETTLE_MS.
+        self.quant_timer = QTimer(view)
+        self.quant_timer.setSingleShot(True)
+        self.quant_timer.setInterval(QUANT_SETTLE_MS)
+        self.quant_timer.timeout.connect(self.run_analysis)
 
         file_menu = bar.addMenu("File")
         a = QAction("Open...", view, shortcut=QKeySequence("Ctrl+O"))
@@ -309,72 +313,44 @@ class BlockWriter:
         quant = bar.addMenu("Quantization")
         self.sliders = {}
         for key, title, lo, hi in (("pixel_quant", "Pixel Resolution", 0, 10), ("pixel_shift", "Color Resolution", 0, 7)):
-            act, self.sliders[key] = vs.make_slider_dialog(view, title, lo, hi, getattr(c, key), self._setter(key))
+            act, self.sliders[key] = vs.make_slider_dialog(view, title, lo, hi, getattr(c, key), self._quant_setter(key))
             quant.addAction(act)
         # Error Correction blends the preview back toward the original by
-        # correction/10. Preview only; the saved file is unaffected.
+        # correction/10. Preview only; the saved file is unaffected, and there
+        # is nothing to survey again.
         quant.addSeparator()
-        act, self.sliders["correction"] = vs.make_slider_dialog(view, "Error Correction", 0, 10, c.correction, self._setter("correction"))
+        act, self.sliders["correction"] = vs.make_slider_dialog(view, "Error Correction", 0, 10, c.correction, self._set_correction)
         quant.addAction(act)
 
-        # Block menu: the settings, and Find Best to rerun the analysis
-        # (worth doing after changing the quantization: the surveyed sets are
-        # kept until then). A shape picked by hand gets its own surveyed sets,
-        # from the analysis or surveyed when picked.
+        # Block menu: what the survey chose (nothing to set by hand).
         block_menu = bar.addMenu("Block")
-        act, self.block_spinner = vs.make_spinner_dialog(view, "Block Size", dm.BLOCK_MIN, dm.BLOCK_MAX, c.block_size, self._block_setter("block_size"))
-        block_menu.addAction(act)
-        # Block Shape: squares (of Block Size), or a rectangle or line.
-        shape_names = ["Square (Block Size)"] + [dm.shape_name(dm.SHAPE_FIRST + i) + (" (line)" if h == 1 else "")
-                                                 for i, (_, h) in enumerate(dm.BLOCK_SHAPES)]
-        act, self.shape_buttons = vs.make_radio_dialog(view, "Block Shape", shape_names, c.block_shape, self._block_setter("block_shape"))
-        block_menu.addAction(act)
-        block_menu.addSeparator()
-        a = QAction("Find Best Tries Rectangles", view, checkable=True, checked=c.survey_shapes)
-        a.toggled.connect(lambda on: setattr(c, "survey_shapes", on))
+        a = QAction("Size", view)
+        a.triggered.connect(lambda: self.show_text("Block Size", self.coder.size_text()))
         block_menu.addAction(a)
-        a = QAction("Find Best", view)
-        a.triggered.connect(self.run_analysis)
+        a = QAction("Predictors", view)
+        a.triggered.connect(lambda: self.show_text("Block Predictors", self.coder.predictor_text()))
         block_menu.addAction(a)
 
         view.set_image(rgb)
         view.show_window()
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(0, self.run_analysis)    # the preview shows the original until the analysis has chosen the sets
+        QTimer.singleShot(0, self.run_analysis)    # the preview shows the original until the survey has chosen the blocks
 
-    def _setter(self, key):
+    def _quant_setter(self, key):
+        """A quantization slider's change: surveys again once the sliders settle."""
         def set_value(v):
             setattr(self.coder, key, v)
             if not self.updating:
-                self.apply()
+                self.quant_changed()
         return set_value
 
-    def _block_setter(self, key):
-        """As _setter, for the block settings: see update."""
-        def set_value(v):
-            setattr(self.coder, key, v)
-            if not self.updating:
-                self.update()
-        return set_value
-
-    def update(self):
-        """After a change to the block settings: with no surveyed sets yet
-        for this shape, surveys them first (in the background), so a shape
-        picked by hand gets the sets that suit it; otherwise just applies."""
-        if not self.coder.needs_survey():
+    def _set_correction(self, v):
+        self.coder.correction = v
+        if not self.updating and self.coder.survey_current():
             self.apply()
-            return
-        block = self.coder.block()
-        self.view.set_menus_enabled(False)
-        self.view.set_status("surveying block %s…" % dm.shape_name(block))
 
-        def done(result, error):
-            if error is not None:
-                print("survey: %r" % error)
-            self.view.set_menus_enabled(True)
-            self.view.set_status(None)
-            self.apply()
-        vs.run_in_background(lambda: self.coder.survey_shape(block), done)
+    def quant_changed(self):
+        self.view.set_status("waiting to survey…")
+        self.quant_timer.start()
 
     def reset(self):
         c = self.coder
@@ -383,7 +359,26 @@ class BlockWriter:
         for key, slider in self.sliders.items():
             slider.setValue(getattr(c, key))
         self.updating = False
-        self.apply()
+        self.quant_changed()
+
+    def show_text(self, title, text):
+        """Shows text in a dialog, in a fixed-width font so the counts line up."""
+        from PySide6.QtGui import QFontDatabase
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QPlainTextEdit, QVBoxLayout
+        dialog = QDialog(self.view)
+        dialog.setWindowTitle(title)
+        edit = QPlainTextEdit(text.strip())
+        edit.setReadOnly(True)
+        edit.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
+        metrics = edit.fontMetrics()
+        lines = text.strip().split("\n")
+        edit.setMinimumSize(min(900, metrics.horizontalAdvance(max(lines, key=len)) + 40), min(600, metrics.lineSpacing() * (len(lines) + 2)))
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok)
+        buttons.accepted.connect(dialog.accept)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(edit)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def apply(self):
         try:
@@ -394,23 +389,33 @@ class BlockWriter:
             print("Apply: %r" % e)
 
     def run_analysis(self):
-        """Runs the analysis in the background with the menus disabled, then
-        shows the chosen settings in the controls and applies them."""
+        """Surveys in the background with the menus disabled, then applies
+        (which prints the listing). If the quantization changed meanwhile, it
+        surveys again."""
+        if self.analysing:
+            return      # done() checks the quantization again
+        self.analysing = True
         self.view.set_menus_enabled(False)
-        self.view.set_status("analysing…")
+        self.view.set_status("surveying…")
+        c = self.coder
+        quant, shift = c.pixel_quant, c.pixel_shift
 
         def done(result, error):
+            self.analysing = False
             if error is not None:
-                print("init: %r" % error)
-            else:
-                self.updating = True
-                self.block_spinner.setValue(self.coder.block_size)
-                self.shape_buttons[self.coder.block_shape].setChecked(True)
-                self.updating = False
+                print("survey: %r" % error)
+            changed = (quant, shift) != (c.pixel_quant, c.pixel_shift)
+            if changed and not self.quant_timer.isActive():
+                self.run_analysis()
+                return
             self.view.set_menus_enabled(True)
+            if error is not None:
+                self.view.set_status("survey failed")
+                return
             self.view.set_status(None)
-            self.apply()
-        vs.run_in_background(self.coder.survey, done)
+            if c.survey_current():
+                self.apply()
+        vs.run_in_background(lambda: c.survey(quant, shift), done)
 
     def save(self):
         if not self.coder.applied:

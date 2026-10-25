@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-block_reader.py version 2.1 -- BlockReader.java for Python (PySide6).
+block_reader.py version 2.2 -- BlockReader.java for Python (PySide6).
 
-Reads Block format 'B' versions 3 and 4, from block_writer.py or
+Reads Block format 'B' versions 3 to 5, from block_writer.py or
 BlockWriter.java: block map deltas (delta type 13), Context coded (version
-3) or mixed-context coded (version 4). See block_writer.BlockCoder.save for
+3) or mixed-context coded (versions 4 and 5; in 5 each channel has its own
+block size). See block_writer.BlockCoder.save for
 the layout.
 
     python3 block_reader.py file
@@ -24,7 +25,7 @@ import viewer_support as vs
 from java_io import DataInput
 
 FORMAT_ID = ord('B')
-FORMAT_VERSION = 4   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: mixed context coding
+FORMAT_VERSION = 5   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: mixed context coding; 5: a block size per channel
 OLDEST_VERSION = 3   # older files are not read (the block predictors changed in version 3)
 
 
@@ -61,8 +62,7 @@ class BlockDecoder:
             else:
                 self.delta[i] = dm.read_context_deltas(inp, w * h, self.delta[:i], w)
         print("Image:        %d x %d" % (self.xdim, self.ydim))
-        print("Channel set:  " + dm.SET_NAMES[self.set_id])
-        print("Block map:    size %d; predictors %s" % (int(self.map[0][0]), ", ".join(dm.describe_map_set(m) for m in self.map)))
+        print(dm.describe_block_maps(self.set_id, self.map, w), end="")
         print()
 
     def decode(self):

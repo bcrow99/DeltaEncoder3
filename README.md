@@ -53,7 +53,7 @@ after that it loads from the cache in `__pycache__`.
 | `delta_writer2.py` | DeltaWriter2 | `DeltaCoder2`: delta types 6–13 only, String* datatype, map-coding report |
 | `simple_writer.py` | SimpleWriter | `SimpleCoder`: unary strings, delta type from the menu |
 | `simple_reader.py` | SimpleReader | `SimpleDecoder` |
-| `block_writer.py` | BlockWriter | `BlockCoder`: block map with mixed-context-coded deltas, best block size and predictors |
+| `block_writer.py` | BlockWriter | `BlockCoder`: block map with mixed-context-coded deltas; each channel's block size and predictors chosen by the survey |
 | `block_reader.py` | BlockReader | `BlockDecoder` |
 | `packet_writer.py` | PacketWriter | `PacketCoder`: unary strings split into separately compressed packets |
 | `packet_reader.py` | PacketReader | `PacketDecoder` |

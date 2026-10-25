@@ -882,6 +882,40 @@ def describe_map_set(mp):
     return "%d predictors" % len(ids)
 
 
+def channel_name(set_id, i):
+    """A channel's name in a channel set: blue, green, red, blue-green,
+    red-green or red-blue (DeltaMapper.channelName)."""
+    return SET_NAMES[set_id].split(", ")[i]
+
+
+def describe_block_size(set_id, i, mp, xdim):
+    """A channel's block map in a line: "Channel 0 - blue: 8 x 8, 2,400 blocks"
+    (DeltaMapper.describeBlockSize)."""
+    block = int(mp[0])
+    return "Channel %d - %s: %d x %d, %s blocks" % (i, channel_name(set_id, i), block_width(block, xdim), block_height(block),
+                                                     format(len(mp) - map_header_length(mp), ","))
+
+
+def describe_block_predictors(mp, indent):
+    """The predictors a block map's blocks use, most used first (ties in the
+    map's order), one per line: the number of blocks, then the name
+    (DeltaMapper.describeBlockPredictors)."""
+    mp = np.asarray(mp, dtype=np.uint8)
+    ids = get_map_ids(mp)
+    count = np.bincount(mp[map_header_length(mp):], minlength=len(ids))
+    order = sorted(range(len(ids)), key=lambda p: (-int(count[p]), p))
+    return "".join("%s%9s  %s\n" % (indent, format(int(count[p]), ","), predictor_name(ids[p])) for p in order if count[p] > 0)
+
+
+def describe_block_maps(set_id, maps, xdim):
+    """The channel set, then each channel's block size, number of blocks and
+    predictors (DeltaMapper.describeBlockMaps)."""
+    t = "Channel set: " + SET_NAMES[set_id] + "\n"
+    for i, mp in enumerate(maps):
+        t += describe_block_size(set_id, i, mp, xdim) + "\n" + describe_block_predictors(mp, "  ")
+    return t
+
+
 @njit
 def _block_wh(block, xdim):
     """(width, height) of a block shape."""
@@ -1494,6 +1528,124 @@ def _block_deltas_from_values(ps, block, ids):
     return get_block_deltas_from_map(ps, mp, ids), mp
 
 
+@njit
+def _nested_choices(src, ref, has_ref, corr, xdim, ydim, sizes, offsets, n, first, second, cross_base, bias_base, t0, t1, choice):
+    """Bands t0..t1-1 (each a row of the largest blocks): each base (smallest)
+    block's sums of |delta| for ids 0..n-1, then each shape's blocks' sums
+    added up from them; each block's id with the smallest sum (the first on a
+    tie) into choice[offsets[shape] + block]."""
+    base = sizes[0]
+    top = sizes[sizes.shape[0] - 1]
+    bw_base = (xdim - 2 + base - 1) // base
+    rows_base = top // base
+    sums = np.zeros(rows_base * bw_base * n, dtype=np.int64)
+    total = np.zeros(n, dtype=np.int64)
+    prim = np.zeros(ALL_PRIMITIVES, dtype=np.int64)
+    for band in range(t0, t1):
+        sums[:] = 0
+        y0 = 1 + band * top
+        y1 = min(ydim, y0 + top)
+        for y in range(y0, y1):
+            r = (y - y0) // base
+            for x in range(1, xdim - 1):
+                k = y * xdim + x
+                _all_primitives(src, ref, has_ref, corr, k, xdim, prim)
+                s0 = (r * bw_base + (x - 1) // base) * n
+                for p in range(n):
+                    i = first[p]
+                    j = second[p]
+                    v = prim[i] if i == j else (prim[i] + prim[j] + 1) >> 1
+                    sums[s0 + p] += abs(src[k] - v)
+        for t in range(sizes.shape[0]):
+            size = sizes[t]
+            f = size // base
+            rows = top // size
+            bw = (xdim - 2 + size - 1) // size
+            bh = (ydim - 1 + size - 1) // size
+            for rs in range(rows):
+                by = band * rows + rs
+                if by >= bh:
+                    break
+                for bx in range(bw):
+                    total[:] = 0
+                    for rr in range(rs * f, rs * f + f):
+                        for cc in range(bx * f, min(bw_base, bx * f + f)):
+                            s0 = (rr * bw_base + cc) * n
+                            for p in range(n):
+                                total[p] += sums[s0 + p]
+                    best = 0
+                    for p in range(1, n):
+                        if total[p] < total[best]:
+                            best = p
+                    choice[offsets[t] + by * bw + bx] = best
+
+
+def _nested_families(sizes):
+    """The shapes split into families of nested squares, smallest first: each
+    square joins the first family whose smallest divides it and whose largest
+    divides it or is divided by it (4, 6, 8, 12, 16: {4, 8, 16} and {6, 12});
+    other shapes are families of one (DeltaMapper.nestedFamilies). Returns
+    lists of indices into sizes."""
+    family = []
+    for t in sorted(range(len(sizes)), key=lambda t: sizes[t]):
+        b = sizes[t]
+        home = None
+        if b < SHAPE_FIRST:
+            for f in family:
+                base, top = sizes[f[0]], sizes[f[-1]]
+                if base < SHAPE_FIRST and b % base == 0 and (top % b == 0 or b % top == 0):
+                    home = f
+                    break
+        if home is None:
+            home = []
+            family.append(home)
+        home.append(t)
+    return family
+
+
+def _nested_squares(sizes):
+    """Whether the shapes are squares, each dividing the largest and divided
+    by the smallest (DeltaMapper.nestedSquares)."""
+    if any(b >= SHAPE_FIRST for b in sizes):
+        return False
+    base, top = min(sizes), max(sizes)
+    return all(b % base == 0 and top % b == 0 for b in sizes)
+
+
+def _table_reference_deltas_at(ps, sizes):
+    """The whole table's reference deltas at several block shapes
+    (DeltaMapper.tableReferenceDeltas): nested squares in one pass over the
+    pixels, each family of them (4, 8, 16; 6, 12) in its own pass, the larger
+    blocks' sums added up from the smallest's; other shapes one at a time.
+    Either way the result is the same."""
+    sizes = [int(b) for b in sizes]
+    if not _nested_squares(sizes):
+        # Each family of nested squares (4, 8, 16; 6, 12) in its own pass;
+        # other shapes one at a time.
+        ref = [None] * len(sizes)
+        for family in _nested_families(sizes):
+            shapes = [sizes[f] for f in family]
+            got = [_table_reference_deltas(ps, shapes[0])] if len(family) == 1 else _table_reference_deltas_at(ps, shapes)
+            for f, d in zip(family, got):
+                ref[f] = d
+        return ref
+    xdim, ydim = ps.xdim, ps.ydim
+    order = sorted(range(len(sizes)), key=lambda t: sizes[t])
+    srt = np.array([sizes[t] for t in order], dtype=np.int64)
+    counts = [blocks_across(xdim, b) * blocks_down(ydim, b) for b in srt]
+    offsets = np.concatenate([[0], np.cumsum(counts)[:-1]]).astype(np.int64)
+    choice = np.zeros(int(sum(counts)), dtype=np.uint8)
+    bands = blocks_down(ydim, int(srt[-1]))
+    _in_bands(bands, lambda lo, hi: _nested_choices(ps.v, ps.ref, ps.has_ref, ps.corr, xdim, ydim, srt, offsets, PREDICTORS,
+                                                    TABLE_FIRST, TABLE_SECOND, CROSS_BASE, BIAS_BASE, lo, hi, choice))
+    ids = list(range(PREDICTORS))
+    by_size = {}
+    for t, b in enumerate(srt):
+        mp = np.concatenate([np.array([b, 0], dtype=np.uint8), choice[offsets[t]:offsets[t] + counts[t]]])
+        by_size[int(b)] = get_block_deltas_from_map(ps, mp, ids)
+    return [by_size[b] for b in sizes]
+
+
 def _table_reference_deltas(ps, block):
     """The survey's reference deltas from the whole table: each block takes
     whichever of the table's predictors gives the smallest sum of |delta|
@@ -1837,11 +1989,12 @@ def write_map(out, delta_type, mp, previous, xdim):
     if delta_type == 13:
         head = map_header_length(mp)
         out.write(mp[:head].tobytes())
-        width = blocks_across(xdim, int(mp[0]))
+        block = int(mp[0])
+        width = blocks_across(xdim, block)
         mp = mp[head:]
         if previous is not None:
             previous = np.asarray(previous, dtype=np.uint8)
-            previous = previous[map_header_length(previous):]
+            previous = align_map(previous[map_header_length(previous):], int(previous[0]), block, xdim, len(mp))
     forms = [_map_to_string(mp), _map_to_arithmetic(mp), _map_to_context(mp, previous, width), _map_to_neighbours(mp, previous, width)]
     best = min((f for f in range(4) if forms[f] is not None), key=lambda f: (len(forms[f]), f))
     out.write_byte(best)
@@ -1854,9 +2007,30 @@ def map_bytes(delta_type, mp, previous, xdim):
     return out.size()
 
 
+def align_map(previous, prev_block, block, xdim, n):
+    """The previous channel's block map entries lined up with this channel's
+    blocks: each block takes the entry of the previous channel's block under
+    its centre (the nearest one at the edges); with the same block shape,
+    entry for entry, as before format 5 (DeltaMapper.alignMap)."""
+    if prev_block == block:
+        return previous
+    w, pw = blocks_across(xdim, block), blocks_across(xdim, prev_block)
+    ph = len(previous) // pw
+    bw, bh = block_width(block, xdim), block_height(block)
+    pbw, pbh = block_width(prev_block, xdim), block_height(prev_block)
+    k = np.arange(n)
+    px = np.minimum(pw - 1, ((k % w) * bw + bw // 2) // pbw)
+    py = np.minimum(ph - 1, ((k // w) * bh + bh // 2) // pbh)
+    return np.asarray(previous, dtype=np.uint8)[py * pw + px]
+
+
 def _read_map_forms(inp, previous, width):
+    """previous: the previous channel's entries, or a function giving them
+    lined up with this map's n entries, or None."""
     coding = inp.read_byte()
     n = inp.read_int()
+    if callable(previous):
+        previous = previous(n)
     if coding == 3:
         K = inp.read_short()
         coded = np.frombuffer(inp.read_fully(inp.read_int()), dtype=np.uint8)
@@ -1908,8 +2082,9 @@ def read_map(inp, delta_type, previous, xdim):
             raise IOError("Block map with block shape %d: not one this version reads." % block)
         prev = None
         if previous is not None:
-            prev = np.asarray(previous, dtype=np.uint8)
-            prev = prev[map_header_length(prev):]
+            full = np.asarray(previous, dtype=np.uint8)
+            entries, prev_block = full[map_header_length(full):], int(full[0])
+            prev = lambda n_entries: align_map(entries, prev_block, block, xdim, n_entries)   # noqa: E731
         body = _read_map_forms(inp, prev, blocks_across(xdim, block))
         if len(body) and int(body.max()) >= len(ids):
             raise IOError("Block map entry %d with %d predictors." % (int(body.max()), len(ids)))
@@ -2602,10 +2777,12 @@ def pixel_sources(channel, xdim, ydim):
     return ps
 
 
-def _channel_cost(ps, block, chosen_before, whole_table=False):
-    """The cost model; its reference deltas from the whole table
-    (_table_reference_deltas) or from SURVEY_REFERENCE_SET."""
-    if whole_table:
+def _channel_cost(ps, block, chosen_before, whole_table=False, ref=None):
+    """The cost model; its reference deltas given (ref), or from the whole
+    table (_table_reference_deltas), or from SURVEY_REFERENCE_SET."""
+    if ref is not None:
+        pass
+    elif whole_table:
         ref = _table_reference_deltas(ps, block)
     else:
         ref, _ = _block_deltas_from_values(ps, block, get_set_ids(SURVEY_REFERENCE_SET))
@@ -2615,11 +2792,14 @@ def _channel_cost(ps, block, chosen_before, whole_table=False):
 def get_block_deltas_by_cost(channel, xdim, ydim, block, ids, whole_table=False):
     """Each channel's (deltas, map) for its predictor ids, blocks assigned
     by estimated cost as the survey does (DeltaMapper.getBlockDeltasByCost);
+    block: one shape for every channel, or a list of each channel's;
     whole_table: the cost model's reference deltas from every id in the
     table, as the survey that chose the ids had them."""
     result, delta = [], []
     ps = pixel_sources(channel, xdim, ydim)
+    blocks = list(block) if isinstance(block, (list, tuple)) else [block] * len(channel)
     for i in range(len(channel)):
+        block = blocks[i]
         dc = _channel_cost(ps[i], block, delta[:i], whole_table)
         mp = prefix_maps(ps[i], block, dc, ids[i], [len(ids[i])])[0]
         d = get_block_deltas_from_map(ps[i], mp, ids[i])
@@ -2635,6 +2815,66 @@ class BlockSurvey:
         self.bytes = 0
         self.report = ""
         self.tried = None     # the full survey: every shape tried, by shape
+        self.blocks = None    # survey_channels: each channel's block shape,
+        self.deltas = None    # and its deltas and block map as chosen (what
+        self.maps = None      # get_block_deltas_by_cost would make from blocks and ids)
+
+
+def _survey_step(blocks):
+    """Big images find the greedy order on every step-th block row (at most
+    SURVEY_SAMPLE_BLOCKS blocks), the id's cost scaled to match; the maps are
+    then made over every block."""
+    return (blocks + SURVEY_SAMPLE_BLOCKS - 1) // SURVEY_SAMPLE_BLOCKS if blocks > SURVEY_SAMPLE_BLOCKS else 1
+
+
+class ChannelSurvey:
+    """One channel's survey at one block shape (DeltaMapper.ChannelSurvey)."""
+
+    def __init__(self, block):
+        self.block = block
+        self.ids = None
+        self.bytes = None
+        self.delta = None
+        self.map = None
+
+
+def _survey_channel(ps, block, whole_table, chosen_before, previous_map, ref=None):
+    """One channel of the survey at one block shape: the greedy order by
+    estimated bits, then the real coded size of its prefixes at SURVEY_COUNTS
+    until two in a row are larger than the best (DeltaMapper.surveyChannel).
+    Returns (the ChannelSurvey, its report line)."""
+    xdim, ydim = ps.xdim, ps.ydim
+    bw = blocks_across(xdim, block)
+    bh = blocks_down(ydim, block)
+    blocks = bw * bh
+    step = _survey_step(blocks)
+    rows = np.arange(0, bh, step, dtype=np.int64)
+    sampled = len(rows) * bw
+    dc = _channel_cost(ps, block, chosen_before, whole_table, ref)
+    est = block_cost_table(ps, block, dc, rows=rows)
+    order = greedy_cost_order(est, sampled, SURVEY_ID_COST * sampled // blocks)
+    counts = [c for c in SURVEY_COUNTS if c < len(order)] + [len(order)]
+    prefix = None
+    if step > 1:
+        est = None
+        prefix = prefix_maps(ps, block, dc, order, counts)
+    result = ChannelSurvey(block)
+    worse = 0
+    line = " (order %d):" % len(order)
+    for c, n in enumerate(counts):
+        ids = order[:n]
+        m = prefix[c] if prefix is not None else _assign_by_cost(est, PREDICTORS, np.array(ids, dtype=np.int64), ids, xdim, ydim, block)
+        d = get_block_deltas_from_map(ps, m, ids)
+        size = map_bytes(13, m, previous_map, xdim) + len(pack_context_deltas(d, chosen_before, xdim))
+        line += " %d:%s" % (n, format(size, ","))
+        if result.bytes is None or size < result.bytes:
+            result.bytes, result.ids, result.delta, result.map, worse = size, list(ids), d, m, 0
+            line += "*"
+        else:
+            worse += 1
+            if worse == 2:
+                break
+    return result, line
 
 
 def _survey_block_size(ps, block, log, whole_table=False):
@@ -2644,39 +2884,49 @@ def _survey_block_size(ps, block, log, whole_table=False):
     bw = blocks_across(xdim, block)
     bh = blocks_down(ydim, block)
     blocks = bw * bh
-    # Big images: the greedy order is found on every step-th block row (at
-    # most SURVEY_SAMPLE_BLOCKS blocks), the id's cost scaled to match; the
-    # maps are then made over every block.
-    step = (blocks + SURVEY_SAMPLE_BLOCKS - 1) // SURVEY_SAMPLE_BLOCKS if blocks > SURVEY_SAMPLE_BLOCKS else 1
-    rows = np.arange(0, bh, step, dtype=np.int64)
-    sampled = len(rows) * bw
+    step = _survey_step(blocks)
+    sampled = (bh + step - 1) // step * bw
     log.append("  block %s%s:" % (shape_name(block), " (order from %s of %s blocks)" % (format(sampled, ","), format(blocks, ",")) if step > 1 else ""))
     for i in range(3):
-        dc = _channel_cost(ps[i], block, delta[:i], whole_table)
-        est = block_cost_table(ps[i], block, dc, rows=rows)
-        order = greedy_cost_order(est, sampled, SURVEY_ID_COST * sampled // blocks)
-        counts = [c for c in SURVEY_COUNTS if c < len(order)] + [len(order)]
-        prefix = None
-        if step > 1:
-            est = None
-            prefix = prefix_maps(ps[i], block, dc, order, counts)
-        best_bytes, worse = None, 0
-        line = "    channel %d (order %d):" % (i, len(order))
-        for c, n in enumerate(counts):
-            ids = order[:n]
-            m = prefix[c] if prefix is not None else _assign_by_cost(est, PREDICTORS, np.array(ids, dtype=np.int64), ids, xdim, ydim, block)
-            d = get_block_deltas_from_map(ps[i], m, ids)
-            size = map_bytes(13, m, mp[i - 1] if i > 0 else None, xdim) + len(pack_context_deltas(d, delta[:i], xdim))
-            line += " %d:%s" % (n, format(size, ","))
-            if best_bytes is None or size < best_bytes:
-                best_bytes, result.ids[i], delta[i], mp[i], worse = size, list(ids), d, m, 0
-                line += "*"
-            else:
-                worse += 1
-                if worse == 2:
-                    break
-        result.bytes += best_bytes
-        log.append(line)
+        c, line = _survey_channel(ps[i], block, whole_table, delta[:i], mp[i - 1] if i > 0 else None)
+        result.ids[i], delta[i], mp[i] = c.ids, c.delta, c.map
+        result.bytes += c.bytes
+        log.append("    channel %d" % i + line)
+    return result
+
+
+SURVEY_CHANNEL_SIZES = [4, 6, 8, 12, 16]
+
+
+def survey_channels(channel, xdim, ydim, sizes=SURVEY_CHANNEL_SIZES, whole_table=False):
+    """The survey with a block shape per channel (DeltaMapper.surveyChannels):
+    channels in order, each surveyed at every shape in sizes (at once, as
+    memory allows) given the deltas and map chosen for the channels before
+    it, keeping the shape that codes it smallest (the first on a tie).
+    result.block is channel 0's; result.blocks has each channel's."""
+    ps = pixel_sources(channel, xdim, ydim)
+    blocks4 = blocks_across(xdim, 4) * ((ydim - 1 + 3) // 4)
+    task = 160 * xdim * ydim + 4 * PREDICTORS * min(SURVEY_SAMPLE_BLOCKS, blocks4)
+    result = BlockSurvey(None)
+    result.blocks = [None] * len(channel)
+    delta, mp, log = [None] * len(channel), [None] * len(channel), []
+    for i in range(len(channel)):
+        before, prev = delta[:i], mp[i - 1] if i > 0 else None
+        # The whole table's reference deltas for every size in one pass.
+        ref = dict(zip(sizes, _table_reference_deltas_at(ps[i], sizes))) if whole_table else {}
+        got = _bounded_map(lambda b: _survey_channel(ps[i], b, whole_table, before, prev, ref.get(b)), list(sizes), task)
+        best = 0
+        for t, b in enumerate(sizes):
+            log.append("  channel %d, block %s" % (i, shape_name(b)) + got[t][1])
+            if got[t][0].bytes < got[best][0].bytes:
+                best = t
+        c = got[best][0]
+        result.blocks[i], result.ids[i] = c.block, c.ids
+        result.bytes += c.bytes
+        delta[i], mp[i] = c.delta, c.map
+    result.block = result.blocks[0]
+    result.report = "\n".join(log) + "\n"
+    result.deltas, result.maps = delta, mp
     return result
 
 
