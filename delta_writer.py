@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-delta_writer.py version 2.1 -- DeltaWriter.java for Python (PySide6).
+delta_writer.py version 2.2 -- DeltaWriter.java for Python (PySide6).
 
 Quantizes an image, codes it as deltas and saves it (to the file "foo", as
-the Java version does) in Delta format 'D' version 3: the same file layout
-as DeltaWriter.java, so either program's files open in either reader.
+the Java version does) in Delta format 'D' (version 4 with the block map,
+version 3 otherwise): the same file layout as DeltaWriter.java, so either
+program's files open in either reader. The block map's block sizes and
+predictors come from the survey (delta_mapper.surveyed_block_maps).
 
     python3 delta_writer.py [image]
 
@@ -36,8 +38,8 @@ import viewer_support as vs
 from java_io import DataOutput
 
 FORMAT_ID = ord('D')
-FORMAT_VERSION = 3   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps
-SURVEYED = -1   # block_set: the surveyed sets (survey_ids)
+FORMAT_VERSION = 4   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: block maps with a block size per channel
+NO_BLOCK_MAP_VERSION = 3   # written for delta types other than the block map (13), whose files are as they were
 
 ENTROPY_NAMES = ["LZ77", "Huffman", "Arithmetic", "Adaptive", "Context"]
 DELTA_MENU_NAMES = ["H", "V", "Average", "Med", "Directional", "Adaptive", "Scanline 1", "Scanline 2",
@@ -71,9 +73,6 @@ class DeltaCoder:
         self.smooth_level = 0
         self.smooth2_level = 0
         self.scanline5_variant = 0
-        self.block_size = dm.BLOCK_DEFAULT
-        self.block_set = 0
-        self.survey_ids = None      # each channel's surveyed predictor ids (the last block search)
 
         self.channel_sum = [0] * 6
         self.set_sum = [0] * 10
@@ -88,9 +87,10 @@ class DeltaCoder:
 
     # ---- Channels -------------------------------------------------------------
 
-    def quantized_channels(self, size, smooth):
+    def quantized_channels(self, size, smooth, keep=True):
         """The six candidate channels after smoothing (if asked), resizing and
-        quantizing; sets channel_min and channel_init."""
+        quantizing; sets channel_min and channel_init (unless keep is False,
+        so it can run in the background)."""
         q = [None] * 3
 
         def one(i):
@@ -105,8 +105,9 @@ class DeltaCoder:
 
         vs.parallel(3, one)
         qc, mins = dm.get_candidate_channels(q[0], q[1], q[2])
-        self.channel_min = mins
-        self.channel_init = [int(c[0]) for c in qc]
+        if keep:
+            self.channel_min = mins
+            self.channel_init = [int(c[0]) for c in qc]
         return qc
 
     def compute_set_sums(self, qc, size):
@@ -130,13 +131,17 @@ class DeltaCoder:
         self.print_channel_set_ranking()
         ids = dm.get_channels(self.min_set_id)
 
+        # The block map's deltas and maps come from the survey (all three
+        # channels at once); the other types' from get_deltas, below.
+        survey = dm.surveyed_block_maps([qc[j] for j in ids], w, h)
+
         T = dm.DELTA_TYPES
         delta_bits = [[0] * T for _ in range(3)]
         maps = [[None] * T for _ in range(3)]
 
         def channel(i):
             for t in range(T):
-                d, m, _ = dm.get_deltas(qc[ids[i]], w, h, t, self.scanline5_variant, self.block_size, max(0, self.block_set), ref=qc[ids[i - 1]] if i > 0 else None)
+                d, m, _ = self.block_or_deltas(survey, i, qc[ids[i]], w, h, t)
                 delta_bits[i][t] = sm.get_bitlength(pack_and_compress(d))
                 maps[i][t] = m
 
@@ -164,7 +169,7 @@ class DeltaCoder:
         star_bits = [0] * 3
 
         def strings(i):
-            d, _, _ = dm.get_deltas(qc[ids[i]], w, h, self.delta_type, self.scanline5_variant, self.block_size, max(0, self.block_set), ref=qc[ids[i - 1]] if i > 0 else None)
+            d, _, _ = self.block_or_deltas(survey, i, qc[ids[i]], w, h, self.delta_type)
             s = sm.get_string_list(d, False)[3]
             s_bits[i] = sm.get_bitlength(s)
             star_bits[i] = sm.get_bitlength(sm.compress_strings(s))
@@ -172,36 +177,37 @@ class DeltaCoder:
         vs.parallel(3, strings)
         self.compress_type = 2 if sum(star_bits) < sum(s_bits) else 1
         if self.delta_type == 13:
-            self.search_block_settings(qc, size, ids)
+            self.print_block_maps(survey, w)
 
-    def search_block_settings(self, qc=None, size=None, ids=None):
-        """Picks block_size and block_set by coding with each candidate."""
-        timer = vs.Timer()
-        if qc is None:
-            size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
-            qc = self.quantized_channels(size, True)
-            ids = dm.get_channels(self.min_set_id)
-        ch = [qc[i] for i in ids]
-        best, table = dm.find_best_block(ch, size[0], size[1])
-        self.block_size, self.block_set = best
-        print(dm.get_block_table(table, best), end="")
-        named = table[best[1]][dm.BLOCK_SEARCH_SIZES.index(best[0])]
-        # Then BlockWriter's survey: each channel's own set from all the
-        # predictors, blocks assigned by estimated coded size; kept if it
-        # codes smaller (Context-coded sizes; with another entropy type only a guide).
-        t = vs.Timer()
-        survey = dm.survey_block_sets(ch, size[0], size[1])
-        self.survey_ids = survey.ids
-        print(survey.report, end="")
-        print("Survey took " + t.elapsed())
-        use_survey = survey.bytes <= named
-        print("Surveyed sets %s bytes, best named set (%s, block %d) %s bytes: using the %s."
-              % (format(survey.bytes, ","), dm.BLOCK_SET_NAMES[best[1]], best[0], format(named, ","),
-                 "surveyed sets" if use_survey else "named set"))
-        if use_survey:
-            self.block_size, self.block_set = survey.block, SURVEYED
-        print("Block search took " + timer.elapsed())
+    # ---- Block map (delta type 13) ----------------------------------------------
+
+    def block_or_deltas(self, survey, i, c, w, h, delta_type):
+        """A channel's (deltas, map, first value) for a delta type: the
+        survey's for the block map (13), get_deltas' for the others."""
+        if delta_type != 13:
+            return dm.get_deltas(c, w, h, delta_type, self.scanline5_variant)
+        return dm.surveyed_deltas(survey, i, c[0])
+
+    def print_block_maps(self, survey, w):
+        """The channel set, then each channel's block size, number of blocks
+        and predictors."""
+        print(dm.describe_block_maps(self.min_set_id, survey.maps, w), end="")
         print()
+
+    def block_channels(self, size):
+        """The three channels the block map codes, in coding order, for the
+        current settings (without setting channel_min and channel_init, so it
+        can run in the background)."""
+        qc = self.quantized_channels(size, True, keep=False)
+        ids = dm.get_channels(dm.best_channel_set(qc, size[0], size[1]))
+        return [qc[j] for j in ids]
+
+    def survey_block_maps(self):
+        """Surveys the block map for the current settings (unless the survey
+        for these channels is kept) and prints it."""
+        size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
+        survey = dm.surveyed_block_maps(self.block_channels(size), size[0], size[1])
+        self.print_block_maps(survey, size[0])
 
     def print_channel_set_ranking(self):
         order = sorted(range(10), key=lambda s: (self.set_sum[s], s))
@@ -246,15 +252,13 @@ class DeltaCoder:
         table, payload, maps, deltas, decoded = [None] * 3, [None] * 3, [None] * 3, [None] * 3, [None] * 3
 
         raw = [None] * 3   # decoded, before the minimum: the next channel's reference
-        # Surveyed sets: blocks assigned by estimated coded size, as the
-        # survey does (channels in order); named sets by smallest |delta|.
-        surveyed = None
-        if self.delta_type == 13 and self.block_set == SURVEYED and self.survey_ids is not None:
-            surveyed = dm.get_block_deltas_by_cost([qc[j] for j in ids], w, h, self.block_size, self.survey_ids)
+        # The block map: the survey's deltas and maps (kept from update or the
+        # survey, or surveyed now).
+        survey = dm.surveyed_block_maps([qc[j] for j in ids], w, h) if self.delta_type == 13 else None
 
         def channel(i):
             j = ids[i]
-            d, m = surveyed[i] if surveyed is not None else dm.get_deltas(qc[j], w, h, self.delta_type, self.scanline5_variant, self.block_size, max(0, self.block_set), ref=qc[ids[i - 1]] if i > 0 else None)[:2]
+            d, m = self.block_or_deltas(survey, i, qc[j], w, h, self.delta_type)[:2]
             deltas[i] = d
             maps[i] = m
             if self.compress_type == 0:
@@ -310,7 +314,7 @@ class DeltaCoder:
         Context), then the entropy-coded payload."""
         ids = dm.get_channels(self.min_set_id)
         out = DataOutput()
-        out.write_byte(FORMAT_ID); out.write_byte(FORMAT_VERSION)
+        out.write_byte(FORMAT_ID); out.write_byte(FORMAT_VERSION if self.delta_type == 13 else NO_BLOCK_MAP_VERSION)
         out.write_short(self.image_xdim); out.write_short(self.image_ydim)
         for v in (self.pixel_shift, self.pixel_quant, self.min_set_id, self.delta_type, self.compress_type,
                   self.entropy_type, self.scanline5_variant, 0, 0):       # last two: pixel pyramid levels, saddle
@@ -470,7 +474,7 @@ class DeltaWriter:
         self.sliders = {}
         for key, title, lo, hi in (("smooth_level", "Smooth", 0, 10), ("smooth2_level", "Smooth2", 0, 10),
                                    ("pixel_quant", "Pixel Resolution", 0, 10), ("pixel_shift", "Color Resolution", 0, 7)):
-            act, slider = vs.make_slider_dialog(view, title, lo, hi, getattr(c, key), self._setter(key))
+            act, slider = vs.make_slider_dialog(view, title, lo, hi, getattr(c, key), self._setter(key, True))
             quant.addAction(act)
             self.sliders[key] = slider
         # Error Correction is not a quantizing step: it blends the preview back
@@ -490,16 +494,8 @@ class DeltaWriter:
             delta_menu.addAction(a)
             a.triggered.connect(lambda _=False, t=t: self.set_delta_type(t))
             self.delta_actions.append(a)
-        delta_menu.addSeparator()
-        act, self.block_spinner = vs.make_spinner_dialog(view, "Block Size", dm.BLOCK_MIN, dm.BLOCK_MAX, c.block_size, self.set_block_size)
-        delta_menu.addAction(act)
-        act, self.block_buttons = vs.make_radio_dialog(view, "Block Predictors", ["Surveyed (per channel)"] + list(dm.BLOCK_SET_NAMES),
-                                                     c.block_set + 1, lambda v: self.set_block_set(v - 1))
-        self.block_buttons[0].setEnabled(False)    # until a block search has run
-        delta_menu.addAction(act)
-        a = QAction("Find Best Block Settings", view)
-        a.triggered.connect(self.find_block_settings)
-        delta_menu.addAction(a)
+        # The block map's block sizes and predictors come from the survey,
+        # redone when a quantization setting changes (update).
 
         # ---- Datatype: two dialogs, each with an Integer and a String button.
         self.datatype_menu = bar.addMenu("Datatype")
@@ -538,31 +534,22 @@ class DeltaWriter:
 
     # ---- Settings -----------------------------------------------------------------
 
-    def _setter(self, key):
+    def _setter(self, key, quantizing=False):
+        """Sets key; a quantization setting resurveys the block map (update)."""
         def set_value(v):
             setattr(self.coder, key, v)
             if not self.updating:
-                self.apply()
+                if quantizing:
+                    self.update()
+                else:
+                    self.apply()
         return set_value
 
     def set_delta_type(self, t):
         if self.coder.delta_type == t:
             return
         self.coder.delta_type = t
-        if t == 13:
-            self.find_block_settings()
-        else:
-            self.apply()
-
-    def set_block_size(self, v):
-        self.coder.block_size = v
-        if self.coder.delta_type == 13 and not self.updating:
-            self.apply()
-
-    def set_block_set(self, v):
-        self.coder.block_set = v
-        if self.coder.delta_type == 13 and not self.updating:
-            self.apply()
+        self.update()
 
     def set_compress_type(self, t):
         if (t == 0) != (self.coder.compress_type == 0):
@@ -586,9 +573,6 @@ class DeltaWriter:
         self.updating = True
         c = self.coder
         self.delta_actions[c.delta_type].setChecked(True)
-        self.block_spinner.setValue(c.block_size)
-        self.block_buttons[0].setEnabled(c.survey_ids is not None)
-        self.block_buttons[c.block_set + 1].setChecked(True)
         for key, slider in self.sliders.items():
             slider.setValue(getattr(c, key))
         self.show_compress_type()
@@ -598,7 +582,7 @@ class DeltaWriter:
         c = self.coder
         c.smooth_level = c.smooth2_level = c.pixel_quant = c.pixel_shift = c.correction = 0
         self.show_settings()
-        self.apply()
+        self.update()
 
     # ---- Work -----------------------------------------------------------------------
 
@@ -634,8 +618,14 @@ class DeltaWriter:
         self.apply()
         self._background("analyzing…", self.coder.survey)
 
-    def find_block_settings(self):
-        self._background("finding block settings…", self.coder.search_block_settings)
+    def update(self):
+        """After a change to the settings: with the block map, surveys first
+        (in the background, with the other menus disabled) unless the survey
+        for these channels is kept, then applies."""
+        if self.coder.delta_type != 13:
+            self.apply()
+            return
+        self._background("surveying…", self.coder.survey_block_maps)
 
     def save(self):
         if not self.coder.applied:

@@ -12,8 +12,8 @@ both measured against it.
                      too fine to see there no longer counts as error.
 
 JPEG: qualities 5-95. Delta coder: Color Resolution 0-6 x Pixel Resolution
-0-10, block map (size 12, Scanline 16) with Context coding, sized as
-block_writer saves it.
+0-10, block map (each channel's block size and predictors from the survey)
+with Context coding, sized as block_writer's survey measures it.
 
 The output matches the Java's. The delta-coder results are the same
 computation. For JPEG, Java's ImageIO and libjpeg (used here through Pillow
@@ -123,7 +123,7 @@ def delta_bytes(m, pixel_quant, pixel_shift):
         if t < best_sum:
             best_sum, best = t, k
     ids = dm.get_channels(best)
-    return 9 + 3 * 8 + dm.get_block_map_bytes([qc[i] for i in ids], size[0], size[1], 12, 3)   # Top 32; + block_writer's header
+    return 9 + 3 * 8 + dm.surveyed_block_maps([qc[i] for i in ids], size[0], size[1]).bytes   # the survey's Context-coded size; + block_writer's header
 
 
 def reconstruct(m, pixel_quant, pixel_shift):

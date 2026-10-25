@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-simple_reader.py version 2.0 -- SimpleReader.java for Python (PySide6).
+simple_reader.py version 2.1 -- SimpleReader.java for Python (PySide6).
 
-Reads Simple format 'S' version 3 files, from simple_writer.py or
+Reads Simple format 'S' version 3 and 4 files, from simple_writer.py or
 SimpleWriter.java, and shows the image.
 
     python3 simple_reader.py file
@@ -25,7 +25,8 @@ import viewer_support as vs
 from java_io import DataInput
 
 FORMAT_ID = ord('S')
-FORMAT_VERSION = 3   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; older files are not read
+FORMAT_VERSION = 4   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: block maps with a block size per channel
+OLDEST_VERSION = 3   # older files are not read
 
 ENTROPY_NAMES = ["LZ77", "Huffman", "Arithmetic", "Adaptive", "Context"]
 
@@ -42,8 +43,9 @@ class SimpleDecoder:
         ident, version = inp.read_unsigned_byte(), inp.read_unsigned_byte()
         if ident != FORMAT_ID:
             raise IOError(self.filename + " is not a Simple Writer file.")
-        if version != FORMAT_VERSION:
-            raise IOError("%s is Simple format version %d; this reader reads version %d only (the block predictors changed in it)." % (self.filename, version, FORMAT_VERSION))
+        if not OLDEST_VERSION <= version <= FORMAT_VERSION:
+            raise IOError("%s is Simple format version %d; this reader reads versions %d to %d (the block predictors changed in version %d)."
+                          % (self.filename, version, OLDEST_VERSION, FORMAT_VERSION, OLDEST_VERSION))
         self.xdim = inp.read_unsigned_short()
         self.ydim = inp.read_unsigned_short()
         # There is no compress_type: the Simple writers always write unary strings.

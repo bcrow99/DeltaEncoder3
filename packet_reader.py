@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-packet_reader.py version 2.0 -- PacketReader.java for Python (PySide6).
+packet_reader.py version 2.1 -- PacketReader.java for Python (PySide6).
 
-Reads Packet format 'P' version 3 files, from packet_writer.py or
+Reads Packet format 'P' version 3 and 4 files, from packet_writer.py or
 PacketWriter.java, and shows the image.
 
     python3 packet_reader.py file
@@ -28,7 +28,8 @@ from java_io import DataInput
 from packet_writer import read_segment_table
 
 FORMAT_ID = ord('P')
-FORMAT_VERSION = 3   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; older files are not read
+FORMAT_VERSION = 4   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: block maps with a block size per channel
+OLDEST_VERSION = 3   # older files are not read
 
 ENTROPY_NAMES = ["LZ77", "Huffman", "Arithmetic", "Arithmetic (per packet)", "Huffman (per packet)",
                  "Adaptive", "Adaptive (per packet)", "Context"]
@@ -51,8 +52,9 @@ class PacketDecoder:
         ident, version = inp.read_unsigned_byte(), inp.read_unsigned_byte()
         if ident != FORMAT_ID:
             raise IOError(self.filename + " is not a Packet Writer file.")
-        if version != FORMAT_VERSION:
-            raise IOError("%s is Packet format version %d; this reader reads version %d only (the block predictors changed in it)." % (self.filename, version, FORMAT_VERSION))
+        if not OLDEST_VERSION <= version <= FORMAT_VERSION:
+            raise IOError("%s is Packet format version %d; this reader reads versions %d to %d (the block predictors changed in version %d)."
+                          % (self.filename, version, OLDEST_VERSION, FORMAT_VERSION, OLDEST_VERSION))
         self.xdim = inp.read_unsigned_short()
         self.ydim = inp.read_unsigned_short()
         # There is no compress_type: the Packet writers always write unary

@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
-simple_writer.py version 2.0 -- SimpleWriter.java for Python (PySide6).
+simple_writer.py version 2.1 -- SimpleWriter.java for Python (PySide6).
 
 Quantizes an image, codes it as deltas packed into unary strings, and saves
-(to the file "foo", as the Java version does) in Simple format 'S' version 3:
-the same file layout as SimpleWriter.java, so either program's files open
-in either reader.
+(to the file "foo", as the Java version does) in Simple format 'S' (version
+4 with the block map, version 3 otherwise): the same file layout as
+SimpleWriter.java, so either program's files open in either reader. The
+block map's block sizes and predictors come from the survey
+(delta_mapper.surveyed_block_maps).
 
     python3 simple_writer.py [image]
 
@@ -33,7 +35,8 @@ from delta_writer import context_code, entropy_code
 from java_io import DataOutput
 
 FORMAT_ID = ord('S')
-FORMAT_VERSION = 3   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps
+FORMAT_VERSION = 4   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: block maps with a block size per channel
+NO_BLOCK_MAP_VERSION = 3   # written for delta types other than the block map (13), whose files are as they were
 
 ENTROPY_NAMES = ["LZ77", "Huffman", "Arithmetic", "Adaptive", "Context"]
 DELTA_MENU_NAMES = ["H", "V", "Average", "Med", "Directional", "Adaptive", "Scanline 1", "Scanline 2",
@@ -61,8 +64,6 @@ class SimpleCoder:
         self.delta_type = 2         # average; the Delta menu selection
         self.entropy_type = 0
         self.scanline5_variant = 0
-        self.block_size = dm.BLOCK_DEFAULT
-        self.block_set = 0
 
         self.channel_sum = [0] * 6
         self.set_sum = [0] * 10
@@ -74,9 +75,10 @@ class SimpleCoder:
         self.channel_iterations = [0] * 3
         self.applied = False
 
-    def quantized_channels(self, size):
+    def quantized_channels(self, size, keep=True):
         """The six candidate channels after resizing and quantizing; sets
-        channel_min and channel_init."""
+        channel_min and channel_init (unless keep is False, so it can run in
+        the background)."""
         q = [None] * 3
 
         def one(i):
@@ -86,8 +88,9 @@ class SimpleCoder:
             q[i] = dm.quantize_channel(ch, self.pixel_shift)
         vs.parallel(3, one)
         qc, mins = dm.get_candidate_channels(q[0], q[1], q[2])
-        self.channel_min = mins
-        self.channel_init = [int(c[0]) for c in qc]
+        if keep:
+            self.channel_min = mins
+            self.channel_init = [int(c[0]) for c in qc]
         return qc
 
     def compute_set_sums(self, qc, size):
@@ -105,6 +108,25 @@ class SimpleCoder:
         size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
         self.compute_set_sums(self.quantized_channels(size), size)
         self.print_channel_set_ranking()
+
+    # ---- Block map (delta type 13) ----------------------------------------------
+
+    def block_channels(self, size):
+        """The three channels the block map codes, in coding order, for the
+        current settings (without setting channel_min and channel_init, so it
+        can run in the background)."""
+        qc = self.quantized_channels(size, keep=False)
+        ids = dm.get_channels(dm.best_channel_set(qc, size[0], size[1]))
+        return [qc[j] for j in ids]
+
+    def survey_block_maps(self):
+        """Surveys the block map for the current settings (unless the survey
+        for these channels is kept) and prints the channel set and each
+        channel's block size, number of blocks and predictors."""
+        size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
+        survey = dm.surveyed_block_maps(self.block_channels(size), size[0], size[1])
+        qc = self.quantized_channels(size, keep=False)
+        print(dm.describe_block_maps(dm.best_channel_set(qc, size[0], size[1]), survey.maps, size[0]), end="")
 
     def print_channel_set_ranking(self):
         order = sorted(range(10), key=lambda s: self.set_sum[s])
@@ -129,10 +151,13 @@ class SimpleCoder:
         table, strings, maps, deltas, decoded = ([None] * 3 for _ in range(5))
 
         raw = [None] * 3   # decoded, before the minimum: the next channel's reference
+        # The block map: the survey's deltas and maps (kept from update, or
+        # surveyed now).
+        survey = dm.surveyed_block_maps([qc[j] for j in ids], w, h) if self.delta_type == 13 else None
 
         def channel(i):
             j = ids[i]
-            d, m, _ = dm.get_deltas(qc[j], w, h, self.delta_type, self.scanline5_variant, self.block_size, self.block_set, ref=qc[ids[i - 1]] if i > 0 else None)
+            d, m, _ = dm.surveyed_deltas(survey, i, qc[j][0]) if survey is not None else dm.get_deltas(qc[j], w, h, self.delta_type, self.scanline5_variant)
             maps[i] = m
             deltas[i] = d
             lo, bits, tbl, s = sm.get_string_list(d, True)
@@ -176,7 +201,7 @@ class SimpleCoder:
         file size."""
         ids = dm.get_channels(self.min_set_id)
         out = DataOutput()
-        out.write_byte(FORMAT_ID); out.write_byte(FORMAT_VERSION)
+        out.write_byte(FORMAT_ID); out.write_byte(FORMAT_VERSION if self.delta_type == 13 else NO_BLOCK_MAP_VERSION)
         out.write_short(self.image_xdim); out.write_short(self.image_ydim)
         for v in (self.pixel_shift, self.pixel_quant, self.min_set_id, self.delta_type, self.entropy_type, self.scanline5_variant):
             out.write_byte(v)
@@ -259,7 +284,7 @@ class SimpleWriter:
         quant = bar.addMenu("Quantization")
         self.sliders = {}
         for key, title, lo, hi in (("pixel_quant", "Pixel Resolution", 0, 10), ("pixel_shift", "Color Resolution", 0, 7)):
-            act, self.sliders[key] = vs.make_slider_dialog(view, title, lo, hi, getattr(c, key), self._setter(key))
+            act, self.sliders[key] = vs.make_slider_dialog(view, title, lo, hi, getattr(c, key), self._setter(key, True))
             quant.addAction(act)
         # Error Correction blends the preview back toward the original by
         # correction/10. Preview only; the saved file is unaffected.
@@ -277,13 +302,8 @@ class SimpleWriter:
             delta_menu.addAction(a)
             a.triggered.connect(lambda _=False, t=t: self.set_delta_type(t))
             self.delta_actions.append(a)
-        # Block map settings (delta type 13); a change re-applies only when
-        # the block map is selected.
-        delta_menu.addSeparator()
-        act, _ = vs.make_spinner_dialog(view, "Block Size", dm.BLOCK_MIN, dm.BLOCK_MAX, c.block_size, self.set_block_size)
-        delta_menu.addAction(act)
-        act, _ = vs.make_radio_dialog(view, "Block Predictors", dm.BLOCK_SET_NAMES, c.block_set, self.set_block_set)
-        delta_menu.addAction(act)
+        # The block map (delta type 13) has no settings: the survey chooses each
+        # channel's block size and predictor set (see update).
 
         entropy_menu = bar.addMenu("Entropy")
         group = QActionGroup(view)
@@ -302,27 +322,21 @@ class SimpleWriter:
         from PySide6.QtCore import QTimer
         QTimer.singleShot(0, self.show_initial_image)
 
-    def _setter(self, key):
+    def _setter(self, key, quantizing=False):
+        """Sets key; a quantization setting resurveys the block map (update)."""
         def set_value(v):
             setattr(self.coder, key, v)
             if not self.updating:
-                self.apply()
+                if quantizing:
+                    self.update()
+                else:
+                    self.apply()
         return set_value
 
     def set_delta_type(self, t):
         if self.coder.delta_type != t:
             self.coder.delta_type = t
-            self.apply()
-
-    def set_block_size(self, v):
-        self.coder.block_size = v
-        if self.coder.delta_type == 13:
-            self.apply()
-
-    def set_block_set(self, v):
-        self.coder.block_set = v
-        if self.coder.delta_type == 13:
-            self.apply()
+            self.update()
 
     def reset(self):
         c = self.coder
@@ -331,7 +345,25 @@ class SimpleWriter:
         for key, slider in self.sliders.items():
             slider.setValue(getattr(c, key))
         self.updating = False
-        self.apply()
+        self.update()
+
+    def update(self):
+        """After a change to the settings: with the block map, surveys first
+        (in the background, with the other menus disabled) unless the survey
+        for these channels is kept, then applies."""
+        if self.coder.delta_type != 13:
+            self.apply()
+            return
+        self.view.set_menus_enabled(False)
+        self.view.set_status("surveying…")
+
+        def done(result, error):
+            if error is not None:
+                print("Survey: %r" % error)
+            self.view.set_menus_enabled(True)
+            self.view.set_status(None)
+            self.apply()
+        vs.run_in_background(self.coder.survey_block_maps, done)
 
     def apply(self):
         try:

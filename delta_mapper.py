@@ -775,8 +775,8 @@ def _from_frame(src, xdim, ydim, init, mp, n_pred):
 # ids (PREDICTOR_TABLE), then one entry per block, row by row: an index
 # 0..n-1 into the ids]. Some predictors use the previous channel (in coding
 # order) at the same pixel, so a channel is coded and decoded with the one
-# before it (ref). With a named set a block takes the predictor with the
-# smallest sum of |delta|; survey_block_sets chooses by estimated coded size.
+# before it (ref). The sets and the blocks' choices come from the survey
+# (survey_channels), from the whole table, by estimated coded size.
 # See DeltaMapper.java and predictor.txt.
 # =============================================================================
 
@@ -842,11 +842,6 @@ TABLE_SECOND = np.array(PREDICTOR_PAIRS[1::2], dtype=np.int64)
 PREDICTORS = len(TABLE_FIRST)   # 256
 TABLE_PRIMITIVES = int(max(TABLE_FIRST.max(), TABLE_SECOND.max())) + 1
 
-# Named sets: the first 4, 8, 16 and 32 of one greedy order (DeltaMapper.BLOCK_ORDER).
-BLOCK_SET_NAMES = ["Top 4", "Top 8", "Top 16", "Top 32"]
-BLOCK_ORDER = [243, 21, 167, 127, 209, 37, 0, 231, 171, 1, 39, 149, 141, 172, 205, 28, 44, 173, 122, 206, 208, 184, 177, 86, 213, 67, 182, 150, 27, 137, 30, 121]
-BLOCK_SET_SIZES = [4, 8, 16, 32]
-
 
 def primitive_name(p):
     return PRIMITIVE_NAMES[p] if p < PRIMITIVES else EXTRA_PRIMITIVE_NAMES[p - PRIMITIVES]
@@ -861,25 +856,12 @@ def table_uses(pid, p):
     return int(TABLE_FIRST[pid]) == p or int(TABLE_SECOND[pid]) == p
 
 
-def get_set_ids(block_set):
-    """The predictor ids of a named set (BLOCK_SET_NAMES)."""
-    return BLOCK_ORDER[:BLOCK_SET_SIZES[block_set]]
-
-
 def map_header_length(mp):
     return 2 + int(mp[1])
 
 
 def get_map_ids(mp):
     return [int(v) for v in mp[2:map_header_length(mp)]]
-
-
-def describe_map_set(mp):
-    ids = get_map_ids(mp)
-    for s, name in enumerate(BLOCK_SET_NAMES):
-        if ids == get_set_ids(s):
-            return name
-    return "%d predictors" % len(ids)
 
 
 def channel_name(set_id, i):
@@ -1744,11 +1726,9 @@ def get_values_from_mixed_deltas(value, coded, previous, xdim, ydim, init, mp, r
 # Dispatch
 # =============================================================================
 
-def get_deltas(src, xdim, ydim, delta_type, variant=0, block=BLOCK_DEFAULT, block_set=0, set_ids=None, ref=None):
-    """(deltas, map or None, init value) for delta_type 0-13. For the block
-    map (13) the predictors are the named set block_set, or the predictor
-    ids set_ids if given, and ref is the previous channel (None for the
-    first)."""
+def get_deltas(src, xdim, ydim, delta_type, variant=0):
+    """(deltas, map or None, init value) for delta_type 0-12. The block map's
+    (13) deltas come from the survey (surveyed_block_maps)."""
     src = np.asarray(src, dtype=np.int64)
     init = int(src[0])
     t = delta_type
@@ -1763,9 +1743,7 @@ def get_deltas(src, xdim, ydim, delta_type, variant=0, block=BLOCK_DEFAULT, bloc
     elif t == 10: d, m = _scanline45(src, xdim, ydim, 8, variant)
     elif t == 11: d, m = _frame(src, xdim, ydim, 8)
     elif t == 12: d, m = _frame(src, xdim, ydim, 16)
-    elif t == 13:
-        ids = get_set_ids(block_set) if set_ids is None else [int(i) for i in set_ids]
-        d, m = get_block_deltas_from_values(src, ref, xdim, ydim, block, ids)
+    elif t == 13: raise ValueError("delta type 13: the block map's deltas come from the survey (surveyed_block_maps)")
     else: raise ValueError("delta_type %d" % t)
     return d, m, init
 
@@ -2472,63 +2450,19 @@ def unpack_mixed_deltas(packed, values, previous, xdim):
     return _mix_decode_known(coded, value, values, xdim, cb, fwd, c9b, m, MIX_ACTIVITY_TABLE, CONTEXTS)
 
 
-# =============================================================================
-# Block-map settings search
-# =============================================================================
-
-def get_block_map_bytes(channel, xdim, ydim, block, block_set, ps=None):
-    """Bytes the three channels take as block-map deltas (Context coded)
-    plus their maps, as the writers save them (ps: their PixelSources)."""
-    ps = pixel_sources(channel, xdim, ydim) if ps is None else ps
-    d, m = [], []
-    for i in range(len(channel)):
-        delta, mp = _block_deltas_from_values(ps[i], block, get_set_ids(block_set))
-        d.append(delta); m.append(mp)
-    total = 0
-    for i in range(3):
-        total += len(pack_context_deltas(d[i], d[:i], xdim))
-        total += map_bytes(13, m[i], m[i - 1] if i > 0 else None, xdim)
-    return total
-
-
-def find_best_block(channel, xdim, ydim, workers=None):
-    """The block size and predictor set that code the three channels
-    smallest: every set at sizes 4, 8 and 16, then the best set at the
-    untried sizes next to its best. Returns ((block, set), bytes) where
-    bytes[set][size index] is -1 for sizes not tried."""
-    ps = pixel_sources(channel, xdim, ydim)
-    n_sets = len(BLOCK_SET_NAMES)
-    first = [0, 2, 4]
-    table = [[-1] * len(BLOCK_SEARCH_SIZES) for _ in range(n_sets)]
-    task = 64 * xdim * ydim                 # a trial's deltas, maps and Context-coder arrays, 3 channels
-    jobs = [(s, i) for s in range(n_sets) for i in first]
-    for (s, i), v in zip(jobs, _bounded_map(lambda j: get_block_map_bytes(channel, xdim, ydim, BLOCK_SEARCH_SIZES[j[1]], j[0], ps), jobs, task)):
-        table[s][i] = v
-    best_set, best_i = 0, first[0]
-    for s in range(n_sets):
-        for i in first:
-            if table[s][i] < table[best_set][best_i]:
-                best_set, best_i = s, i
-    more = [i for i in (best_i - 1, best_i + 1) if 0 <= i < len(BLOCK_SEARCH_SIZES) and table[best_set][i] < 0]
-    for i, v in zip(more, _bounded_map(lambda i: get_block_map_bytes(channel, xdim, ydim, BLOCK_SEARCH_SIZES[i], best_set, ps), more, task)):
-        table[best_set][i] = v
-    for i in range(len(BLOCK_SEARCH_SIZES)):
-        if 0 <= table[best_set][i] < table[best_set][best_i]:
-            best_i = i
-    return (BLOCK_SEARCH_SIZES[best_i], best_set), table
-
-
 # ---- Surveying predictor sets (DeltaMapper.surveyBlockSets) -------------------
 #
 # Predictors are ranked by an estimate of their coded size: a cost per delta
-# value per coding context, from the deltas of a reference set (Top 32);
-# each predictor's estimated bits per block; a greedy order that charges for
+# value per coding context, from reference deltas (each block's best of the
+# whole table by sum of |delta|); each predictor's estimated bits per block; a greedy order that charges for
 # the map (entropy of the block counts plus a byte per id); real coded sizes
-# at SURVEY_COUNTS; blocks assigned by the estimate. See DeltaMapper.java.
+# at SURVEY_COUNTS; blocks assigned by the estimate. survey_channels (what
+# the writers use) gives each channel its own block size from
+# SURVEY_CHANNEL_SIZES; surveyed_block_maps keeps the last survey. See
+# DeltaMapper.java.
 # Costs are integers (1/256 bits) so the result matches Java exactly.
 
 SURVEY_COUNTS = [1, 2, 3, 4, 5, 6, 8, 10, 12, 16, 20, 24, 32, 40, 48, 64, 80, 96, 128, 160, 192, 255]
-SURVEY_REFERENCE_SET = 3            # Top 32
 SURVEY_ID_COST = 8 * 256            # a predictor id in the map header, 1/256 bits
 SURVEY_SAMPLE_BLOCKS = 1 << 17      # blocks the greedy order is found on, at most
 _LOG2 = math.log(2)
@@ -2777,30 +2711,24 @@ def pixel_sources(channel, xdim, ydim):
     return ps
 
 
-def _channel_cost(ps, block, chosen_before, whole_table=False, ref=None):
+def _channel_cost(ps, block, chosen_before, ref=None):
     """The cost model; its reference deltas given (ref), or from the whole
-    table (_table_reference_deltas), or from SURVEY_REFERENCE_SET."""
-    if ref is not None:
-        pass
-    elif whole_table:
+    table (_table_reference_deltas)."""
+    if ref is None:
         ref = _table_reference_deltas(ps, block)
-    else:
-        ref, _ = _block_deltas_from_values(ps, block, get_set_ids(SURVEY_REFERENCE_SET))
     return DeltaCost(ps.v, ref, chosen_before, ps.xdim, ps.ydim)
 
 
-def get_block_deltas_by_cost(channel, xdim, ydim, block, ids, whole_table=False):
+def get_block_deltas_by_cost(channel, xdim, ydim, block, ids):
     """Each channel's (deltas, map) for its predictor ids, blocks assigned
     by estimated cost as the survey does (DeltaMapper.getBlockDeltasByCost);
-    block: one shape for every channel, or a list of each channel's;
-    whole_table: the cost model's reference deltas from every id in the
-    table, as the survey that chose the ids had them."""
+    block: one shape for every channel, or a list of each channel's."""
     result, delta = [], []
     ps = pixel_sources(channel, xdim, ydim)
     blocks = list(block) if isinstance(block, (list, tuple)) else [block] * len(channel)
     for i in range(len(channel)):
         block = blocks[i]
-        dc = _channel_cost(ps[i], block, delta[:i], whole_table)
+        dc = _channel_cost(ps[i], block, delta[:i])
         mp = prefix_maps(ps[i], block, dc, ids[i], [len(ids[i])])[0]
         d = get_block_deltas_from_map(ps[i], mp, ids[i])
         result.append((d, mp))
@@ -2838,7 +2766,7 @@ class ChannelSurvey:
         self.map = None
 
 
-def _survey_channel(ps, block, whole_table, chosen_before, previous_map, ref=None):
+def _survey_channel(ps, block, chosen_before, previous_map, ref=None):
     """One channel of the survey at one block shape: the greedy order by
     estimated bits, then the real coded size of its prefixes at SURVEY_COUNTS
     until two in a row are larger than the best (DeltaMapper.surveyChannel).
@@ -2850,7 +2778,7 @@ def _survey_channel(ps, block, whole_table, chosen_before, previous_map, ref=Non
     step = _survey_step(blocks)
     rows = np.arange(0, bh, step, dtype=np.int64)
     sampled = len(rows) * bw
-    dc = _channel_cost(ps, block, chosen_before, whole_table, ref)
+    dc = _channel_cost(ps, block, chosen_before, ref)
     est = block_cost_table(ps, block, dc, rows=rows)
     order = greedy_cost_order(est, sampled, SURVEY_ID_COST * sampled // blocks)
     counts = [c for c in SURVEY_COUNTS if c < len(order)] + [len(order)]
@@ -2877,7 +2805,7 @@ def _survey_channel(ps, block, whole_table, chosen_before, previous_map, ref=Non
     return result, line
 
 
-def _survey_block_size(ps, block, log, whole_table=False):
+def _survey_block_size(ps, block, log):
     xdim, ydim = ps[0].xdim, ps[0].ydim
     result = BlockSurvey(block)
     delta, mp = [None] * 3, [None] * 3
@@ -2888,7 +2816,7 @@ def _survey_block_size(ps, block, log, whole_table=False):
     sampled = (bh + step - 1) // step * bw
     log.append("  block %s%s:" % (shape_name(block), " (order from %s of %s blocks)" % (format(sampled, ","), format(blocks, ",")) if step > 1 else ""))
     for i in range(3):
-        c, line = _survey_channel(ps[i], block, whole_table, delta[:i], mp[i - 1] if i > 0 else None)
+        c, line = _survey_channel(ps[i], block, delta[:i], mp[i - 1] if i > 0 else None)
         result.ids[i], delta[i], mp[i] = c.ids, c.delta, c.map
         result.bytes += c.bytes
         log.append("    channel %d" % i + line)
@@ -2898,7 +2826,7 @@ def _survey_block_size(ps, block, log, whole_table=False):
 SURVEY_CHANNEL_SIZES = [4, 6, 8, 12, 16]
 
 
-def survey_channels(channel, xdim, ydim, sizes=SURVEY_CHANNEL_SIZES, whole_table=False):
+def survey_channels(channel, xdim, ydim, sizes=SURVEY_CHANNEL_SIZES):
     """The survey with a block shape per channel (DeltaMapper.surveyChannels):
     channels in order, each surveyed at every shape in sizes (at once, as
     memory allows) given the deltas and map chosen for the channels before
@@ -2913,8 +2841,8 @@ def survey_channels(channel, xdim, ydim, sizes=SURVEY_CHANNEL_SIZES, whole_table
     for i in range(len(channel)):
         before, prev = delta[:i], mp[i - 1] if i > 0 else None
         # The whole table's reference deltas for every size in one pass.
-        ref = dict(zip(sizes, _table_reference_deltas_at(ps[i], sizes))) if whole_table else {}
-        got = _bounded_map(lambda b: _survey_channel(ps[i], b, whole_table, before, prev, ref.get(b)), list(sizes), task)
+        ref = dict(zip(sizes, _table_reference_deltas_at(ps[i], sizes)))
+        got = _bounded_map(lambda b: _survey_channel(ps[i], b, before, prev, ref[b]), list(sizes), task)
         best = 0
         for t, b in enumerate(sizes):
             log.append("  channel %d, block %s" % (i, shape_name(b)) + got[t][1])
@@ -2930,21 +2858,65 @@ def survey_channels(channel, xdim, ydim, sizes=SURVEY_CHANNEL_SIZES, whole_table
     return result
 
 
-def survey_at_block_size(channel, xdim, ydim, block, whole_table=False):
+def best_channel_set(qc, xdim, ydim):
+    """The channel set whose three channels have the smallest summed entropy
+    estimate (get_ideal_frequency2; the first on a tie), as the writers pick
+    it (DeltaMapper.bestChannelSet). qc: the six candidate channels."""
+    total = [0] * 6
+
+    def one(i):
+        total[i] = int(math.floor(float(_shannon_limit(np.asarray(get_ideal_frequency2(qc[i], xdim, ydim), dtype=np.int64)))))
+    for f in [_ROW_POOL.submit(one, i) for i in range(6)]:
+        f.result()
+    sums = [sum(total[c] for c in get_channels(s)) for s in range(10)]
+    return min(range(10), key=lambda s: (sums[s], s))
+
+
+def _copy(a):
+    return a.copy() if hasattr(a, "copy") else a
+
+
+def surveyed_deltas(survey, i, first):
+    """A channel's block map from a survey, as get_deltas gives other types:
+    (deltas, map, the first value), copies, as the survey is kept for the
+    next call (surveyed_block_maps; DeltaMapper.surveyedDeltas)."""
+    return _copy(survey.deltas[i]), _copy(survey.maps[i]), int(first)
+
+
+_SURVEYED = None                # the last surveyed_block_maps: (xdim, channel copies, survey)
+_SURVEYED_LOCK = threading.Lock()
+
+
+def surveyed_block_maps(channel, xdim, ydim):
+    """The block maps the survey chooses for three channels (survey_channels
+    at SURVEY_CHANNEL_SIZES): each channel's block size, predictor set,
+    deltas and map. The last result is kept, and returned again for the same
+    channels, so a writer can ask whenever it needs the block map's deltas
+    (DeltaMapper.surveyedBlockMaps)."""
+    global _SURVEYED
+    with _SURVEYED_LOCK:
+        channel = [np.asarray(c, dtype=np.int64) for c in channel]
+        if _SURVEYED is not None and _SURVEYED[0] == xdim and len(_SURVEYED[1]) == len(channel) \
+                and all(np.array_equal(a, b) for a, b in zip(_SURVEYED[1], channel)):
+            return _SURVEYED[2]
+        survey = survey_channels(channel, xdim, ydim, SURVEY_CHANNEL_SIZES)
+        _SURVEYED = (xdim, [c.copy() for c in channel], survey)
+        return survey
+
+
+def survey_at_block_size(channel, xdim, ydim, block):
     """The survey at one block shape only: the same sets survey_block_sets
     would choose for that shape (DeltaMapper.surveyAtBlockSize)."""
-    return _survey_block_size(pixel_sources(channel, xdim, ydim), block, [], whole_table)
+    return _survey_block_size(pixel_sources(channel, xdim, ydim), block, [])
 
 
-def survey_block_sets(channel, xdim, ydim, survey_shapes=False, whole_table=False):
+def survey_block_sets(channel, xdim, ydim, survey_shapes=False):
     """The block size and each channel's predictor ids that code smallest
     (DeltaMapper.surveyBlockSets): per channel, predictors in greedy order
     by estimated coded bits (with the map's cost), with the real coded size
     measured for the first n at SURVEY_COUNTS until two in a row are larger
     than the best; block sizes 4, 8, 16, then the untried sizes next to the
-    best; with survey_shapes, then the rectangles and lines (BLOCK_SHAPES).
-    whole_table: the cost model's reference deltas from every id in the
-    table (otherwise from SURVEY_REFERENCE_SET)."""
+    best; with survey_shapes, then the rectangles and lines (BLOCK_SHAPES)."""
     tried, log = {}, []
     ps = pixel_sources(channel, xdim, ydim)
 
@@ -2955,7 +2927,7 @@ def survey_block_sets(channel, xdim, ydim, survey_shapes=False, whole_table=Fals
         # The block sizes are independent: surveyed at the same time, as many
         # as memory allows.
         logs = {b: [] for b in sizes}
-        got = dict(zip(sizes, _bounded_map(lambda b: _survey_block_size(ps, b, logs[b], whole_table), sizes, task)))
+        got = dict(zip(sizes, _bounded_map(lambda b: _survey_block_size(ps, b, logs[b]), sizes, task)))
         for b in sizes:
             tried[b] = got[b]
             log.extend(logs[b])
@@ -3032,16 +3004,3 @@ def describe_group_use(survey, coded):
             if unused:
                 r.append("      unused: " + ", ".join(unused))
     return "\n".join(r) + "\n"
-
-
-def get_block_table(table, best):
-    lines = ["Block map, bytes coded (Context-coded deltas + maps, 3 channels):",
-             "  %-18s" % "set \\ block" + "".join(" %9d " % b for b in BLOCK_SEARCH_SIZES)]
-    for s, name in enumerate(BLOCK_SET_NAMES):
-        row = "  %-18s" % name
-        for i, b in enumerate(BLOCK_SEARCH_SIZES):
-            v = table[s][i]
-            chosen = s == best[1] and b == best[0]
-            row += " %9s " % "-" if v < 0 else " %9d" % v + ("*" if chosen else " ")
-        lines.append(row)
-    return "\n".join(lines) + "\n"

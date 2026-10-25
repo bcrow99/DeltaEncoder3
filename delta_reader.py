@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-delta_reader.py version 2.0 -- DeltaReader.java for Python (PySide6).
+delta_reader.py version 2.1 -- DeltaReader.java for Python (PySide6).
 
-Reads Delta format 'D' version 3 files, from delta_writer.py or
+Reads Delta format 'D' version 3 and 4 files, from delta_writer.py or
 DeltaWriter.java (or DeltaWriter2.java), and shows the image.
 
     python3 delta_reader.py file
@@ -29,7 +29,8 @@ import viewer_support as vs
 from java_io import DataInput
 
 FORMAT_ID = ord('D')
-FORMAT_VERSION = 3   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; older files are not read
+FORMAT_VERSION = 4   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: block maps with a block size per channel
+OLDEST_VERSION = 3   # older files are not read
 
 ENTROPY_NAMES = ["LZ77", "Huffman", "Arithmetic", "Adaptive", "Context"]
 COMPRESS_NAMES = ["Integer", "String", "String*", "String* (DeltaWriter2)"]
@@ -47,8 +48,9 @@ class DeltaDecoder:
         ident, version = inp.read_unsigned_byte(), inp.read_unsigned_byte()
         if ident != FORMAT_ID:
             raise IOError(self.filename + " is not a Delta Writer file.")
-        if version != FORMAT_VERSION:
-            raise IOError("%s is Delta format version %d; this reader reads version %d only (the block predictors changed in it)." % (self.filename, version, FORMAT_VERSION))
+        if not OLDEST_VERSION <= version <= FORMAT_VERSION:
+            raise IOError("%s is Delta format version %d; this reader reads versions %d to %d (the block predictors changed in version %d)."
+                          % (self.filename, version, OLDEST_VERSION, FORMAT_VERSION, OLDEST_VERSION))
         self.xdim = inp.read_unsigned_short()
         self.ydim = inp.read_unsigned_short()
         (self.pixel_shift, self.pixel_quant, self.set_id, self.delta_type, self.compress_type,

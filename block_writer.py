@@ -154,7 +154,7 @@ class BlockCoder:
         size = dm.get_quantized_size(self.image_xdim, self.image_ydim, quant)
         qc, _, _ = self.quantized_channels(size, quant, shift)
         ids = dm.get_channels(best_set(self.channel_sums(qc, size)))
-        survey = dm.survey_channels([qc[i] for i in ids], size[0], size[1], dm.SURVEY_CHANNEL_SIZES, whole_table=True)
+        survey = dm.survey_channels([qc[i] for i in ids], size[0], size[1], dm.SURVEY_CHANNEL_SIZES)
         self.survey_blocks, self.survey_ids = list(survey.blocks), survey.ids
         self.survey_deltas, self.survey_maps = survey.deltas, survey.maps     # what apply codes
         self.survey_quant, self.survey_shift = quant, shift
@@ -310,7 +310,7 @@ class BlockCoder:
         for b in range(n):
             y0, y1 = band_start(b, n, rows), band_start(b + 1, n, rows)
             ch = [np.asarray(v[y0 * w:y1 * w], dtype=np.int64) for v in self.value_list]
-            got = dm.get_block_deltas_by_cost(ch, w, y1 - y0, self.survey_blocks, self.survey_ids, whole_table=True)
+            got = dm.get_block_deltas_by_cost(ch, w, y1 - y0, self.survey_blocks, self.survey_ids)
             d = [g[0] for g in got]
             m = [g[1] for g in got]
             coded = mixed_code(d, ch, w)
