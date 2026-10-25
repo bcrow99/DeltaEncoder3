@@ -1475,17 +1475,35 @@ def get_block_deltas_from_values(src, ref, xdim, ydim, block, ids):
     return _block_deltas_from_values(PixelSource(src, ref, xdim, ydim), block, ids)
 
 
-def _block_deltas_from_values(ps, block, ids):
+def _block_choices_for(ps, block, ids):
+    """Each block's choice (an index into ids) by smallest sum of |delta|, the first on a tie."""
     xdim, ydim = ps.xdim, ps.ydim
-    ids = [int(i) for i in ids]
     arr = np.array(ids, dtype=np.int64)
     used = np.array(sorted(set(int(TABLE_FIRST[i]) for i in ids) | set(int(TABLE_SECOND[i]) for i in ids)), dtype=np.int64)
     bh = blocks_down(ydim, block)
     choice = np.zeros(blocks_across(xdim, block) * bh, dtype=np.uint8)
     _in_bands(bh, lambda lo, hi: _block_choices(ps.v, ps.ref, ps.has_ref, ps.corr, xdim, ydim, block, arr, used,
                                                 TABLE_FIRST, TABLE_SECOND, TABLE_PRIMITIVES, CROSS_BASE, BIAS_BASE, lo, hi, choice))
+    return choice
+
+
+def _block_deltas_from_values(ps, block, ids):
+    ids = [int(i) for i in ids]
+    choice = _block_choices_for(ps, block, ids)
     mp = np.concatenate([np.array([block, len(ids)] + ids, dtype=np.uint8), choice])
     return get_block_deltas_from_map(ps, mp, ids), mp
+
+
+def _table_reference_deltas(ps, block):
+    """The survey's reference deltas from the whole table: each block takes
+    whichever of the table's predictors gives the smallest sum of |delta|
+    (DeltaMapper.tableReferenceDeltas)."""
+    ids = list(range(PREDICTORS))
+    choice = _block_choices_for(ps, block, ids)
+    # No id list in this map's header (256 ids don't fit its count byte):
+    # the choices start at 2 and the ids are passed directly.
+    mp = np.concatenate([np.array([block, 0], dtype=np.uint8), choice])
+    return get_block_deltas_from_map(ps, mp, ids)
 
 
 @njit
@@ -2584,18 +2602,25 @@ def pixel_sources(channel, xdim, ydim):
     return ps
 
 
-def _channel_cost(ps, block, chosen_before):
-    ref, _ = _block_deltas_from_values(ps, block, get_set_ids(SURVEY_REFERENCE_SET))
+def _channel_cost(ps, block, chosen_before, whole_table=False):
+    """The cost model; its reference deltas from the whole table
+    (_table_reference_deltas) or from SURVEY_REFERENCE_SET."""
+    if whole_table:
+        ref = _table_reference_deltas(ps, block)
+    else:
+        ref, _ = _block_deltas_from_values(ps, block, get_set_ids(SURVEY_REFERENCE_SET))
     return DeltaCost(ps.v, ref, chosen_before, ps.xdim, ps.ydim)
 
 
-def get_block_deltas_by_cost(channel, xdim, ydim, block, ids):
+def get_block_deltas_by_cost(channel, xdim, ydim, block, ids, whole_table=False):
     """Each channel's (deltas, map) for its predictor ids, blocks assigned
-    by estimated cost as the survey does (DeltaMapper.getBlockDeltasByCost)."""
+    by estimated cost as the survey does (DeltaMapper.getBlockDeltasByCost);
+    whole_table: the cost model's reference deltas from every id in the
+    table, as the survey that chose the ids had them."""
     result, delta = [], []
     ps = pixel_sources(channel, xdim, ydim)
     for i in range(len(channel)):
-        dc = _channel_cost(ps[i], block, delta[:i])
+        dc = _channel_cost(ps[i], block, delta[:i], whole_table)
         mp = prefix_maps(ps[i], block, dc, ids[i], [len(ids[i])])[0]
         d = get_block_deltas_from_map(ps[i], mp, ids[i])
         result.append((d, mp))
@@ -2612,7 +2637,7 @@ class BlockSurvey:
         self.tried = None     # the full survey: every shape tried, by shape
 
 
-def _survey_block_size(ps, block, log):
+def _survey_block_size(ps, block, log, whole_table=False):
     xdim, ydim = ps[0].xdim, ps[0].ydim
     result = BlockSurvey(block)
     delta, mp = [None] * 3, [None] * 3
@@ -2627,7 +2652,7 @@ def _survey_block_size(ps, block, log):
     sampled = len(rows) * bw
     log.append("  block %s%s:" % (shape_name(block), " (order from %s of %s blocks)" % (format(sampled, ","), format(blocks, ",")) if step > 1 else ""))
     for i in range(3):
-        dc = _channel_cost(ps[i], block, delta[:i])
+        dc = _channel_cost(ps[i], block, delta[:i], whole_table)
         est = block_cost_table(ps[i], block, dc, rows=rows)
         order = greedy_cost_order(est, sampled, SURVEY_ID_COST * sampled // blocks)
         counts = [c for c in SURVEY_COUNTS if c < len(order)] + [len(order)]
@@ -2655,19 +2680,21 @@ def _survey_block_size(ps, block, log):
     return result
 
 
-def survey_at_block_size(channel, xdim, ydim, block):
+def survey_at_block_size(channel, xdim, ydim, block, whole_table=False):
     """The survey at one block shape only: the same sets survey_block_sets
     would choose for that shape (DeltaMapper.surveyAtBlockSize)."""
-    return _survey_block_size(pixel_sources(channel, xdim, ydim), block, [])
+    return _survey_block_size(pixel_sources(channel, xdim, ydim), block, [], whole_table)
 
 
-def survey_block_sets(channel, xdim, ydim, survey_shapes=False):
+def survey_block_sets(channel, xdim, ydim, survey_shapes=False, whole_table=False):
     """The block size and each channel's predictor ids that code smallest
     (DeltaMapper.surveyBlockSets): per channel, predictors in greedy order
     by estimated coded bits (with the map's cost), with the real coded size
     measured for the first n at SURVEY_COUNTS until two in a row are larger
     than the best; block sizes 4, 8, 16, then the untried sizes next to the
-    best; with survey_shapes, then the rectangles and lines (BLOCK_SHAPES)."""
+    best; with survey_shapes, then the rectangles and lines (BLOCK_SHAPES).
+    whole_table: the cost model's reference deltas from every id in the
+    table (otherwise from SURVEY_REFERENCE_SET)."""
     tried, log = {}, []
     ps = pixel_sources(channel, xdim, ydim)
 
@@ -2678,7 +2705,7 @@ def survey_block_sets(channel, xdim, ydim, survey_shapes=False):
         # The block sizes are independent: surveyed at the same time, as many
         # as memory allows.
         logs = {b: [] for b in sizes}
-        got = dict(zip(sizes, _bounded_map(lambda b: _survey_block_size(ps, b, logs[b]), sizes, task)))
+        got = dict(zip(sizes, _bounded_map(lambda b: _survey_block_size(ps, b, logs[b], whole_table), sizes, task)))
         for b in sizes:
             tried[b] = got[b]
             log.extend(logs[b])

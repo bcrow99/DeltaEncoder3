@@ -7,13 +7,14 @@ type 13) with mixed-context-coded deltas (delta_mapper.pack_mixed_deltas)
 and a coded map. Each block uses one
 predictor from its channel's set, and a set can be any of the 256
 predictors delta_mapper has ids for (id 255 is the least-squares predictor,
-LS). The startup analysis (and Find Best)
-picks the channel set, then surveys the sets (delta_mapper.survey_block_sets:
-per channel, predictors added in greedy order by estimated coded bits,
-blocks assigned by the estimate, and the real coded size measured), and
-also codes with each named set (find_best_block); it keeps whichever is
-smallest -- actual sizes, not estimates. The sets are surveyed per block
-shape: a shape picked by hand uses its own. Saves (to the file
+LS). The sets come from the predictor table alone: the startup analysis
+(and Find Best) picks the channel set, then surveys each channel's set
+(delta_mapper.survey_block_sets: predictors added in greedy order by
+estimated coded bits, the estimate's reference deltas from the whole table,
+blocks assigned by the estimate, and the real coded size measured at each
+count), and keeps the block shape that codes smallest -- actual sizes, not
+estimates. The sets are surveyed per block shape: a shape picked by hand
+uses its own. Saves (to the file
 "foo", as the Java version does) in Block format 'B' version 4, read by
 block_reader.py and BlockReader.java. The analysis measures sizes with the
 Context coder (pack_context_deltas); the file uses the mixed coder, about
@@ -38,7 +39,6 @@ import resize_mapper as rm
 import viewer_support as vs
 from java_io import DataOutput
 
-SURVEYED = -1
 FORMAT_ID = ord('B')
 FORMAT_VERSION = 4   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: mixed context coding
 
@@ -90,7 +90,6 @@ class BlockCoder:
         self.block_size = dm.BLOCK_DEFAULT   # the square's size
         self.block_shape = 0        # 0: square (block_size); i + 1: dm.BLOCK_SHAPES[i]
         self.survey_shapes = True   # Find Best also tries the rectangles and lines
-        self.block_set = 0          # a named set (dm.BLOCK_SET_NAMES), or SURVEYED
         self.survey_sets = None     # each channel's surveyed predictor ids, by block shape: every
                                     # shape the last analysis tried, plus any surveyed since
 
@@ -128,45 +127,34 @@ class BlockCoder:
         return s
 
     def survey(self):
-        """Picks the channel set with the smallest entropy estimate, then the
-        block size and predictor sets that code smallest: the surveyed sets
-        (dm.survey_block_sets, kept in survey_sets) or a named set
-        (dm.find_best_block) (Java: init). Sets and returns (block size,
-        named set or SURVEYED)."""
+        """Picks the channel set with the smallest entropy estimate, then
+        surveys each channel's predictor set from the table at each block
+        shape (dm.survey_block_sets, kept in survey_sets) (Java: init). Sets
+        and returns the block shape that codes smallest."""
         timer = vs.Timer()
         size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
         qc, _, _ = self.quantized_channels(size)
         set_id = best_set(self.channel_sums(qc, size))
         ids = dm.get_channels(set_id)
-        best, table = dm.find_best_block([qc[i] for i in ids], size[0], size[1])
         print("Channel set: " + dm.SET_NAMES[set_id])
-        print(dm.get_block_table(table, best), end="")
-        named = table[best[1]][dm.BLOCK_SEARCH_SIZES.index(best[0])]
-        print("Named sets took " + timer.elapsed())
-        print()
-        t = vs.Timer()
-        survey = dm.survey_block_sets([qc[i] for i in ids], size[0], size[1], self.survey_shapes)
+        survey = dm.survey_block_sets([qc[i] for i in ids], size[0], size[1], self.survey_shapes, whole_table=True)
         self.survey_sets = {b: t.ids for b, t in survey.tried.items()}
         print(survey.report, end="")
-        print(dm.describe_group_use(survey, dm.get_block_deltas_by_cost([qc[i] for i in ids], size[0], size[1], survey.block, survey.ids)), end="")
-        print("Survey took " + t.elapsed())
-        use_survey = survey.bytes <= named
-        print("Surveyed sets (block %s) %s bytes, best named set (%s, block %d) %s bytes: using the %s."
-              % (dm.shape_name(survey.block), format(survey.bytes, ","), dm.BLOCK_SET_NAMES[best[1]], best[0], format(named, ","),
-                 "surveyed sets" if use_survey else "named set"))
+        print(dm.describe_group_use(survey, dm.get_block_deltas_by_cost([qc[i] for i in ids], size[0], size[1], survey.block, survey.ids,
+                                                                        whole_table=True)), end="")
+        print("Surveyed sets (block %s): %s bytes." % (dm.shape_name(survey.block), format(survey.bytes, ",")))
         print("Analysis took " + timer.elapsed())
         print()
-        best = (survey.block, SURVEYED) if use_survey else best
-        block, self.block_set = best
+        block = survey.block
         if block < dm.SHAPE_FIRST:
             self.block_size, self.block_shape = block, 0
         else:
             self.block_shape = block - dm.SHAPE_FIRST + 1
-        return best
+        return block
 
     def needs_survey(self):
-        """Whether the surveyed sets are chosen but none exist yet for this shape."""
-        return self.block_set == SURVEYED and self.survey_sets is not None and self.block() not in self.survey_sets
+        """Whether there are no surveyed sets yet for this shape."""
+        return self.survey_sets is None or self.block() not in self.survey_sets
 
     def survey_shape(self, block=None):
         """Surveys each channel's predictor ids at one block shape (the
@@ -177,9 +165,11 @@ class BlockCoder:
         size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
         qc, _, _ = self.quantized_channels(size)
         ids = dm.get_channels(best_set(self.channel_sums(qc, size)))
-        survey = dm.survey_at_block_size([qc[i] for i in ids], size[0], size[1], block)
+        survey = dm.survey_at_block_size([qc[i] for i in ids], size[0], size[1], block, whole_table=True)
         print("Surveyed sets for block %s: %s bytes, %d, %d and %d predictors (took %s)" % (dm.shape_name(block), format(survey.bytes, ","),
               len(survey.ids[0]), len(survey.ids[1]), len(survey.ids[2]), timer.elapsed()))
+        if self.survey_sets is None:
+            self.survey_sets = {}
         self.survey_sets[block] = survey.ids
         return survey.ids
 
@@ -195,22 +185,18 @@ class BlockCoder:
         self.min_set_id = best_set(self.channel_sum)
         ids = dm.get_channels(self.min_set_id)
         deltas, maps, decoded = ([None] * 3 for _ in range(3))
-        # Surveyed sets: blocks assigned by estimated coded size, as the
-        # survey does (channels in order). Named sets: by smallest |delta|.
-        surveyed = None
-        survey_ids = self.survey_sets.get(self.block()) if self.survey_sets is not None else None
-        if self.block_set == SURVEYED and survey_ids is not None:
-            surveyed = dm.get_block_deltas_by_cost([qc[j] for j in ids], w, h, self.block(), survey_ids)
+        # The surveyed sets, blocks assigned by estimated coded size as the
+        # survey does (channels in order). With none yet for this shape (an
+        # analysis that failed, or a coder used without one), they are
+        # surveyed now.
+        survey_ids = self.survey_shape() if self.needs_survey() else self.survey_sets[self.block()]
+        surveyed = dm.get_block_deltas_by_cost([qc[j] for j in ids], w, h, self.block(), survey_ids, whole_table=True)
 
         raw = [None] * 3   # decoded, before the minimum: the next channel's reference
 
         def channel(i):
             j = ids[i]
-            if surveyed is not None:
-                d, m = surveyed[i]
-            else:
-                d, m, _ = dm.get_deltas(qc[j], w, h, 13, 0, self.block(), max(0, self.block_set),
-                                       ref=qc[ids[i - 1]] if i > 0 else None)
+            d, m = surveyed[i]
             deltas[i], maps[i] = d, m
             ch = dm.get_values_from_deltas(d, w, h, self.channel_init[j], 13, m, 0, ref=raw[i - 1] if i > 0 else None)
             raw[i] = ch
@@ -333,8 +319,8 @@ class BlockWriter:
 
         # Block menu: the settings, and Find Best to rerun the analysis
         # (worth doing after changing the quantization: the surveyed sets are
-        # kept until then). Block Predictors offers the surveyed sets
-        # (available once an analysis has run) and the named sets.
+        # kept until then). A shape picked by hand gets its own surveyed sets,
+        # from the analysis or surveyed when picked.
         block_menu = bar.addMenu("Block")
         act, self.block_spinner = vs.make_spinner_dialog(view, "Block Size", dm.BLOCK_MIN, dm.BLOCK_MAX, c.block_size, self._block_setter("block_size"))
         block_menu.addAction(act)
@@ -342,11 +328,6 @@ class BlockWriter:
         shape_names = ["Square (Block Size)"] + [dm.shape_name(dm.SHAPE_FIRST + i) + (" (line)" if h == 1 else "")
                                                  for i, (_, h) in enumerate(dm.BLOCK_SHAPES)]
         act, self.shape_buttons = vs.make_radio_dialog(view, "Block Shape", shape_names, c.block_shape, self._block_setter("block_shape"))
-        block_menu.addAction(act)
-        set_names = ["Surveyed (per channel)"] + list(dm.BLOCK_SET_NAMES)
-        set_block = self._block_setter("block_set")
-        act, self.set_buttons = vs.make_radio_dialog(view, "Block Predictors", set_names, c.block_set + 1, lambda v: set_block(v - 1))
-        self.set_buttons[0].setEnabled(False)      # until the first analysis
         block_menu.addAction(act)
         block_menu.addSeparator()
         a = QAction("Find Best Tries Rectangles", view, checkable=True, checked=c.survey_shapes)
@@ -359,7 +340,7 @@ class BlockWriter:
         view.set_image(rgb)
         view.show_window()
         from PySide6.QtCore import QTimer
-        QTimer.singleShot(0, self.show_initial_image)
+        QTimer.singleShot(0, self.run_analysis)    # the preview shows the original until the analysis has chosen the sets
 
     def _setter(self, key):
         def set_value(v):
@@ -377,10 +358,9 @@ class BlockWriter:
         return set_value
 
     def update(self):
-        """After a change to the block settings: with the surveyed sets chosen
-        and none yet for this shape, surveys them first (in the background),
-        so a shape picked by hand gets the sets that suit it; otherwise just
-        applies."""
+        """After a change to the block settings: with no surveyed sets yet
+        for this shape, surveys them first (in the background), so a shape
+        picked by hand gets the sets that suit it; otherwise just applies."""
         if not self.coder.needs_survey():
             self.apply()
             return
@@ -413,10 +393,6 @@ class BlockWriter:
             traceback.print_exc()
             print("Apply: %r" % e)
 
-    def show_initial_image(self):
-        self.apply()
-        self.run_analysis()
-
     def run_analysis(self):
         """Runs the analysis in the background with the menus disabled, then
         shows the chosen settings in the controls and applies them."""
@@ -430,8 +406,6 @@ class BlockWriter:
                 self.updating = True
                 self.block_spinner.setValue(self.coder.block_size)
                 self.shape_buttons[self.coder.block_shape].setChecked(True)
-                self.set_buttons[self.coder.block_set + 1].setChecked(True)
-                self.set_buttons[0].setEnabled(self.coder.survey_sets is not None)
                 self.updating = False
             self.view.set_menus_enabled(True)
             self.view.set_status(None)
