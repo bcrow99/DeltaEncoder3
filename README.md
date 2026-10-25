@@ -21,13 +21,13 @@ python3 block_writer.py [image]      # Block format 'B'
 python3 block_reader.py foo
 python3 packet_writer.py [image]     # Packet format 'P' version 1
 python3 packet_reader.py foo
-python3 pixel_writer.py [image]      # Pixel format 'P' versions 1-3
+python3 pixel_writer.py [image]      # Pixel format 'X' versions 1-4
 python3 pixel_reader.py foo
 ```
 
-The Packet and Pixel formats share the ID byte 'P' (as in the Java), so a
-reader can't tell one from the other: open a Packet file with packet_reader.py
-and a Pixel file with pixel_reader.py.
+The Pixel format's ID byte is 'X'; it was 'P' until that turned out to be the
+Packet format's too, so pixel_reader.py explains a 'P' file instead of
+reading it.
 
 Three smaller programs:
 
@@ -87,8 +87,11 @@ version's font-scaling fallback isn't needed.
 
 The pixel pyramid ("Average" in the old Java Quantization menu) has been taken
 out of both the Java and the Python Delta programs. Both readers refuse old
-files that used it, with a message. The pyramid operators are still in
-`image_mapper.py`.
+files that used it, with a message. The Pixel programs have it, in Java and
+Python: Quantization > Average in pixel_writer.py codes the red, green and
+blue channels averaged over 1 or 2 levels of 2 x 2 squares, plus a sign bit
+per pixel per level (pixel_mapper.py, with the operators in
+`image_mapper.py`).
 
 ## Compatibility testing
 

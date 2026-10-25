@@ -41,6 +41,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 
 import arithmetic_mapper as am
+import image_mapper as im
 import resize_mapper as rm
 from numba_support import njit, jdiv
 
@@ -427,3 +428,83 @@ def get_rgb(channel, qxdim, xdim, ydim, pixel_quant, pixel_shift):
     ydim, then shifted back up and clamped to 0-255."""
     c = [rm.resize(ch, qxdim, xdim, ydim) if pixel_quant != 0 else np.asarray(ch, dtype=np.int64) for ch in channel]
     return np.stack([clamp(np.asarray(v, dtype=np.int64) << pixel_shift).reshape(ydim, xdim) for v in c], axis=2).astype(np.uint8)
+
+
+# =============================================================================
+# Averaging pyramid (the Quantization menu's Average; PixelMapper.java)
+# =============================================================================
+#
+# Each level halves the width and height: every 2 x 2 square becomes its
+# rounded average (image_mapper.shrink_avg_flat), and only the smallest level
+# is coded. To expand, each level is predicted from the one below it by a
+# gradient fit (expand_gradient_flat, or expand_gradient_saddle_flat with the
+# cross term), then corrected with one sign bit per pixel: whether the pixel
+# was >= its square's average (build_geq_bits_flat /
+# refine_with_sign_bits_flat). Applied to the red, green and blue channels
+# themselves (values 0..max_value), never to difference channels. The image
+# is first padded (edge pixels repeated) to a multiple of 2^levels.
+
+PYRAMID_MAX = 2
+
+
+def pyramid_size(xdim, ydim, levels):
+    """Size of the top level, the size the pixels are coded at."""
+    if levels == 0:
+        return xdim, ydim
+    mult = 1 << levels
+    return im.pad_to(xdim, mult) >> levels, im.pad_to(ydim, mult) >> levels
+
+
+def shrink_pyramid(c, xdim, ydim, levels):
+    """Shrinks c (xdim x ydim) levels times. Returns (the top level, the sign
+    bits: one array per level, level lvl's bits against level lvl + 1)."""
+    mult = 1 << levels
+    level_xdim = im.pad_to(xdim, mult)
+    level = im.pad_edge_replicate_flat(np.asarray(c, dtype=np.int64), xdim, ydim, level_xdim, im.pad_to(ydim, mult))
+    bits = []
+    for _ in range(levels):
+        nxt = im.shrink_avg_flat(level, level_xdim)
+        bits.append(np.asarray(im.build_geq_bits_flat(level, nxt, level_xdim), dtype=np.bool_))
+        level = nxt
+        level_xdim //= 2
+    return np.asarray(level, dtype=np.int64), bits
+
+
+def expand_pyramid(top, xdim, ydim, sign_bits, max_value, saddle):
+    """Inverse of shrink_pyramid, as close as the sign bits allow: expands the
+    top level back to xdim x ydim, correcting each level with its sign bits."""
+    levels = len(sign_bits)
+    mult = 1 << levels
+    level = np.asarray(top, dtype=np.int64)
+    level_xdim = im.pad_to(xdim, mult) >> levels
+    for lvl in range(levels - 1, -1, -1):
+        if saddle:
+            predicted = im.expand_gradient_saddle_flat(level, level_xdim, max_value)
+        else:
+            predicted = im.expand_gradient_flat(level, level_xdim, max_value)
+        level = im.refine_with_sign_bits_flat(level, predicted, sign_bits[lvl], level_xdim * 2, max_value)
+        level_xdim *= 2
+    return np.asarray(im.crop_flat(level, im.pad_to(xdim, mult), im.pad_to(ydim, mult), xdim, ydim), dtype=np.int64)
+
+
+def write_sign_bits(out, sign_bits):
+    """Sign bits, one bitmap per level: int length, then (length + 7) // 8
+    bytes, bit q in byte q >> 3 at bit q & 7."""
+    for bits in sign_bits:
+        bits = np.asarray(bits, dtype=np.bool_)
+        out.write_int(len(bits))
+        out.write(np.packbits(bits, bitorder="little").tobytes())
+
+
+def read_sign_bits(inp, levels):
+    sign_bits = []
+    for _ in range(levels):
+        n = inp.read_int()
+        packed = np.frombuffer(inp.read_fully((n + 7) // 8), dtype=np.uint8)
+        sign_bits.append(np.unpackbits(packed, bitorder="little")[:n].astype(np.bool_))
+    return sign_bits
+
+
+def sign_bit_bytes(sign_bits):
+    """Bytes the sign bits take in the file."""
+    return sum(4 + (len(b) + 7) // 8 for b in sign_bits)
