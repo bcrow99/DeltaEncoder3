@@ -13,8 +13,9 @@ Menus: File, View, Quantization (Pixel Resolution and Color Resolution) and
 Block (Block Size; Coding: the pixel values with an exact prediction or with
 brightness bands as context, or the prediction errors; Channels: red, green
 and blue, or green and the differences red - green and blue - green). At
-start-up the block size that codes the image smallest is found; changing the
-coding or the channels finds it again.
+start-up the block size that codes the image smallest is found (up to one
+block for the whole frame); changing the coding or the channels finds it
+again.
 
 The coding (class PixelCoder) is separate from the window:
 
@@ -193,7 +194,7 @@ class PixelWriter:
         # doesn't. A new coding or channel choice has its own best block size,
         # so choosing one runs the block size search again.
         block_menu = bar.addMenu("Block")
-        act, self.block_slider = vs.make_slider_dialog(view, "Block Size", px.BLOCK_MIN, px.BLOCK_MAX, c.block_size, self._setter("block_size"))
+        act, self.block_slider = vs.make_slider_dialog(view, "Block Size", px.BLOCK_MIN, px.block_limit(c.image_xdim, c.image_ydim), c.block_size, self._setter("block_size"))
         block_menu.addAction(act)
         act, _ = vs.make_radio_dialog(view, "Coding", px.CODING_NAMES, c.coding, self.set_coding)
         block_menu.addAction(act)
@@ -231,9 +232,22 @@ class PixelWriter:
         self.updating = False
         self.apply()
 
+    def block_range(self):
+        """Sets the Block Size slider's maximum, the whole frame of the image
+        as coded (pixel_mapper.block_limit) or the block size if that is
+        larger, and its value, the block size."""
+        c = self.coder
+        b = c.block_size
+        was, self.updating = self.updating, True
+        self.block_slider.setMaximum(max(px.block_limit(c.qxdim, c.qydim), b))
+        self.block_slider.setValue(b)
+        c.block_size = b
+        self.updating = was
+
     def apply(self):
         try:
             self.view.set_image(self.coder.apply())
+            self.block_range()
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -256,9 +270,7 @@ class PixelWriter:
                 print("init: %r" % error)
             self.view.set_status(None)
             self.view.set_menus_enabled(True)
-            self.updating = True
-            self.block_slider.setValue(self.coder.block_size)
-            self.updating = False
+            self.block_range()
             self.apply()
         vs.run_in_background(self.coder.survey, done)
 

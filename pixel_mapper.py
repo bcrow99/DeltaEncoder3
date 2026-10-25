@@ -70,9 +70,17 @@ CHANNEL_NAMES = ["red", "green", "blue"]
 PRIMARY, DIFFERENCE = 0, 1
 CHANNEL_SET_NAMES = ["Red, green, blue (corrected)", "Green, red - green, blue - green"]
 
-# The block sizes find_best_block tries: powers of 2, then the steps halfway
-# (by ratio) around the best of those.
+# The block sizes find_best_block tries: powers of 2, then (if the largest is
+# the best) doubling up to the whole frame, then the steps halfway (by ratio)
+# around the best of those.
 SEARCH_SIZES = [8, 16, 32, 64, 128, 256]
+
+
+def block_limit(xdim, ydim):
+    """The largest block size worth having for an xdim x ydim image (the
+    Block Size slider's maximum): one block covering the whole frame, since
+    any larger size codes the same, but never less than BLOCK_MAX."""
+    return max(BLOCK_MAX, xdim, ydim)
 
 
 # =============================================================================
@@ -359,19 +367,27 @@ def _java_round(x):
 
 
 def find_best_block(channel, xdim, ydim, max_value, shift, coding, channels, tried=None):
-    """The block size (BLOCK_MIN..BLOCK_MAX) that codes the channels smallest:
-    every size in SEARCH_SIZES, then the sizes halfway (by ratio) to each
+    """The block size (BLOCK_MIN..block_limit) that codes the channels
+    smallest: every size in SEARCH_SIZES; while the largest tried is the best
+    and smaller than the frame, twice that (the last one the whole frame: the
+    larger of xdim and ydim); then the sizes halfway (by ratio) to each
     neighbour of the best (ties go to the smaller size). tried, if a list,
     gets (size, coded bytes of the 3 channels) for every size tried,
     smallest size first."""
     sizes = {}
     _measure(SEARCH_SIZES, channel, xdim, ydim, max_value, shift, coding, channels, sizes)
     best = _best_of(sizes)
+    frame, last = max(xdim, ydim), SEARCH_SIZES[-1]
+    while best == last and last < frame:
+        last = min(2 * last, frame)
+        _measure([last], channel, xdim, ydim, max_value, shift, coding, channels, sizes)
+        best = _best_of(sizes)
     more = []
-    lower, upper = _java_round(best / math.sqrt(2)), _java_round(best * math.sqrt(2))
+    lower = _java_round(best / math.sqrt(2))
+    upper = min(_java_round(best * math.sqrt(2)), block_limit(xdim, ydim))
     if lower >= BLOCK_MIN and lower not in sizes:
         more.append(lower)
-    if upper <= BLOCK_MAX and upper not in sizes:
+    if upper > best and upper not in sizes:
         more.append(upper)
     _measure(more, channel, xdim, ydim, max_value, shift, coding, channels, sizes)
     if tried is not None:
