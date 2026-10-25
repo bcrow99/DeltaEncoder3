@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-block_reader.py version 2.2 -- BlockReader.java for Python (PySide6).
+block_reader.py version 2.3 -- BlockReader.java for Python (PySide6).
 
-Reads Block format 'B' versions 3 to 5, from block_writer.py or
+Reads Block format 'B' versions 3 to 6, from block_writer.py or
 BlockWriter.java: block map deltas (delta type 13), Context coded (version
-3) or mixed-context coded (versions 4 and 5; in 5 each channel has its own
-block size). See block_writer.BlockCoder.save for
-the layout.
+3) or mixed-context coded (versions 4 to 6; from 5 each channel has its own
+block size; 6 is in bands of rows, decoded at the same time). See
+block_writer.BlockCoder.save for the layout.
 
     python3 block_reader.py file
 
@@ -19,13 +19,14 @@ import sys
 
 import numpy as np
 
+import block_writer as bw
 import delta_mapper as dm
 import resize_mapper as rm
 import viewer_support as vs
 from java_io import DataInput
 
 FORMAT_ID = ord('B')
-FORMAT_VERSION = 5   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: mixed context coding; 5: a block size per channel
+FORMAT_VERSION = 6   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: mixed context coding; 5: a block size per channel; 6: independently decodable bands
 OLDEST_VERSION = 3   # older files are not read (the block predictors changed in version 3)
 
 
@@ -53,6 +54,10 @@ class BlockDecoder:
 
         self.min, self.init = [0] * 3, [0] * 3
         self.map, self.delta = [None] * 3, [None] * 3
+        self.bands = 1
+        if version >= 6:
+            self._read_bands(inp, w, h)
+            return
         for i in range(3):
             self.min[i] = inp.read_int()
             self.init[i] = inp.read_int()
@@ -65,6 +70,52 @@ class BlockDecoder:
         print(dm.describe_block_maps(self.set_id, self.map, w), end="")
         print()
 
+    def _read_bands(self, inp, w, h):
+        """Format 6 (see block_writer.BlockCoder.in_bands): the bands, read
+        (maps decoded, deltas not yet)."""
+        n = self.bands = inp.read_unsigned_byte()
+        if n < 1 or h // n < 2:
+            raise IOError("A Block file with %d bands of a %d-row image: not one this version reads." % (n, h))
+        self.min = [inp.read_int() for _ in range(3)]
+        length = [inp.read_int() for _ in range(n)]
+        self.band_init, self.band_map, self.band_delta = [], [], []
+        for b in range(n):
+            bi = DataInput(inp.read_fully(length[b]))
+            init, maps, deltas = [], [], []
+            for i in range(3):
+                init.append(bi.read_int())
+                maps.append(dm.read_map(bi, 13, maps[i - 1] if i > 0 else None, w))
+                deltas.append(dm.read_mixed_deltas(bi))
+            self.band_init.append(init)
+            self.band_map.append(maps)
+            self.band_delta.append(deltas)
+        # The listing: each channel's maps over all the bands (the same block
+        # size and predictor set in every band).
+        for i in range(3):
+            head = dm.map_header_length(self.band_map[0][i])
+            self.map[i] = np.concatenate([np.asarray(self.band_map[0][i], dtype=np.uint8)]
+                                         + [np.asarray(self.band_map[b][i], dtype=np.uint8)[head:] for b in range(1, n)])
+        print("Image:        %d x %d" % (self.xdim, self.ydim))
+        print(dm.describe_block_maps(self.set_id, self.map, w), end="")
+        print(bw.describe_bands(n, h))
+        print()
+
+    def _decode_bands(self, w, h):
+        """Format 6: the bands decoded at the same time; returns the channels."""
+        n = self.bands
+        channel = [np.zeros(w * h, dtype=np.int64) for _ in range(3)]
+
+        def one(b):
+            y0, y1 = bw.band_start(b, n, h), bw.band_start(b + 1, n, h)
+            d, v = [None] * 3, [None] * 3
+            for i in range(3):
+                value, coded = self.band_delta[b][i]
+                d[i], v[i] = dm.get_values_from_mixed_deltas(value, coded, d[:i], w, y1 - y0, self.band_init[b][i], self.band_map[b][i],
+                                                             v[i - 1] if i > 0 else None)
+                channel[i][y0 * w:y1 * w] = v[i]
+        vs.parallel(n, one)
+        return channel
+
     def decode(self):
         """The image as an (ydim, xdim, 3) uint8 array, R, G, B."""
         timer = vs.Timer()
@@ -72,16 +123,19 @@ class BlockDecoder:
         ids = dm.get_channels(self.set_id)
         channel = [None] * 3
 
-        raw = [None] * 3
-        # In order: each channel's predictors may use the one before it.
-        deltas = [None] * 3
+        if self.version >= 6:
+            raw = self._decode_bands(w, h)
+        else:
+            raw, deltas = [None] * 3, [None] * 3
+            # In order: each channel's predictors may use the one before it.
+            for i in range(3):
+                ref = raw[i - 1] if i > 0 else None
+                if self.version >= 4:
+                    value, coded = self.delta[i]
+                    deltas[i], raw[i] = dm.get_values_from_mixed_deltas(value, coded, deltas[:i], w, h, self.init[i], self.map[i], ref)
+                else:
+                    raw[i] = dm.get_values_from_deltas(self.delta[i], w, h, self.init[i], 13, self.map[i], 0, ref=ref)
         for i in range(3):
-            ref = raw[i - 1] if i > 0 else None
-            if self.version >= 4:
-                value, coded = self.delta[i]
-                deltas[i], raw[i] = dm.get_values_from_mixed_deltas(value, coded, deltas[:i], w, h, self.init[i], self.map[i], ref)
-            else:
-                raw[i] = dm.get_values_from_deltas(self.delta[i], w, h, self.init[i], 13, self.map[i], 0, ref=ref)
             channel[i] = raw[i] + self.min[i] if ids[i] > 2 else raw[i]
         bgr = dm.get_blue_green_red(self.set_id, *channel)
         if self.pixel_quant != 0:

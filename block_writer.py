@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-block_writer.py version 2.2 -- BlockWriter.java for Python (PySide6).
+block_writer.py version 2.3 -- BlockWriter.java for Python (PySide6).
 
 A writer with one delta type and one entropy coder: the block map (delta
 type 13) with mixed-context-coded deltas (delta_mapper.pack_mixed_deltas)
@@ -18,6 +18,9 @@ count). It runs at startup and again after any change to the quantization
 Java version does) in Block format 'B' version 5, read by block_reader.py
 and BlockReader.java. The survey measures sizes with the Context coder
 (pack_context_deltas); the file uses the mixed coder, about 1% smaller.
+File > Bands splits the image into up to MAX_BANDS bands of rows that a
+reader can decode at the same time (format 6), for about a byte per column
+per band boundary; with 1 (the default) Save writes format 5.
 
     python3 block_writer.py [image]
 
@@ -40,7 +43,11 @@ import viewer_support as vs
 from java_io import DataOutput
 
 FORMAT_ID = ord('B')
-FORMAT_VERSION = 5   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: mixed context coding; 5: a block size per channel
+FORMAT_VERSION = 6   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: mixed context coding; 5: a block size per channel; 6: independently decodable bands
+ONE_BAND_VERSION = 5   # the version written with one band: the layout before bands
+MAX_BANDS = 16         # the most bands Save offers
+BAND_MIN_ROWS = 64     # the fewest rows (of the quantized image) a band may have
+BAND_COST_TENTHS = 13  # roughly what a band boundary costs, tenths of a byte per column (for the estimate only)
 
 QUANT_SETTLE_MS = 400   # how long a quantization slider must rest before the survey runs again
 
@@ -89,6 +96,7 @@ class BlockCoder:
         self.pixel_shift = 3
         self.correction = 0         # preview only
         self.min_set_id = 0
+        self.bands = 1              # independently decodable bands Save writes (1: one, format 5)
 
         # The last survey: each channel's block size and predictor ids, in
         # coding order (None before the first), and the quantization it was
@@ -98,6 +106,7 @@ class BlockCoder:
         self.survey_deltas = self.survey_maps = None
         self.survey_quant = self.survey_shift = -1
         self.survey_time = None     # the survey's seconds, printed with the next apply's listing
+        self.survey_bytes = 0       # the survey's coded size, for the Bands estimate
 
         self.channel_sum = [0] * 6
         self.channel_min = [0] * 6
@@ -150,13 +159,33 @@ class BlockCoder:
         self.survey_deltas, self.survey_maps = survey.deltas, survey.maps     # what apply codes
         self.survey_quant, self.survey_shift = quant, shift
         self.survey_time = time.perf_counter() - start
+        self.survey_bytes = survey.bytes
         return self.survey_blocks
 
     def size_text(self):
         """Each channel's block size and number of blocks (the Block menu's Size)."""
         if not self.applied:
             return "No survey yet."
-        return "".join(dm.describe_block_size(self.min_set_id, i, self.map_list[i], self.delta_xdim) + "\n" for i in range(3))
+        t = "".join(dm.describe_block_size(self.min_set_id, i, self.map_list[i], self.delta_xdim) + "\n" for i in range(3))
+        if self.bands_used() > 1:
+            t += describe_bands(self.bands_used(), len(self.value_list[0]) // self.delta_xdim) + "\n"
+        return t
+
+    def bands_used(self):
+        """The bands Save will write: bands, but no more than leave
+        BAND_MIN_ROWS rows in each."""
+        rows = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)[1]
+        return max(1, min(self.bands, rows // BAND_MIN_ROWS))
+
+    def band_estimate(self):
+        """The Bands dialog's estimate of what the bands cost."""
+        n = self.bands_used()
+        if n == 1:
+            return "1 band: the image is too small for more" if self.bands > 1 else "1 band"
+        w, h = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
+        cost = (n - 1) * w * BAND_COST_TENTHS // 10
+        pct = " (%+.2f%%)" % (100.0 * cost / self.survey_bytes) if self.survey_bytes > 0 else ""
+        return describe_bands(n, h) + ": about +%s bytes" % format(cost, ",") + pct
 
     def predictor_text(self):
         """Each channel's predictors, most used first, with their numbers of
@@ -185,9 +214,7 @@ class BlockCoder:
         deltas, maps, decoded = ([None] * 3 for _ in range(3))
         # The deltas and maps the survey chose (for this quantization, so for
         # these channels): each channel's block size and set, blocks assigned
-        # by estimated coded size.
-
-        # The reader rebuilds each channel exactly as quantized (before the
+        # by estimated coded size. The reader rebuilds each channel exactly as quantized (before the
         # minimum is added back), so the preview and the mixed coder use the
         # quantized channels as they are: no need to decode the deltas here.
         raw = [np.asarray(qc[j], dtype=np.int64) for j in ids]
@@ -223,18 +250,41 @@ class BlockCoder:
         return rgb
 
     def save(self, filename="foo"):
-        """Header: FORMAT_ID, FORMAT_VERSION, width, height (unsigned shorts),
-        pixel_shift, pixel_quant, channel set. Then per channel: int min, int
-        init, the block map (write_map, type 13; it carries the channel's
-        block size and predictor ids; its context lines up the previous
-        channel's map, align_map), then the deltas, mixed-context coded
-        (pack_mixed_deltas). Channels 1 and 2 use the ones before them as
-        context, so the reader decodes in order. Returns the file size."""
+        """One band: format 5 (one_band). Bands: format 6 (in_bands), and the
+        size it would have been as one band for the report. Returns the file
+        size."""
+        n = self.bands_used()
+        data = self.one_band()
+        one = len(data)
+        if n > 1:
+            data = self.in_bands(n)
+        with open(filename, "wb") as f:
+            f.write(data)
+        raw = self.image_xdim * self.image_ydim * 3
+        if n > 1:
+            print("Saved %s: %s bytes (%s; %s as one band, %+.2f%%)" % (os.path.basename(filename), format(len(data), ","),
+                  describe_bands(n, len(self.value_list[0]) // self.delta_xdim), format(one, ","), 100.0 * (len(data) - one) / one))
+        else:
+            print("Saved %s: %s bytes" % (os.path.basename(filename), format(len(data), ",")))
+        print("Original compression rate: %.4f" % (self.file_length / raw))
+        print("Output  compression rate:  %.4f" % (len(data) / raw))
+        print()
+        return len(data)
+
+    def one_band(self):
+        """Format 5. Header: FORMAT_ID, ONE_BAND_VERSION, width, height
+        (unsigned shorts), pixel_shift, pixel_quant, channel set. Then per
+        channel: int min, int init, the block map (write_map, type 13; it
+        carries the channel's block size and predictor ids; its context lines
+        up the previous channel's map, align_map), then the deltas,
+        mixed-context coded (pack_mixed_deltas). Channels 1 and 2 use the ones
+        before them as context, so the reader decodes in order. Returns the
+        bytes."""
         coded = mixed_code(self.delta_list, self.value_list, self.delta_xdim)
 
         ids = dm.get_channels(self.min_set_id)
         out = DataOutput()
-        out.write_byte(FORMAT_ID); out.write_byte(FORMAT_VERSION)
+        out.write_byte(FORMAT_ID); out.write_byte(ONE_BAND_VERSION)
         out.write_short(self.image_xdim); out.write_short(self.image_ydim)
         out.write_byte(self.pixel_shift); out.write_byte(self.pixel_quant); out.write_byte(self.min_set_id)
         for i in range(3):
@@ -242,15 +292,59 @@ class BlockCoder:
             out.write_int(self.channel_min[j]); out.write_int(self.channel_init[j])
             dm.write_map(out, 13, self.map_list[i], self.map_list[i - 1] if i > 0 else None, self.delta_xdim)
             out.write(coded[i])
+        return out.to_bytes()
 
-        with open(filename, "wb") as f:
-            f.write(out.to_bytes())
-        raw = self.image_xdim * self.image_ydim * 3
-        print("Saved %s: %s bytes" % (os.path.basename(filename), format(out.size(), ",")))
-        print("Original compression rate: %.4f" % (self.file_length / raw))
-        print("Output  compression rate:  %.4f" % (out.size() / raw))
-        print()
-        return out.size()
+    def in_bands(self, n):
+        """Format 6: the header as format 5's, then the number of bands n (an
+        unsigned byte), each channel's int min (coding order), then n int
+        lengths and the n bands. Band b is rows band_start(b) to
+        band_start(b + 1) of the quantized image, coded as an image of its own
+        with the survey's block sizes and predictor sets (blocks assigned by
+        cost in the band; the predictors, least squares and contexts start
+        again at its top): per channel, int init, the block map, then the
+        mixed-coded deltas. A reader can decode the bands at the same time.
+        Returns the bytes."""
+        w = self.delta_xdim
+        rows = len(self.value_list[0]) // w
+        band = []
+        for b in range(n):
+            y0, y1 = band_start(b, n, rows), band_start(b + 1, n, rows)
+            ch = [np.asarray(v[y0 * w:y1 * w], dtype=np.int64) for v in self.value_list]
+            got = dm.get_block_deltas_by_cost(ch, w, y1 - y0, self.survey_blocks, self.survey_ids, whole_table=True)
+            d = [g[0] for g in got]
+            m = [g[1] for g in got]
+            coded = mixed_code(d, ch, w)
+            bo = DataOutput()
+            for i in range(3):
+                bo.write_int(int(ch[i][0]))
+                dm.write_map(bo, 13, m[i], m[i - 1] if i > 0 else None, w)
+                bo.write(coded[i])
+            band.append(bo.to_bytes())
+
+        ids = dm.get_channels(self.min_set_id)
+        out = DataOutput()
+        out.write_byte(FORMAT_ID); out.write_byte(FORMAT_VERSION)
+        out.write_short(self.image_xdim); out.write_short(self.image_ydim)
+        out.write_byte(self.pixel_shift); out.write_byte(self.pixel_quant); out.write_byte(self.min_set_id)
+        out.write_byte(n)
+        for i in range(3):
+            out.write_int(self.channel_min[ids[i]])
+        for b in band:
+            out.write_int(len(b))
+        for b in band:
+            out.write(b)
+        return out.to_bytes()
+
+
+def band_start(b, n, rows):
+    """Band b's first row, of rows split into n bands (BlockWriter.bandStart)."""
+    return b * rows // n
+
+
+def describe_bands(n, rows):
+    """"8 bands of 375 rows" (or "of 374 to 375 rows")."""
+    lo, hi = rows // n, -(-rows // n)
+    return "%d bands of %s rows" % (n, lo if lo == hi else "%d to %d" % (lo, hi))
 
 
 # =============================================================================
@@ -304,6 +398,12 @@ class BlockWriter:
         a = QAction("Reset", view)
         a.triggered.connect(self.reset)
         file_menu.addAction(a)
+        # Bands: Save codes the image as this many bands of rows, each
+        # decodable on its own (so a reader can decode them at the same time),
+        # for a small cost per band boundary. Like Save itself, it never
+        # changes the preview.
+        act, self.bands_slider = vs.make_slider_dialog(view, "Bands", 1, MAX_BANDS, c.bands, self._set_bands)
+        file_menu.addAction(act)
         a = QAction("Save", view)
         a.triggered.connect(self.save)
         file_menu.addAction(a)
@@ -342,6 +442,10 @@ class BlockWriter:
             if not self.updating:
                 self.quant_changed()
         return set_value
+
+    def _set_bands(self, v):
+        self.coder.bands = v
+        self.view.set_status(self.coder.band_estimate())
 
     def _set_correction(self, v):
         self.coder.correction = v
