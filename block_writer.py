@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-block_writer.py version 2.3 -- BlockWriter.java for Python (PySide6).
+block_writer.py version 2.4 -- BlockWriter.java for Python (PySide6).
 
 A writer with one delta type and one entropy coder: the block map (delta
 type 13) with mixed-context-coded deltas (delta_mapper.pack_mixed_deltas)
@@ -15,12 +15,14 @@ estimated coded bits, the estimate's reference deltas from the whole table,
 blocks assigned by the estimate, and the real coded size measured at each
 count). It runs at startup and again after any change to the quantization
 (Pixel Resolution or Color Resolution). Saves (to the file "foo", as the
-Java version does) in Block format 'B' version 5, read by block_reader.py
+Java version does) in Block format 'B' version 7, read by block_reader.py
 and BlockReader.java. The survey measures sizes with the Context coder
-(pack_context_deltas); the file uses the mixed coder, about 1% smaller.
-File > Bands splits the image into up to MAX_BANDS bands of rows that a
-reader can decode at the same time (format 6), for about a byte per column
-per band boundary; with 1 (the default) Save writes format 5.
+(pack_context_deltas); the file uses the mixed coder, with its contexts
+split by second opinions (how far GAP/8, MED and the left pixel lie from the
+block's prediction), about 3% smaller. File > Bands splits the image into up
+to MAX_BANDS bands of rows that a reader can decode at the same time (format
+8), for about a byte per column per band boundary; with 1 (the default) Save
+writes format 7.
 
     python3 block_writer.py [image]
 
@@ -43,8 +45,8 @@ import viewer_support as vs
 from java_io import DataOutput
 
 FORMAT_ID = ord('B')
-FORMAT_VERSION = 6   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: mixed context coding; 5: a block size per channel; 6: independently decodable bands
-ONE_BAND_VERSION = 5   # the version written with one band: the layout before bands
+FORMAT_VERSION = 8   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: mixed context coding; 5: a block size per channel; 6: independently decodable bands; 7 and 8: 5 and 6 with the mixed coder's second opinions
+ONE_BAND_VERSION = 7   # the version written with one band: the layout before bands
 MAX_BANDS = 16         # the most bands Save offers
 BAND_MIN_ROWS = 64     # the fewest rows (of the quantized image) a band may have
 BAND_COST_TENTHS = 13  # roughly what a band boundary costs, tenths of a byte per column (for the estimate only)
@@ -53,13 +55,15 @@ QUANT_SETTLE_MS = 400   # how long a quantization slider must rest before the su
 
 
 def mixed_code(delta, values, xdim):
-    """Each channel's deltas mixed-context coded (pack_mixed_deltas), channel
-    i's contexts using channels 0..i-1. Checks each decodes back."""
+    """Each channel's deltas mixed-context coded with the second opinions
+    (pack_mixed_deltas), channel i's contexts using channels 0..i-1. Checks
+    each decodes back."""
     coded = [None] * 3
 
     def one(i):
-        coded[i] = dm.pack_mixed_deltas(delta[i], values[i], delta[:i], xdim)
-        back = dm.unpack_mixed_deltas(coded[i], values[i], delta[:i], xdim)
+        v = np.asarray(values[i], dtype=np.int64)
+        coded[i] = dm.pack_mixed_deltas(delta[i], v, delta[:i], xdim, True)
+        back = dm.unpack_mixed_deltas(coded[i], v, delta[:i], xdim, v - np.asarray(delta[i], dtype=np.int64))
         if not np.array_equal(back, delta[i]):
             print("WARNING: channel %d mixed-coded deltas do not decode back." % i)
 
@@ -96,7 +100,7 @@ class BlockCoder:
         self.pixel_shift = 3
         self.correction = 0         # preview only
         self.min_set_id = 0
-        self.bands = 1              # independently decodable bands Save writes (1: one, format 5)
+        self.bands = 1              # independently decodable bands Save writes (1: one, format 7)
 
         # The last survey: each channel's block size and predictor ids, in
         # coding order (None before the first), and the quantization it was
@@ -250,7 +254,7 @@ class BlockCoder:
         return rgb
 
     def save(self, filename="foo"):
-        """One band: format 5 (one_band). Bands: format 6 (in_bands), and the
+        """One band: format 7 (one_band). Bands: format 8 (in_bands), and the
         size it would have been as one band for the report. Returns the file
         size."""
         n = self.bands_used()
@@ -272,12 +276,12 @@ class BlockCoder:
         return len(data)
 
     def one_band(self):
-        """Format 5. Header: FORMAT_ID, ONE_BAND_VERSION, width, height
+        """Format 7 (5's layout). Header: FORMAT_ID, ONE_BAND_VERSION, width, height
         (unsigned shorts), pixel_shift, pixel_quant, channel set. Then per
         channel: int min, int init, the block map (write_map, type 13; it
         carries the channel's block size and predictor ids; its context lines
         up the previous channel's map, align_map), then the deltas,
-        mixed-context coded (pack_mixed_deltas). Channels 1 and 2 use the ones
+        mixed-context coded with the second opinions (pack_mixed_deltas). Channels 1 and 2 use the ones
         before them as context, so the reader decodes in order. Returns the
         bytes."""
         coded = mixed_code(self.delta_list, self.value_list, self.delta_xdim)
@@ -295,7 +299,7 @@ class BlockCoder:
         return out.to_bytes()
 
     def in_bands(self, n):
-        """Format 6: the header as format 5's, then the number of bands n (an
+        """Format 8 (6's layout): the header as format 7's, then the number of bands n (an
         unsigned byte), each channel's int min (coding order), then n int
         lengths and the n bands. Band b is rows band_start(b) to
         band_start(b + 1) of the quantized image, coded as an image of its own

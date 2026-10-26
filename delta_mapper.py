@@ -1642,9 +1642,10 @@ def _table_reference_deltas(ps, block):
 
 @njit
 def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, cross_base, bias_base, use_ls,
-                mixed, data, value, cb, fwd, c9b, m, act_table, n_contexts):
+                mixed, data, value, cb, fwd, c9b, m, act_table, n_contexts, opinions):
     # mixed: each delta is decoded (into delta) just before it is used, from
-    # the deltas and values so far (get_values_from_mixed_deltas).
+    # the deltas and values so far (get_values_from_mixed_deltas); with
+    # opinions, given the block's prediction at interior pixels.
     state = _mix_state(data, m, value.shape[0], n_contexts)
     bwd, bht = _block_wh(np.int64(mp[0]), xdim)
     bw = (xdim - 2 + bwd - 1) // bwd
@@ -1658,22 +1659,20 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
     prim = np.zeros(ALL_PRIMITIVES, dtype=np.int64)
     row, col, win, cur, ring, z, a, b, coef, dg = _ls_state(xdim, has_ref)
     if mixed:
-        _mix_decode_one(state, data, 0, delta, dst, value, xdim, cb, fwd, c9b, m, act_table)
+        _mix_decode_one(state, data, 0, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, opinions, 0)
     dst[0] = init
     for x in range(1, xdim):
         if mixed:
-            _mix_decode_one(state, data, x, delta, dst, value, xdim, cb, fwd, c9b, m, act_table)
+            _mix_decode_one(state, data, x, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, opinions, 0)
         dst[x] = dst[x - 1] + delta[x]
     for y in range(1, ydim):
         k = y * xdim
         if mixed:
-            _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table)
+            _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, opinions, 0)
         dst[k] = dst[k - xdim] + delta[k]
         mrow = head + (y - 1) // bht * bw
         for x in range(1, xdim - 1):
             k += 1
-            if mixed:
-                _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table)
             pid = ids[mp[mrow + (x - 1) // bwd]]
             if use_ls:
                 corr[4, k] = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg,
@@ -1682,11 +1681,14 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
             _all_primitives(dst, ref, has_ref, corr, k, xdim, prim)
             i = first[pid]
             j = second[pid]
-            dst[k] = delta[k] + (prim[i] if i == j else (prim[i] + prim[j] + 1) >> 1)
+            p = prim[i] if i == j else (prim[i] + prim[j] + 1) >> 1
+            if mixed:
+                _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, opinions, p)
+            dst[k] = delta[k] + p
             _bias_commit(dst, k, xdim, ctx, bsum, bcount, bias_base)
         k += 1
         if mixed:
-            _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table)
+            _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, opinions, 0)
         dst[k] = dst[k - 1] + delta[k]
     return dst
 
@@ -1705,20 +1707,21 @@ def get_values_from_block_deltas(delta, xdim, ydim, init, mp, ref):
     none = np.zeros(1, dtype=np.int64)
     return _from_block(np.asarray(delta, dtype=np.int64), r, has_ref, xdim, ydim, init, mp,
                        ids, TABLE_FIRST, TABLE_SECOND, CROSS_BASE, BIAS_BASE, use_ls,
-                       False, np.zeros(1, dtype=np.uint8), none, none, none, none, 2, MIX_ACTIVITY_TABLE, 1)
+                       False, np.zeros(1, dtype=np.uint8), none, none, none, none, 2, MIX_ACTIVITY_TABLE, 1, False)
 
 
-def get_values_from_mixed_deltas(value, coded, previous, xdim, ydim, init, mp, ref):
+def get_values_from_mixed_deltas(value, coded, previous, xdim, ydim, init, mp, ref, opinions=False):
     """Decodes a channel pack_mixed_deltas coded (value, coded: from
     read_mixed_deltas) while rebuilding it from its block map, as
     get_values_from_block_deltas does. previous: the deltas of the channels
-    decoded before it; ref: the previous channel's values. Returns (deltas, values)."""
+    decoded before it; ref: the previous channel's values; opinions: whether
+    it was coded with the second opinions. Returns (deltas, values)."""
     mp, r, has_ref, ids, use_ls = _from_block_args(xdim, mp, ref)
     n = xdim * ydim
     cb, fwd, c9b, m = _mix_setup(previous, xdim, n)
     delta = np.zeros(n, dtype=np.int64)
     values = _from_block(delta, r, has_ref, xdim, ydim, init, mp, ids, TABLE_FIRST, TABLE_SECOND, CROSS_BASE, BIAS_BASE,
-                         use_ls, True, coded, value, cb, fwd, c9b, m, MIX_ACTIVITY_TABLE, CONTEXTS)
+                         use_ls, True, coded, value, cb, fwd, c9b, m, MIX_ACTIVITY_TABLE, _mix_contexts_count(opinions), opinions)
     return delta, values
 
 
@@ -2182,7 +2185,14 @@ def read_context_deltas(inp, n, previous, xdim):
 # frequent first, so the scan is short). Model 0 needs the values decoded so
 # far, so the decoder decodes each delta as it rebuilds the channel
 # (get_values_from_mixed_deltas).
+#
+# With second opinions (Block formats 7 and 8): each model's context is also
+# split MIX_OPINION_LEVELS ways by how far a simple predictor's value lies
+# from the block's prediction, signed (_gradient_level of opinion -
+# prediction): GAP/8 for model 0, MED for model 1 and a (left) for model 2;
+# interior pixels only (the rest use the middle level). See DeltaMapper.java.
 
+MIX_OPINION_LEVELS = 9
 MIX_R_BITS = 16
 MIX_W_BITS = 16
 MIX_WMIN = 256
@@ -2251,8 +2261,9 @@ def _mix_earlier(previous, xdim, ydim, cross_table):
 
 
 @njit
-def _mix_contexts(k, d, v, xdim, cb, fwd, c9b, m, act_table, ctx):
-    """The models' contexts at pixel k (d and v are read below k only)."""
+def _mix_contexts(k, d, v, xdim, cb, fwd, c9b, m, act_table, ctx, opinions, pred):
+    """The models' contexts at pixel k (d and v are read below k only); with
+    opinions, split by the second opinions about pred, the block's prediction."""
     x = k % xdim
     act = 0
     if x > 0:
@@ -2279,6 +2290,31 @@ def _mix_contexts(k, d, v, xdim, cb, fwd, c9b, m, act_table, ctx):
         ctx[2] = act_table[min(act, top)] * 5 + c9b[k]
     else:
         ctx[1] = act_table[min(act, top)] * 5 + c
+    if opinions:
+        mid = MIX_OPINION_LEVELS // 2
+        o0 = mid
+        o1 = mid
+        o2 = mid
+        if k >= xdim and x >= 1 and x < xdim - 1:
+            a = v[k - 1]
+            b = v[k - xdim]
+            cc = v[k - xdim - 1]
+            dd = v[k - xdim + 1]
+            up2 = k >= 2 * xdim
+            aa = v[k - 2] if x >= 2 else a
+            bb = v[k - 2 * xdim] if up2 else b
+            nne = v[k - 2 * xdim + 1] if up2 else dd
+            o0 = _gradient_level(_gap(a, aa, b, bb, cc, dd, nne, 10, 4, 1) - pred) + mid
+            o1 = _gradient_level(_block_predictor(11, a, b, cc, dd) - pred) + mid
+            o2 = _gradient_level(a - pred) + mid
+        ctx[0] = ctx[0] * MIX_OPINION_LEVELS + o0
+        ctx[1] = ctx[1] * MIX_OPINION_LEVELS + o1
+        if m == 3:
+            ctx[2] = ctx[2] * MIX_OPINION_LEVELS + o2
+
+
+def _mix_contexts_count(opinions):
+    return CONTEXTS * MIX_OPINION_LEVELS if opinions else CONTEXTS
 
 
 @njit
@@ -2326,7 +2362,7 @@ def _mix_update(f, total, w, ctx, m, s, n_symbols, q):
 
 
 @njit
-def _mix_encode(symbol, d, v, xdim, n_symbols, cb, fwd, c9b, m, act_table, n_contexts):
+def _mix_encode(symbol, d, v, xdim, n_symbols, cb, fwd, c9b, m, act_table, n_contexts, opinions):
     n = symbol.shape[0]
     f, total, w = _mix_init(m, n_symbols, n_contexts)
     st, out = am._enc_init(n)
@@ -2334,7 +2370,7 @@ def _mix_encode(symbol, d, v, xdim, n_symbols, cb, fwd, c9b, m, act_table, n_con
     q = np.zeros(m, dtype=np.int64)
     T = (1 << MIX_R_BITS) + n_symbols
     for k in range(n):
-        _mix_contexts(k, d, v, xdim, cb, fwd, c9b, m, act_table, ctx)
+        _mix_contexts(k, d, v, xdim, cb, fwd, c9b, m, act_table, ctx, opinions, v[k] - d[k])
         s = symbol[k]
         a = 0
         b = 0
@@ -2363,11 +2399,12 @@ def _mix_state(data, m, n_symbols, n_contexts):
 
 
 @njit
-def _mix_decode_one(state, data, k, d, v, value, xdim, cb, fwd, c9b, m, act_table):
-    """Decodes delta k into d[k] (d and v must be filled below k)."""
+def _mix_decode_one(state, data, k, d, v, value, xdim, cb, fwd, c9b, m, act_table, opinions, pred):
+    """Decodes delta k into d[k] (d and v must be filled below k; pred: the
+    block's prediction at k, used with opinions at interior pixels)."""
     dt, f, total, w, ctx, cum, C0, C1, q = state
     n_symbols = value.shape[0]
-    _mix_contexts(k, d, v, xdim, cb, fwd, c9b, m, act_table, ctx)
+    _mix_contexts(k, d, v, xdim, cb, fwd, c9b, m, act_table, ctx, opinions, pred)
     t = am._target(dt, (1 << MIX_R_BITS) + n_symbols)
     for j in range(m):
         cum[j] = 0
@@ -2395,13 +2432,14 @@ def _mix_decode_one(state, data, k, d, v, value, xdim, cb, fwd, c9b, m, act_tabl
 
 
 @njit
-def _mix_decode_known(data, value, v, xdim, cb, fwd, c9b, m, act_table, n_contexts):
-    """Decodes every delta with the channel's values already known (a check of the coding)."""
+def _mix_decode_known(data, value, v, xdim, cb, fwd, c9b, m, act_table, n_contexts, opinions, pred):
+    """Decodes every delta with the channel's values (and, with opinions, the
+    block's predictions) already known (a check of the coding)."""
     n = v.shape[0]
     d = np.zeros(n, dtype=np.int64)
     state = _mix_state(data, m, value.shape[0], n_contexts)
     for k in range(n):
-        _mix_decode_one(state, data, k, d, v, value, xdim, cb, fwd, c9b, m, act_table)
+        _mix_decode_one(state, data, k, d, v, value, xdim, cb, fwd, c9b, m, act_table, opinions, pred[k] if opinions else 0)
     return d
 
 
@@ -2415,16 +2453,17 @@ def _mix_setup(previous, xdim, n):
     return cb, fwd, c9b, 3
 
 
-def pack_mixed_deltas(delta, values, previous, xdim):
+def pack_mixed_deltas(delta, values, previous, xdim, opinions=False):
     """A channel's deltas, mixed-context coded: int min, the rank table (as
     pack_context_deltas), int coded length, coded bytes. values: the channel
     as the decoder rebuilds it (before any minimum is added back); previous:
-    the deltas of the channels coded before it."""
+    the deltas of the channels coded before it; opinions: with the second
+    opinions (Block formats 7 and 8; the block's prediction is values - delta)."""
     delta = np.asarray(delta, dtype=np.int64)
     symbol, lo, rank = _rank_symbols(delta)
     cb, fwd, c9b, m = _mix_setup(previous, xdim, len(delta))
     coded = _mix_encode(symbol, delta, np.asarray(values, dtype=np.int64), xdim, len(rank),
-                        cb, fwd, c9b, m, MIX_ACTIVITY_TABLE, CONTEXTS)
+                        cb, fwd, c9b, m, MIX_ACTIVITY_TABLE, _mix_contexts_count(opinions), opinions)
     out = DataOutput()
     out.write_int(lo); write_table(out, rank); out.write_int(len(coded)); out.write(coded.tobytes())
     return out.to_bytes()
@@ -2441,13 +2480,18 @@ def read_mixed_deltas(inp):
     return value, coded
 
 
-def unpack_mixed_deltas(packed, values, previous, xdim):
+def unpack_mixed_deltas(packed, values, previous, xdim, prediction=None):
     """Decodes pack_mixed_deltas' bytes given the channel's values (for
-    checking the coding; a reader rebuilds the values as it decodes)."""
+    checking the coding; a reader rebuilds the values as it decodes) and,
+    for bytes coded with the second opinions, the block's prediction at
+    each pixel."""
     value, coded = read_mixed_deltas(DataInput(packed))
     values = np.asarray(values, dtype=np.int64)
     cb, fwd, c9b, m = _mix_setup(previous, xdim, len(values))
-    return _mix_decode_known(coded, value, values, xdim, cb, fwd, c9b, m, MIX_ACTIVITY_TABLE, CONTEXTS)
+    opinions = prediction is not None
+    pred = np.asarray(prediction, dtype=np.int64) if opinions else np.zeros(1, dtype=np.int64)
+    return _mix_decode_known(coded, value, values, xdim, cb, fwd, c9b, m, MIX_ACTIVITY_TABLE,
+                             _mix_contexts_count(opinions), opinions, pred)
 
 
 # ---- Surveying predictor sets (DeltaMapper.surveyBlockSets) -------------------
