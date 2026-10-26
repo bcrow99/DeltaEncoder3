@@ -276,16 +276,22 @@ def _model_update(f, bit, total, c, n, s, increment, limit):
         bit[c, i] += increment
         i += i & -i
     if total[c] > limit:
-        t = 0
-        for k in range(n):
-            f[c, k] = (f[c, k] + 1) >> 1
-            t += f[c, k]
-            bit[c, k + 1] = f[c, k]
-        for i in range(1, n + 1):
-            j = i + (i & -i)
-            if j <= n:
-                bit[c, j] += bit[c, i]
-        total[c] = t
+        _model_halve(f, bit, total, c, n)
+
+
+@njit
+def _model_halve(f, bit, total, c, n):
+    """Context c's counts halved (rounding up), its tree rebuilt."""
+    t = 0
+    for k in range(n):
+        f[c, k] = (f[c, k] + 1) >> 1
+        t += f[c, k]
+        bit[c, k + 1] = f[c, k]
+    for i in range(1, n + 1):
+        j = i + (i & -i)
+        if j <= n:
+            bit[c, j] += bit[c, i]
+    total[c] = t
 
 
 # ---- Adaptive coder ---------------------------------------------------------
@@ -333,7 +339,9 @@ def get_arithmetic_values_adaptive(encoded, n):
 @njit
 def _context_encode(symbol, n_symbols, context, n_contexts, top):
     # The range coder of _encode / _shift_low with its state in local
-    # variables (kept in registers; the same bytes, about twice as fast).
+    # variables (kept in registers; the same bytes, about twice as fast),
+    # and _model_start / _model_update written out (a call per symbol
+    # passing arrays is slow in Numba; the rare halving stays a call).
     f, bit, total = _models(n_contexts, n_symbols)
     n = symbol.shape[0]
     out = np.zeros(max(16, n // 2 + n // 8 + 16), dtype=np.uint8)
@@ -345,7 +353,11 @@ def _context_encode(symbol, n_symbols, context, n_contexts, top):
     for k in range(n):
         c = context[k]
         s = symbol[k]
-        start = _model_start(bit, c, s)
+        start = 0
+        i = s
+        while i > 0:
+            start += bit[c, i]
+            i -= i & -i
         r = rng // total[c]
         low += start * r
         rng = np.int64(f[c, s]) * r
@@ -369,7 +381,14 @@ def _context_encode(symbol, n_symbols, context, n_contexts, top):
                 cache = (low >> 32) & 0xFF
             csize += 1
             low = (low & 0xFFFFFFFF) << 8
-        _model_update(f, bit, total, c, n_symbols, s, CONTEXT_INCREMENT, CONTEXT_LIMIT)
+        f[c, s] += CONTEXT_INCREMENT
+        total[c] += CONTEXT_INCREMENT
+        i = s + 1
+        while i <= n_symbols:
+            bit[c, i] += CONTEXT_INCREMENT
+            i += i & -i
+        if total[c] > CONTEXT_LIMIT:
+            _model_halve(f, bit, total, c, n_symbols)
     st = np.zeros(5, dtype=np.int64)
     st[0] = low; st[1] = rng; st[2] = cache; st[3] = csize; st[4] = size
     return _finish(st, out)

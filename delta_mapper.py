@@ -1443,6 +1443,49 @@ def _all_primitives(v, ref, has_ref, corr, k, xdim, prim):
     prim[47] = np.int64(corr[5, k]) if corr.shape[0] > 5 else a   # LS wide (row 5)
 
 
+_CROSS_BASE_T = tuple(int(b) for b in CROSS_BASE)   # as constants in _primitive_value
+_BIAS_BASE_T = tuple(int(b) for b in BIAS_BASE)
+
+
+@njit
+def _primitive_value(q, a, b, c, d, aa, bb, nne, has_ref, r, ra, rb, rc, rd, c0, c1, c2, c3, ls, lsw):
+    """Primitive q from the neighbours already read (scalars only: a call
+    passing arrays per pixel is slow in Numba): a, b, c, d; aa, bb, nne as
+    _all_primitives has them; the previous channel's r, ra, rb, rc, rd (if
+    has_ref); bias corrections c0-c3; LS and LS wide. The same values as
+    _primitive."""
+    if q < CROSS_FIRST:
+        return _block_predictor(q, a, b, c, d)
+    if q < REACH_FIRST:
+        s = q - CROSS_FIRST
+        base = _CROSS_BASE_T[s]
+        p = _block_predictor(base, a, b, c, d)
+        if not has_ref:
+            return p
+        e = r - _block_predictor(base, ra, rb, rc, rd)
+        return p + (e >> 1) if s >= 6 else p + e
+    if q < CLAMP_FIRST:
+        if q == REACH_FIRST:
+            return 2 * a - aa
+        if q == REACH_FIRST + 1:
+            return 2 * b - bb
+        if q == REACH_FIRST + 2:
+            return _gap(a, aa, b, bb, c, d, nne, 80, 32, 8)
+        return _gap(a, aa, b, bb, c, d, nne, 10, 4, 1)
+    if q < BIAS_FIRST:
+        lo = min(min(a, b), min(c, d))
+        hi = max(max(a, b), max(c, d))
+        p = a + b - c if q == CLAMP_FIRST else a + d - b
+        return max(lo, min(hi, p))
+    if q == LS_WIDE:
+        return lsw
+    if q >= LS_FIRST:
+        return ls
+    s = q - BIAS_FIRST
+    cs = c0 if s == 0 else (c1 if s == 1 else (c2 if s == 2 else c3))
+    return _block_predictor(_BIAS_BASE_T[s], a, b, c, d) + cs
+
+
 @njit
 def _predict(pid, first, second, v, ref, has_ref, corr, k, xdim, cross_base, bias_base):
     i = first[pid]
@@ -1475,16 +1518,30 @@ def _block_from_map(src, ref, has_ref, corr, xdim, y0, y1, mp, ids, first, secon
     bwd, bht = _block_wh(np.int64(mp[0]), xdim)
     bw = (xdim - 2 + bwd - 1) // bwd
     head = 2 + np.int64(mp[1])
-    prim = np.zeros(ALL_PRIMITIVES, dtype=np.int64)   # all of them: faster than computing two by dispatch
+    nc = corr.shape[0]
+    # The entry's one or two primitives only, from neighbours read here
+    # (_primitive_value takes scalars).
     for y in range(y0, y1):
         row = head + (y - 1) // bht * bw
         for x in range(1, xdim - 1):
             k = y * xdim + x
-            _all_primitives(src, ref, has_ref, corr, k, xdim, prim)
             pid = ids[mp[row + (x - 1) // bwd]]
             i = first[pid]
             j = second[pid]
-            dst[k] = src[k] - (prim[i] if i == j else (prim[i] + prim[j] + 1) >> 1)
+            a = src[k - 1]; b = src[k - xdim]; c = src[k - xdim - 1]; d = src[k - xdim + 1]
+            aa = src[k - 2] if x >= 2 else a
+            bb = src[k - 2 * xdim] if y >= 2 else b
+            nne = src[k - 2 * xdim + 1] if y >= 2 else d
+            r = ra = rb = rc = rd = 0
+            if has_ref:
+                r = ref[k]; ra = ref[k - 1]; rb = ref[k - xdim]; rc = ref[k - xdim - 1]; rd = ref[k - xdim + 1]
+            c0 = np.int64(corr[0, k]); c1 = np.int64(corr[1, k]); c2 = np.int64(corr[2, k]); c3 = np.int64(corr[3, k])
+            ls = np.int64(corr[4, k]) if nc > 4 else a
+            lsw = np.int64(corr[5, k]) if nc > 5 else a
+            p = _primitive_value(i, a, b, c, d, aa, bb, nne, has_ref, r, ra, rb, rc, rd, c0, c1, c2, c3, ls, lsw)
+            if i != j:
+                p = (p + _primitive_value(j, a, b, c, d, aa, bb, nne, has_ref, r, ra, rb, rc, rd, c0, c1, c2, c3, ls, lsw) + 1) >> 1
+            dst[k] = src[k] - p
 
 
 def get_block_deltas_from_map(ps, mp, ids=None):
@@ -1499,8 +1556,34 @@ def get_block_deltas_from_map(ps, mp, ids=None):
     return dst
 
 
+def _first_channel_primitive(q):
+    """What primitive q is on the first channel: a cross-channel primitive's
+    base predictor (CROSS_BASE), any other primitive itself."""
+    return int(CROSS_BASE[q - CROSS_FIRST]) if CROSS_FIRST <= q < REACH_FIRST else q
+
+
+def same_prediction(has_ref, pids, first=None, second=None):
+    """(same, at) for the ids pids (DeltaMapper.samePrediction and
+    distinctPositions): on the first channel (no ref) entries that differ only
+    in cross-channel primitives predict alike; same[q] is the first position
+    predicting as pids[q] does, at the positions that are their own first. The
+    survey computes only those: the others' sums and estimates are copies, and
+    a strict-less argmin over them picks what it would over all."""
+    first = TABLE_FIRST if first is None else first
+    second = TABLE_SECOND if second is None else second
+    n = len(pids)
+    same = np.arange(n, dtype=np.int64)
+    if not has_ref:
+        seen = {}
+        for q in range(n):
+            i = _first_channel_primitive(int(first[pids[q]]))
+            j = _first_channel_primitive(int(second[pids[q]]))
+            same[q] = seen.setdefault((min(i, j), max(i, j)), q)
+    return same, np.flatnonzero(same == np.arange(n)).astype(np.int64)
+
+
 @njit
-def _block_choices(src, ref, has_ref, corr, xdim, ydim, block, ids, used, first, second, n_prim, cross_base, bias_base, by0, by1, choice):
+def _block_choices(src, ref, has_ref, corr, xdim, ydim, block, ids, used, at, first, second, n_prim, cross_base, bias_base, by0, by1, choice):
     """Block rows by0..by1-1: each block's index of the id with the smallest
     sum of |delta|, into choice. Each primitive in used is computed once per pixel."""
     bwd, bht = _block_wh(block, xdim)
@@ -1517,14 +1600,14 @@ def _block_choices(src, ref, has_ref, corr, xdim, ydim, block, ids, used, first,
                 k = y * xdim + x
                 _all_primitives(src, ref, has_ref, corr, k, xdim, prim)
                 base = (x - 1) // bwd * n
-                for p in range(n):
+                for p in at:
                     i = first[ids[p]]
                     j = second[ids[p]]
                     v = prim[i] if i == j else (prim[i] + prim[j] + 1) >> 1
                     sums[base + p] += abs(src[k] - v)
         for bx in range(bw):
             best = 0
-            for p in range(1, n):
+            for p in at:
                 if sums[bx * n + p] < sums[bx * n + best]:
                     best = p
             choice[by * bw + bx] = best
@@ -1543,7 +1626,8 @@ def _block_choices_for(ps, block, ids):
     used = np.array(sorted(set(int(TABLE_FIRST[i]) for i in ids) | set(int(TABLE_SECOND[i]) for i in ids)), dtype=np.int64)
     bh = blocks_down(ydim, block)
     choice = np.zeros(blocks_across(xdim, block) * bh, dtype=np.uint8)
-    _in_bands(bh, lambda lo, hi: _block_choices(ps.v, ps.ref, ps.has_ref, ps.corr, xdim, ydim, block, arr, used,
+    at = same_prediction(ps.has_ref, ids)[1]
+    _in_bands(bh, lambda lo, hi: _block_choices(ps.v, ps.ref, ps.has_ref, ps.corr, xdim, ydim, block, arr, used, at,
                                                 TABLE_FIRST, TABLE_SECOND, TABLE_PRIMITIVES, CROSS_BASE, BIAS_BASE, lo, hi, choice))
     return choice
 
@@ -1556,7 +1640,7 @@ def _block_deltas_from_values(ps, block, ids):
 
 
 @njit
-def _nested_choices(src, ref, has_ref, corr, xdim, ydim, sizes, offsets, n, first, second, cross_base, bias_base, t0, t1, choice):
+def _nested_choices(src, ref, has_ref, corr, xdim, ydim, sizes, offsets, n, at, first, second, cross_base, bias_base, t0, t1, choice):
     """Bands t0..t1-1 (each a row of the largest blocks): each base (smallest)
     block's sums of |delta| for ids 0..n-1, then each shape's blocks' sums
     added up from them; each block's id with the smallest sum (the first on a
@@ -1578,7 +1662,7 @@ def _nested_choices(src, ref, has_ref, corr, xdim, ydim, sizes, offsets, n, firs
                 k = y * xdim + x
                 _all_primitives(src, ref, has_ref, corr, k, xdim, prim)
                 s0 = (r * bw_base + (x - 1) // base) * n
-                for p in range(n):
+                for p in at:
                     i = first[p]
                     j = second[p]
                     v = prim[i] if i == j else (prim[i] + prim[j] + 1) >> 1
@@ -1598,10 +1682,10 @@ def _nested_choices(src, ref, has_ref, corr, xdim, ydim, sizes, offsets, n, firs
                     for rr in range(rs * f, rs * f + f):
                         for cc in range(bx * f, min(bw_base, bx * f + f)):
                             s0 = (rr * bw_base + cc) * n
-                            for p in range(n):
+                            for p in at:
                                 total[p] += sums[s0 + p]
                     best = 0
-                    for p in range(1, n):
+                    for p in at:
                         if total[p] < total[best]:
                             best = p
                     choice[offsets[t] + by * bw + bx] = best
@@ -1663,7 +1747,8 @@ def _table_reference_deltas_at(ps, sizes):
     offsets = np.concatenate([[0], np.cumsum(counts)[:-1]]).astype(np.int64)
     choice = np.zeros(int(sum(counts)), dtype=np.uint8)
     bands = blocks_down(ydim, int(srt[-1]))
-    _in_bands(bands, lambda lo, hi: _nested_choices(ps.v, ps.ref, ps.has_ref, ps.corr, xdim, ydim, srt, offsets, PREDICTORS,
+    at = same_prediction(ps.has_ref, list(range(PREDICTORS)))[1]
+    _in_bands(bands, lambda lo, hi: _nested_choices(ps.v, ps.ref, ps.has_ref, ps.corr, xdim, ydim, srt, offsets, PREDICTORS, at,
                                                     TABLE_FIRST, TABLE_SECOND, CROSS_BASE, BIAS_BASE, lo, hi, choice))
     ids = list(range(PREDICTORS))
     by_size = {}
@@ -2170,10 +2255,30 @@ def _delta_context(d, previous, k, xdim, act_limit, cross_limit):
 
 
 @njit
-def _delta_contexts(d, previous, xdim, act_limit, cross_limit, k0, k1, ctx):
-    """Contexts of deltas k0..k1-1, into ctx."""
+def _delta_contexts(d, previous, xdim, act_table, cross_table, n_cross, k0, k1, ctx):
+    """Contexts of deltas k0..k1-1, into ctx: _delta_context's, written out
+    here with its buckets looked up (act_table, cross_table: _bucket_table of
+    ACTIVITY_LIMIT and CROSS_LIMIT), as a call per delta passing arrays is
+    slow in Numba."""
+    n_prev = previous.shape[0]
+    na = act_table.shape[0] - 1
+    nc = cross_table.shape[0] - 1
     for k in range(k0, k1):
-        ctx[k] = _delta_context(d, previous, k, xdim, act_limit, cross_limit)
+        y = k // xdim
+        x = k - y * xdim
+        activity = 0
+        cross = 0
+        if x > 0:
+            activity += abs(d[k - 1])
+        if k >= xdim:
+            activity += abs(d[k - xdim])
+            if x > 0:
+                activity += abs(d[k - xdim - 1])
+            if x < xdim - 1:
+                activity += abs(d[k - xdim + 1])
+        for p in range(n_prev):
+            cross += abs(previous[p, k])
+        ctx[k] = act_table[min(activity, na)] * n_cross + cross_table[min(cross, nc)]
 
 
 @njit
@@ -2200,7 +2305,7 @@ def pack_context_deltas(delta, previous, xdim):
     symbol, lo, rank = _rank_symbols(delta)
     prev2d = _previous_2d(previous, len(delta))
     ctx = np.zeros(len(delta), dtype=np.int64)
-    _in_bands(len(delta), lambda k0, k1: _delta_contexts(delta, prev2d, xdim, ACTIVITY_LIMIT, CROSS_LIMIT, k0, k1, ctx))
+    _in_bands(len(delta), lambda k0, k1: _delta_contexts(delta, prev2d, xdim, MIX_ACTIVITY_TABLE, MIX_CROSS_TABLE, len(CROSS_LIMIT), k0, k1, ctx))
     coded = am.get_interval_value_context(symbol, len(rank), ctx, CONTEXTS)
     out = DataOutput()
     out.write_int(lo); write_table(out, rank); out.write_int(len(coded)); out.write(coded.tobytes())
@@ -2573,14 +2678,16 @@ def _cost256(r):
 
 
 @njit
-def _cost_counts(ref, previous, xdim, ydim, lo, rng, act_limit, cross_limit, n_ctx):
+def _cost_counts(ref, previous, xdim, ydim, lo, rng, act_table, cross_table, n_cross, n_ctx):
+    every = np.zeros(xdim * ydim, dtype=np.int64)
+    _delta_contexts(ref, previous, xdim, act_table, cross_table, n_cross, xdim, xdim * ydim, every)
     ctx = np.zeros(xdim * ydim, dtype=np.int64)
     count = np.zeros((n_ctx, rng), dtype=np.int64)
     total = np.zeros(n_ctx, dtype=np.int64)
     for y in range(1, ydim):
         for x in range(1, xdim - 1):
             k = y * xdim + x
-            c = _delta_context(ref, previous, k, xdim, act_limit, cross_limit)
+            c = every[k]
             ctx[k] = c
             v = min(rng - 1, max(0, ref[k] - lo))
             count[c, v] += 1
@@ -2598,7 +2705,8 @@ class DeltaCost:
         self.lo = -2 * span - 2
         self.range = 4 * span + 5
         self.context, count, total = _cost_counts(np.asarray(ref, dtype=np.int64), _previous_2d(previous, len(src)),
-                                                  xdim, ydim, self.lo, self.range, ACTIVITY_LIMIT, CROSS_LIMIT, CONTEXTS)
+                                                  xdim, ydim, self.lo, self.range, MIX_ACTIVITY_TABLE, MIX_CROSS_TABLE,
+                                                  len(CROSS_LIMIT), CONTEXTS)
         cost = np.zeros((CONTEXTS, self.range), dtype=np.int64)
         cache = {}
         for c in range(CONTEXTS):
@@ -2613,7 +2721,7 @@ class DeltaCost:
 
 
 @njit
-def _block_cost_table(src, ref, has_ref, corr, xdim, ydim, block, cost, ctx, lo, rng, pids, first, second, n_prim, cross_base, bias_base, rows, r0, r1, est):
+def _block_cost_table(src, ref, has_ref, corr, xdim, ydim, block, cost, ctx, lo, rng, pids, same, at, first, second, n_prim, cross_base, bias_base, rows, r0, r1, est):
     """Block rows rows[r0..r1-1] of the cost table, into est[(r * bw + bx) * n + q]."""
     n = pids.shape[0]
     bwd, bht = _block_wh(block, xdim)
@@ -2630,15 +2738,21 @@ def _block_cost_table(src, ref, has_ref, corr, xdim, ydim, block, cost, ctx, lo,
                 c = ctx[k]
                 _all_primitives(src, ref, has_ref, corr, k, xdim, prim)
                 base = (r * bw + (x - 1) // bwd) * n
-                for q in range(n):
+                for q in at:
                     i = first[pids[q]]
                     j = second[pids[q]]
                     v = prim[i] if i == j else (prim[i] + prim[j] + 1) >> 1
                     est[base + q] += cost[c, min(rng - 1, max(0, s - v - lo))]
+        # The rest of each group as its first (each row's estimates start at 0).
+        if at.shape[0] < n and y0 < y1:
+            for bx in range(bw):
+                for q in range(n):
+                    if same[q] != q:
+                        est[(r * bw + bx) * n + q] = est[(r * bw + bx) * n + same[q]]
 
 
 @njit
-def _prefix_maps(src, ref, has_ref, corr, xdim, ydim, block, cost, ctx, lo, rng, pids, first, second, n_prim, cross_base, bias_base,
+def _prefix_maps(src, ref, has_ref, corr, xdim, ydim, block, cost, ctx, lo, rng, pids, same, at, first, second, n_prim, cross_base, bias_base,
                  counts, heads, by0, by1, maps):
     """Block rows by0..by1-1 of the prefix maps (DeltaMapper.prefixMaps): row c
     of maps is the map for the first counts[c] ids, entries from heads[c]."""
@@ -2650,7 +2764,7 @@ def _prefix_maps(src, ref, has_ref, corr, xdim, ydim, block, cost, ctx, lo, rng,
     for by in range(by0, by1):
         est[:] = 0
         rows[0] = by
-        _block_cost_table(src, ref, has_ref, corr, xdim, ydim, block, cost, ctx, lo, rng, pids, first, second, n_prim,
+        _block_cost_table(src, ref, has_ref, corr, xdim, ydim, block, cost, ctx, lo, rng, pids, same, at, first, second, n_prim,
                           cross_base, bias_base, rows, 0, 1, est)
         for bx in range(bw):
             best = 0
@@ -2673,8 +2787,9 @@ def block_cost_table(ps, block, dc, ids=None, rows=None):
     bh = blocks_down(ps.ydim, block)
     rows = np.arange(bh, dtype=np.int64) if rows is None else np.asarray(rows, dtype=np.int64)
     est = np.zeros(blocks_across(ps.xdim, block) * len(rows) * len(ids), dtype=np.int32)   # as Java's int
+    same, at = same_prediction(ps.has_ref, ids)
     _in_bands(len(rows), lambda lo, hi: _block_cost_table(ps.v, ps.ref, ps.has_ref, ps.corr, ps.xdim, ps.ydim, block, dc.cost, dc.context,
-                                                          dc.lo, dc.range, ids, TABLE_FIRST, TABLE_SECOND,
+                                                          dc.lo, dc.range, ids, same, at, TABLE_FIRST, TABLE_SECOND,
                                                           TABLE_PRIMITIVES, CROSS_BASE, BIAS_BASE, rows, lo, hi, est))
     return est
 
@@ -2690,8 +2805,9 @@ def prefix_maps(ps, block, dc, ids, counts):
     maps = np.zeros((len(counts), width), dtype=np.uint8)
     heads = np.array([2 + c for c in counts], dtype=np.int64)
     arr = np.array(ids, dtype=np.int64)
+    same, at = same_prediction(ps.has_ref, ids)
     _in_bands(bh, lambda lo, hi: _prefix_maps(ps.v, ps.ref, ps.has_ref, ps.corr, ps.xdim, ps.ydim, block, dc.cost, dc.context,
-                                              dc.lo, dc.range, arr, TABLE_FIRST, TABLE_SECOND, TABLE_PRIMITIVES, CROSS_BASE, BIAS_BASE,
+                                              dc.lo, dc.range, arr, same, at, TABLE_FIRST, TABLE_SECOND, TABLE_PRIMITIVES, CROSS_BASE, BIAS_BASE,
                                               np.array(counts, dtype=np.int64), heads, lo, hi, maps))
     out = []
     for c, m in enumerate(counts):
