@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-delta_writer.py version 2.2 -- DeltaWriter.java for Python (PySide6).
+delta_writer.py version 2.3 -- DeltaWriter.java for Python (PySide6).
 
 Quantizes an image, codes it as deltas and saves it (to the file "foo", as
 the Java version does) in Delta format 'D' (version 4 with the block map,
@@ -38,7 +38,7 @@ import viewer_support as vs
 from java_io import DataOutput
 
 FORMAT_ID = ord('D')
-FORMAT_VERSION = 4   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: block maps with a block size per channel
+FORMAT_VERSION = 5   # 3: one predictor table (delta_mapper.TABLE_256) and cross-channel block maps; 4: block maps with a block size per channel; 5: the 225-entry predictor table (delta_mapper.TABLE)
 NO_BLOCK_MAP_VERSION = 3   # written for delta types other than the block map (13), whose files are as they were
 
 ENTROPY_NAMES = ["LZ77", "Huffman", "Arithmetic", "Adaptive", "Context"]

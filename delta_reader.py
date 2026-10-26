@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-delta_reader.py version 2.1 -- DeltaReader.java for Python (PySide6).
+delta_reader.py version 2.2 -- DeltaReader.java for Python (PySide6).
 
-Reads Delta format 'D' version 3 and 4 files, from delta_writer.py or
+Reads Delta format 'D' versions 3 to 5 files, from delta_writer.py or
 DeltaWriter.java (or DeltaWriter2.java), and shows the image.
 
     python3 delta_reader.py file
@@ -29,7 +29,7 @@ import viewer_support as vs
 from java_io import DataInput
 
 FORMAT_ID = ord('D')
-FORMAT_VERSION = 4   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: block maps with a block size per channel
+FORMAT_VERSION = 5   # 3: one predictor table (delta_mapper.TABLE_256) and cross-channel block maps; 4: block maps with a block size per channel; 5: the 225-entry predictor table (delta_mapper.TABLE)
 OLDEST_VERSION = 3   # older files are not read
 
 ENTROPY_NAMES = ["LZ77", "Huffman", "Arithmetic", "Adaptive", "Context"]
@@ -51,6 +51,7 @@ class DeltaDecoder:
         if not OLDEST_VERSION <= version <= FORMAT_VERSION:
             raise IOError("%s is Delta format version %d; this reader reads versions %d to %d (the block predictors changed in version %d)."
                           % (self.filename, version, OLDEST_VERSION, FORMAT_VERSION, OLDEST_VERSION))
+        self.predictor_table = dm.TABLE if version >= 5 else dm.TABLE_256   # what the block maps' ids index
         self.xdim = inp.read_unsigned_short()
         self.ydim = inp.read_unsigned_short()
         (self.pixel_shift, self.pixel_quant, self.set_id, self.delta_type, self.compress_type,
@@ -118,7 +119,7 @@ class DeltaDecoder:
                 delta[0] = 0
                 delta[1:] += self.delta_min[i]
         channel = dm.get_values_from_deltas(delta, w, h, self.init[i], self.delta_type, self.map[i], self.scanline5_variant,
-                                            ref=self.raw[i - 1] if i > 0 else None)
+                                            ref=self.raw[i - 1] if i > 0 else None, table=self.predictor_table)
         self.raw[i] = channel   # as decoded: the next channel's reference (block map)
         if dm.get_channels(self.set_id)[i] > 2:
             channel = channel + self.min[i]

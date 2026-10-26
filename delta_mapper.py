@@ -793,9 +793,11 @@ BLOCK_SEARCH_SIZES = [4, 6, 8, 12, 16, 24, 32]
 
 # Primitives: 0-21 on a, b, c, d (_block_predictor); 22-27 selection; 28-35
 # cross-channel; 36-39 longer reach; 40-41 clamped; 42-45 bias-corrected;
-# 46 least squares (LS: see _ls_next).
+# 46 least squares (LS: see _ls_next); 47 the same fit with a wider clamp (LS
+# wide: 2 beyond the range of all 8 neighbours rather than of a, b, c, d).
 PRIMITIVES = 22
-SELECTION_FIRST, CROSS_FIRST, REACH_FIRST, CLAMP_FIRST, BIAS_FIRST, LS_FIRST, ALL_PRIMITIVES = 22, 28, 36, 40, 42, 46, 47
+SELECTION_FIRST, CROSS_FIRST, REACH_FIRST, CLAMP_FIRST, BIAS_FIRST, LS_FIRST, ALL_PRIMITIVES = 22, 28, 36, 40, 42, 46, 48
+LS_WIDE = 47
 LS_RADIUS = 10   # the least-squares window: rows above, columns either side, pixels to the left
 GROUP_NAMES = ["selection", "cross-channel", "longer reach", "clamped", "bias-corrected", "least squares"]
 GROUP_FIRST = [SELECTION_FIRST, CROSS_FIRST, REACH_FIRST, CLAMP_FIRST, BIAS_FIRST, LS_FIRST, ALL_PRIMITIVES]
@@ -809,12 +811,14 @@ EXTRA_PRIMITIVE_NAMES = [
     "2a-aa", "2b-bb", "GAP", "GAP/8",
     "clamp(a+b-c)", "clamp(a+d-b)",
     "MED+bias", "(a+b)/2+bias", "a+bias", "b+bias",
-    "LS"]
+    "LS", "LS wide"]
 CROSS_BASE = np.array([0, 1, 3, 11, 4, 10, 11, 4], dtype=np.int64)   # the last two with half the error
 BIAS_BASE = np.array([11, 4, 0, 1], dtype=np.int64)
 
-# PREDICTOR_TABLE as pairs of primitives (equal for a primitive alone); id 255 is LS.
-PREDICTOR_PAIRS = [
+# PREDICTOR_TABLE_256 as pairs of primitives (equal for a primitive alone):
+# the table of Block formats 3 to 8 and Delta, Packet and Simple formats 3
+# and 4; id 255 is LS.
+PREDICTOR_PAIRS_256 = [
     0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 11, 11, 13, 13,
     16, 16, 18, 18, 19, 19, 23, 23, 24, 24, 25, 25, 28, 28, 29, 29, 30, 30, 31, 31, 32, 32, 34, 34,
     35, 35, 36, 36, 37, 37, 39, 39, 40, 40, 42, 42, 45, 45, 2, 0, 2, 1, 3, 0, 3, 1, 4, 0,
@@ -837,9 +841,35 @@ PREDICTOR_PAIRS = [
     40, 39, 42, 0, 42, 1, 42, 3, 42, 4, 42, 6, 42, 7, 42, 16, 42, 18, 42, 23, 42, 29, 42, 34,
     42, 35, 42, 36, 42, 37, 42, 39, 42, 40, 45, 0, 45, 3, 45, 4, 45, 5, 45, 6, 45, 7, 45, 16,
     45, 23, 45, 34, 45, 39, 46, 46]
+# PREDICTOR_TABLE (DeltaMapper.PREDICTOR_PAIRS): 225 entries, the 224 of the
+# 256 that BlockWriter's survey chose at least once over 19 test images at four
+# settings, in their old order (LS last, 223), then LS wide (224).
+PREDICTOR_PAIRS = [
+    0, 0, 1, 1, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 11, 11, 13, 13, 16, 16,
+    19, 19, 23, 23, 24, 24, 25, 25, 28, 28, 29, 29, 30, 30, 31, 31, 32, 32, 34, 34, 35, 35, 39, 39,
+    40, 40, 42, 42, 45, 45, 2, 0, 2, 1, 3, 0, 4, 0, 4, 3, 5, 0, 5, 1, 5, 4, 6, 0,
+    6, 1, 6, 2, 6, 4, 7, 0, 7, 4, 7, 5, 7, 6, 8, 0, 8, 1, 8, 4, 9, 4, 11, 0,
+    11, 1, 11, 7, 11, 8, 13, 0, 16, 0, 16, 1, 16, 3, 16, 4, 16, 5, 16, 6, 16, 7, 16, 9,
+    16, 11, 18, 0, 18, 1, 18, 4, 18, 5, 18, 6, 18, 7, 18, 8, 18, 9, 18, 13, 18, 16, 19, 3,
+    19, 18, 23, 0, 23, 2, 23, 4, 23, 5, 23, 6, 24, 0, 24, 1, 24, 4, 24, 5, 24, 6, 24, 7,
+    24, 9, 24, 18, 24, 23, 25, 1, 25, 3, 25, 5, 28, 0, 28, 5, 28, 6, 28, 7, 28, 8, 28, 16,
+    29, 1, 29, 4, 29, 5, 29, 6, 29, 7, 29, 8, 29, 16, 29, 28, 30, 6, 30, 7, 30, 16, 30, 25,
+    30, 28, 30, 29, 31, 5, 31, 6, 31, 11, 31, 16, 32, 4, 32, 5, 32, 6, 32, 7, 32, 8, 32, 9,
+    32, 16, 32, 28, 32, 30, 34, 0, 34, 2, 34, 3, 34, 6, 34, 7, 34, 8, 34, 16, 34, 23, 34, 25,
+    34, 28, 34, 29, 34, 30, 34, 31, 35, 0, 35, 1, 35, 2, 35, 3, 35, 4, 35, 5, 35, 6, 35, 7,
+    35, 8, 35, 9, 35, 16, 35, 23, 35, 24, 35, 28, 35, 29, 35, 30, 36, 4, 36, 11, 36, 16, 36, 25,
+    37, 9, 37, 13, 37, 16, 37, 18, 37, 19, 37, 25, 39, 0, 39, 1, 39, 2, 39, 3, 39, 4, 39, 5,
+    39, 6, 39, 7, 39, 8, 39, 9, 39, 11, 39, 13, 39, 16, 39, 23, 39, 24, 39, 25, 39, 28, 39, 29,
+    39, 30, 39, 31, 39, 32, 39, 34, 39, 35, 39, 36, 39, 37, 40, 0, 40, 1, 40, 3, 40, 7, 40, 11,
+    40, 16, 40, 19, 40, 25, 40, 34, 40, 36, 40, 37, 40, 39, 42, 0, 42, 1, 42, 3, 42, 4, 42, 6,
+    42, 7, 42, 16, 42, 18, 42, 23, 42, 29, 42, 34, 42, 35, 42, 36, 42, 37, 42, 39, 42, 40, 45, 0,
+    45, 4, 45, 5, 45, 6, 45, 7, 45, 16, 45, 34, 45, 39, 46, 46, 47, 47]
 TABLE_FIRST = np.array(PREDICTOR_PAIRS[0::2], dtype=np.int64)
 TABLE_SECOND = np.array(PREDICTOR_PAIRS[1::2], dtype=np.int64)
-PREDICTORS = len(TABLE_FIRST)   # 256
+PREDICTORS = len(TABLE_FIRST)   # 225
+TABLE = (TABLE_FIRST, TABLE_SECOND)
+TABLE_256 = (np.array(PREDICTOR_PAIRS_256[0::2], dtype=np.int64), np.array(PREDICTOR_PAIRS_256[1::2], dtype=np.int64))
+MAX_PREDICTORS = 256   # the most ids a block map may carry, one more than the largest id
 TABLE_PRIMITIVES = int(max(TABLE_FIRST.max(), TABLE_SECOND.max())) + 1
 
 
@@ -847,8 +877,9 @@ def primitive_name(p):
     return PRIMITIVE_NAMES[p] if p < PRIMITIVES else EXTRA_PRIMITIVE_NAMES[p - PRIMITIVES]
 
 
-def predictor_name(pid):
-    i, j = int(TABLE_FIRST[pid]), int(TABLE_SECOND[pid])
+def predictor_name(pid, table=None):
+    first, second = TABLE if table is None else table
+    i, j = int(first[pid]), int(second[pid])
     return primitive_name(i) if i == j else "avg(%s, %s)" % (primitive_name(i), primitive_name(j))
 
 
@@ -878,7 +909,7 @@ def describe_block_size(set_id, i, mp, xdim):
                                                      format(len(mp) - map_header_length(mp), ","))
 
 
-def describe_block_predictors(mp, indent):
+def describe_block_predictors(mp, indent, table=None):
     """The predictors a block map's blocks use, most used first (ties in the
     map's order), one per line: the number of blocks, then the name
     (DeltaMapper.describeBlockPredictors)."""
@@ -886,15 +917,16 @@ def describe_block_predictors(mp, indent):
     ids = get_map_ids(mp)
     count = np.bincount(mp[map_header_length(mp):], minlength=len(ids))
     order = sorted(range(len(ids)), key=lambda p: (-int(count[p]), p))
-    return "".join("%s%9s  %s\n" % (indent, format(int(count[p]), ","), predictor_name(ids[p])) for p in order if count[p] > 0)
+    return "".join("%s%9s  %s\n" % (indent, format(int(count[p]), ","), predictor_name(ids[p], table)) for p in order if count[p] > 0)
 
 
-def describe_block_maps(set_id, maps, xdim):
+def describe_block_maps(set_id, maps, xdim, table=None):
     """The channel set, then each channel's block size, number of blocks and
-    predictors (DeltaMapper.describeBlockMaps)."""
+    predictors (DeltaMapper.describeBlockMaps); table: the one the maps' ids
+    index (TABLE_256 for older files)."""
     t = "Channel set: " + SET_NAMES[set_id] + "\n"
     for i, mp in enumerate(maps):
-        t += describe_block_size(set_id, i, mp, xdim) + "\n" + describe_block_predictors(mp, "  ")
+        t += describe_block_size(set_id, i, mp, xdim) + "\n" + describe_block_predictors(mp, "  ", table)
     return t
 
 
@@ -1181,7 +1213,8 @@ def _ls_start(v, ref, has_ref, xdim, y0, row, col, ring, z):
 @njit
 def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg, fit):
     """Moves the window to interior pixel k and, if fit, returns the
-    least-squares primitive there (the decoder fits only where it is used)."""
+    least-squares primitives there, (LS, LS wide) (the decoder fits only
+    where they are used)."""
     nf = 11 if has_ref else 8
     m = nf + 2
     nt = m * (m + 1) // 2
@@ -1226,14 +1259,14 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, 
             for t in range(nt):
                 cur[t] -= ring[sl + t]
     if not fit:
-        return 0
+        return 0, 0
 
     n = nf + 1
     pa = _ls_at(v, y, x - 1, xdim); pb = _ls_at(v, y - 1, x, xdim)
     pc = _ls_at(v, y - 1, x - 1, xdim); pd = _ls_at(v, y - 1, x + 1, xdim)
     cnt = win[nf * m - nf * (nf - 1) // 2] + cur[nf * m - nf * (nf - 1) // 2]
     if cnt < 2 * n:
-        return pa
+        return pa, pa
     # The normal equations' lower triangle (ridge 1), then L D L^T as in the Java.
     for i in range(n):
         base = i * m - i * (i - 1) // 2
@@ -1246,7 +1279,7 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, 
         for q in range(j):
             sv -= a[j, q] * a[j, q] * dg[q]
         if sv < 1e-9:
-            return pa
+            return pa, pa
         dg[j] = sv
         for i in range(j + 1, n):
             t_ = a[i, j]
@@ -1271,42 +1304,50 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, 
         p += coef[i] * z[i]
     lo = min(min(pa, pb), min(pc, pd))
     hi = max(max(pa, pb), max(pc, pd))
+    wlo = lo
+    whi = hi
+    for i in range(4, 8):
+        wlo = min(wlo, z[i])
+        whi = max(whi, z[i])
+    w = max(wlo - 2, min(whi + 2, p))
     if p < lo - 2:
         p = lo - 2
     if p > hi + 2:
         p = hi + 2
-    return int(np.floor(p + 0.5))
+    return int(np.floor(p + 0.5)), int(np.floor(w + 0.5))
 
 
 @njit
-def _ls_band(v, ref, has_ref, xdim, y0, y1, out):
+def _ls_band(v, ref, has_ref, xdim, y0, y1, out, wide):
     row, col, win, cur, ring, z, a, b, coef, dg = _ls_state(xdim, has_ref)
     _ls_start(v, ref, has_ref, xdim, y0, row, col, ring, z)
     for y in range(y0, y1):
         for x in range(1, xdim - 1):
             k = y * xdim + x
-            out[k] = _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg, True)
+            out[k], wide[k] = _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg, True)
 
 
-_LS_CACHE = []        # recently computed planes: (xdim, channel copy, previous channel copy or None, plane)
+_LS_CACHE = []        # recently computed planes: (xdim, channel copy, previous channel copy or None, (LS, LS wide))
 _LS_CACHE_SIZE = 3    # a channel set's three
 _LS_CACHE_LOCK = threading.Lock()
 _LS_POOL = ThreadPoolExecutor(_CPUS)   # its own: PixelSources are made in _ROW_POOL's threads
 
 
 def _ls_plane(v, ref, has_ref, xdim, ydim):
-    """The encoder's least-squares primitive for the whole channel
-    (DeltaMapper.leastSquaresPlane): bands of rows in parallel, reused if
-    the same channel (and previous channel) was just done."""
+    """The encoder's least-squares primitives for the whole channel, (LS, LS
+    wide) (DeltaMapper.leastSquaresPlanes): bands of rows in parallel, reused
+    if the same channel (and previous channel) was just done."""
     r = ref if has_ref else None
     with _LS_CACHE_LOCK:
         for xd, cv, cr, plane in _LS_CACHE:
             if xd == xdim and np.array_equal(cv, v) and ((cr is None and r is None) or (cr is not None and r is not None and np.array_equal(cr, r))):
                 return plane
     out = np.zeros(v.shape[0], dtype=np.int16)
+    wide = np.zeros(v.shape[0], dtype=np.int16)
     band = max(4 * (LS_RADIUS + 1), (ydim - 1 + _CPUS - 1) // _CPUS)
-    for f in [_LS_POOL.submit(_ls_band, v, ref, has_ref, xdim, y0, min(ydim, y0 + band), out) for y0 in range(1, ydim, band)]:
+    for f in [_LS_POOL.submit(_ls_band, v, ref, has_ref, xdim, y0, min(ydim, y0 + band), out, wide) for y0 in range(1, ydim, band)]:
         f.result()
+    out = (out, wide)
     with _LS_CACHE_LOCK:
         _LS_CACHE.append((xdim, v.copy(), None if r is None else r.copy(), out))
         del _LS_CACHE[:-_LS_CACHE_SIZE]
@@ -1345,6 +1386,8 @@ def _primitive(q, v, ref, has_ref, corr, k, xdim, cross_base, bias_base):
         hi = max(max(a, b), max(c, d))
         p = a + b - c if q == CLAMP_FIRST else a + d - b
         return max(lo, min(hi, p))
+    if q == LS_WIDE:
+        return np.int64(corr[5, k])
     if q >= LS_FIRST:
         return np.int64(corr[4, k])
     s = q - BIAS_FIRST
@@ -1397,6 +1440,7 @@ def _all_primitives(v, ref, has_ref, corr, k, xdim, prim):
     prim[42] = med + np.int64(corr[0, k]); prim[43] = prim[4] + np.int64(corr[1, k])
     prim[44] = a + np.int64(corr[2, k]); prim[45] = b + np.int64(corr[3, k])
     prim[46] = np.int64(corr[4, k]) if corr.shape[0] > 4 else a   # LS (row 4: see PixelSource)
+    prim[47] = np.int64(corr[5, k]) if corr.shape[0] > 5 else a   # LS wide (row 5)
 
 
 @njit
@@ -1412,7 +1456,8 @@ def _predict(pid, first, second, v, ref, has_ref, corr, k, xdim, cross_base, bia
 class PixelSource:
     """What the table's primitives need for a channel (DeltaMapper.PixelSource,
     encoder side): the channel, the previous channel, the bias corrections
-    (corr rows 0-3) and the least-squares primitive (row 4)."""
+    (corr rows 0-3) and the least-squares primitives (rows 4, LS, and 5, LS
+    wide)."""
 
     def __init__(self, v, ref, xdim, ydim):
         self.v = np.asarray(v, dtype=np.int64)
@@ -1420,8 +1465,8 @@ class PixelSource:
         self.ref = np.asarray(ref, dtype=np.int64) if ref is not None else np.zeros(1, dtype=np.int64)
         self.xdim, self.ydim = xdim, ydim
         corr = _bias_corrections(self.v, xdim, ydim, BIAS_BASE)
-        ls = _ls_plane(self.v, self.ref, self.has_ref, xdim, ydim)
-        self.corr = np.concatenate([corr, ls[None, :]])
+        ls, wide = _ls_plane(self.v, self.ref, self.has_ref, xdim, ydim)
+        self.corr = np.concatenate([corr, ls[None, :], wide[None, :]])
 
 
 @njit
@@ -1652,7 +1697,7 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
     head = 2 + np.int64(mp[1])
     n = xdim * ydim
     dst = np.zeros(n, dtype=np.int64)
-    corr = np.zeros((5, n), dtype=np.int16)   # bias corrections, then LS (computed only if the map uses it)
+    corr = np.zeros((6, n), dtype=np.int16)   # bias corrections, then LS and LS wide (computed only if the map uses them)
     ctx = np.zeros(1, dtype=np.int64)
     bsum = np.zeros((4, 729), dtype=np.int64)
     bcount = np.zeros((4, 729), dtype=np.int64)
@@ -1675,8 +1720,9 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
             k += 1
             pid = ids[mp[mrow + (x - 1) // bwd]]
             if use_ls:
-                corr[4, k] = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg,
-                                      first[pid] == LS_FIRST or second[pid] == LS_FIRST)
+                corr[4, k], corr[5, k] = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg,
+                                                  first[pid] == LS_FIRST or second[pid] == LS_FIRST
+                                                  or first[pid] == LS_WIDE or second[pid] == LS_WIDE)
             _bias_prepare(dst, k, xdim, ctx, corr, bsum, bcount)
             _all_primitives(dst, ref, has_ref, corr, k, xdim, prim)
             i = first[pid]
@@ -1693,34 +1739,43 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
     return dst
 
 
-def _from_block_args(xdim, mp, ref):
+def _from_block_args(xdim, mp, ref, table=None):
+    """(map, ref, has_ref, ids, use_ls, first, second) for decoding a block
+    map whose ids index table (TABLE if None; TABLE_256 for older files)."""
+    first, second = TABLE if table is None else table
     mp = np.asarray(mp, dtype=np.uint8)
     has_ref = ref is not None
     r = np.asarray(ref, dtype=np.int64) if has_ref else np.zeros(1, dtype=np.int64)
     ids = np.array(get_map_ids(mp), dtype=np.int64)
-    use_ls = bool(np.any((TABLE_FIRST[ids] == LS_FIRST) | (TABLE_SECOND[ids] == LS_FIRST)))
-    return mp, r, has_ref, ids, use_ls
+    if np.any(ids >= len(first)):
+        raise ValueError("Block map with predictor id %d: not in a %d-entry table." % (int(ids.max()), len(first)))
+    ls = (first[ids] == LS_FIRST) | (second[ids] == LS_FIRST) | (first[ids] == LS_WIDE) | (second[ids] == LS_WIDE)
+    return mp, r, has_ref, ids, bool(np.any(ls)), first, second
 
 
-def get_values_from_block_deltas(delta, xdim, ydim, init, mp, ref):
-    mp, r, has_ref, ids, use_ls = _from_block_args(xdim, mp, ref)
+def get_values_from_block_deltas(delta, xdim, ydim, init, mp, ref, table=None):
+    """Inverse of the block deltas (DeltaMapper.getValuesFromBlockDeltas);
+    table: the one the map's ids index (TABLE if None; TABLE_256 for older
+    files)."""
+    mp, r, has_ref, ids, use_ls, first, second = _from_block_args(xdim, mp, ref, table)
     none = np.zeros(1, dtype=np.int64)
     return _from_block(np.asarray(delta, dtype=np.int64), r, has_ref, xdim, ydim, init, mp,
-                       ids, TABLE_FIRST, TABLE_SECOND, CROSS_BASE, BIAS_BASE, use_ls,
+                       ids, first, second, CROSS_BASE, BIAS_BASE, use_ls,
                        False, np.zeros(1, dtype=np.uint8), none, none, none, none, 2, MIX_ACTIVITY_TABLE, 1, False)
 
 
-def get_values_from_mixed_deltas(value, coded, previous, xdim, ydim, init, mp, ref, opinions=False):
+def get_values_from_mixed_deltas(value, coded, previous, xdim, ydim, init, mp, ref, opinions=False, table=None):
     """Decodes a channel pack_mixed_deltas coded (value, coded: from
     read_mixed_deltas) while rebuilding it from its block map, as
     get_values_from_block_deltas does. previous: the deltas of the channels
     decoded before it; ref: the previous channel's values; opinions: whether
-    it was coded with the second opinions. Returns (deltas, values)."""
-    mp, r, has_ref, ids, use_ls = _from_block_args(xdim, mp, ref)
+    it was coded with the second opinions; table: the one the map's ids index
+    (TABLE if None; TABLE_256 for older files). Returns (deltas, values)."""
+    mp, r, has_ref, ids, use_ls, first, second = _from_block_args(xdim, mp, ref, table)
     n = xdim * ydim
     cb, fwd, c9b, m = _mix_setup(previous, xdim, n)
     delta = np.zeros(n, dtype=np.int64)
-    values = _from_block(delta, r, has_ref, xdim, ydim, init, mp, ids, TABLE_FIRST, TABLE_SECOND, CROSS_BASE, BIAS_BASE,
+    values = _from_block(delta, r, has_ref, xdim, ydim, init, mp, ids, first, second, CROSS_BASE, BIAS_BASE,
                          use_ls, True, coded, value, cb, fwd, c9b, m, MIX_ACTIVITY_TABLE, _mix_contexts_count(opinions), opinions)
     return delta, values
 
@@ -1751,9 +1806,10 @@ def get_deltas(src, xdim, ydim, delta_type, variant=0):
     return d, m, init
 
 
-def get_values_from_deltas(delta, xdim, ydim, init, delta_type, mp=None, variant=0, ref=None):
+def get_values_from_deltas(delta, xdim, ydim, init, delta_type, mp=None, variant=0, ref=None, table=None):
     """Inverse of get_deltas; ref (the previous channel as decoded, before
-    any minimum is added back) is used by the block map only."""
+    any minimum is added back) and table (the one a block map's ids index:
+    TABLE_256 for older files) are used by the block map only."""
     delta = np.asarray(delta, dtype=np.int64)
     t = delta_type
     if t == 0: return _from_horizontal(delta, xdim, ydim, init)
@@ -1768,7 +1824,7 @@ def get_values_from_deltas(delta, xdim, ydim, init, delta_type, mp=None, variant
     if t == 10: return _from_scanline45(delta, xdim, ydim, init, mp, 8, variant)
     if t == 11: return _from_frame(delta, xdim, ydim, init, mp, 8)
     if t == 12: return _from_frame(delta, xdim, ydim, init, mp, 16)
-    if t == 13: return get_values_from_block_deltas(delta, xdim, ydim, init, mp, ref)
+    if t == 13: return get_values_from_block_deltas(delta, xdim, ydim, init, mp, ref, table)
     raise ValueError("delta_type %d" % t)
 
 
@@ -2054,10 +2110,10 @@ def read_map(inp, delta_type, previous, xdim):
     if delta_type == 13:
         block = inp.read_unsigned_byte()
         n = inp.read_unsigned_byte()
-        if not (1 <= n <= PREDICTORS):
+        if not (1 <= n <= MAX_PREDICTORS):
             raise IOError("Block map with %d predictors: not one this version reads." % n)
         ids = [inp.read_unsigned_byte() for _ in range(n)]
-        if max(ids) >= PREDICTORS:
+        if max(ids) >= MAX_PREDICTORS:
             raise IOError("Block map with predictor id %d: not one this version reads." % max(ids))
         if not valid_shape(block):
             raise IOError("Block map with block shape %d: not one this version reads." % block)

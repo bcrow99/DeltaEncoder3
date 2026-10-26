@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-delta_writer2.py version 2.2 -- DeltaWriter2.java for Python (PySide6).
+delta_writer2.py version 2.3 -- DeltaWriter2.java for Python (PySide6).
 
 A streamlined Delta Writer. Its files are read by delta_reader.py (and
 DeltaReader.java): the header and per-channel layout are the same, with
@@ -42,7 +42,7 @@ from delta_writer import ENTROPY_NAMES, context_code, entropy_code, pack_and_com
 from java_io import DataOutput
 
 FORMAT_ID = ord('D')
-FORMAT_VERSION = 4   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: block maps with a block size per channel
+FORMAT_VERSION = 5   # 3: one predictor table (delta_mapper.TABLE_256) and cross-channel block maps; 4: block maps with a block size per channel; 5: the 225-entry predictor table (delta_mapper.TABLE)
 NO_BLOCK_MAP_VERSION = 3   # written for delta types other than the block map (13), whose files are as they were
 
 # compress_type written to the header: String* (strings that don't compress

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-packet_writer.py version 2.1 -- PacketWriter.java for Python (PySide6).
+packet_writer.py version 2.2 -- PacketWriter.java for Python (PySide6).
 
 Quantizes an image, codes it as deltas packed into unary strings, splits
 each string into separately compressed segments ("packets") and entropy
@@ -40,7 +40,7 @@ from delta_writer import context_code
 from java_io import DataOutput
 
 FORMAT_ID = ord('P')
-FORMAT_VERSION = 4   # 3: one predictor table (delta_mapper.PREDICTOR_TABLE) and cross-channel block maps; 4: block maps with a block size per channel
+FORMAT_VERSION = 5   # 3: one predictor table (delta_mapper.TABLE_256) and cross-channel block maps; 4: block maps with a block size per channel; 5: the 225-entry predictor table (delta_mapper.TABLE)
 NO_BLOCK_MAP_VERSION = 3   # written for delta types other than the block map (13), whose files are as they were
 
 # Entropy menu, in entropy_type order. 3, 4 and 6 code every packet on its
