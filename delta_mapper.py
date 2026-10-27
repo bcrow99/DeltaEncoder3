@@ -3026,20 +3026,40 @@ def _survey_channel(ps, block, chosen_before, previous_map, ref=None):
     result = ChannelSurvey(block)
     worse = 0
     line = " (order %d):" % len(order)
-    for c, n in enumerate(counts):
-        ids = order[:n]
+
+    def coded(c):
+        ids = order[:counts[c]]
         m = prefix[c] if prefix is not None else _assign_by_cost(est, PREDICTORS, np.array(ids, dtype=np.int64), ids, xdim, ydim, block)
         d = get_block_deltas_from_map(ps, m, ids)
-        size = map_bytes(13, m, previous_map, xdim) + len(pack_context_deltas(d, chosen_before, xdim))
-        line += " %d:%s" % (n, format(size, ","))
-        if result.bytes is None or size < result.bytes:
-            result.bytes, result.ids, result.delta, result.map, worse = size, list(ids), d, m, 0
-            line += "*"
-        else:
-            worse += 1
-            if worse == 2:
-                break
+        return ids, d, m, map_bytes(13, m, previous_map, xdim) + len(pack_context_deltas(d, chosen_before, xdim))
+
+    # The counts are coded _survey_width() at a time, on cores the other
+    # block shapes leave idle; those past where the stopping rule ends are
+    # thrown away, so the result (and the report) is the same.
+    width = _survey_width()
+    done = False
+    for c0 in range(0, len(counts), width):
+        for ids, d, m, size in _bounded_map(coded, range(c0, min(len(counts), c0 + width)), 64 * xdim * ydim):
+            line += " %d:%s" % (len(ids), format(size, ","))
+            if result.bytes is None or size < result.bytes:
+                result.bytes, result.ids, result.delta, result.map, worse = size, list(ids), d, m, 0
+                line += "*"
+            else:
+                worse += 1
+                if worse == 2:
+                    done = True
+                    break
+        if done:
+            break
     return result, line
+
+
+def _survey_width():
+    """How many of a channel's predictor counts the survey codes at once at
+    each block shape: the cores left over when the five block shapes run at
+    once, shared out (1 on up to 9 cores, 2 on 10-14, 3 on 15-19, at most 4)
+    (DeltaMapper.surveyWidth)."""
+    return max(1, min(4, _CPUS // 5))
 
 
 def _survey_block_size(ps, block, log):
