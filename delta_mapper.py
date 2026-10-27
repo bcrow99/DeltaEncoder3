@@ -920,6 +920,27 @@ def describe_block_predictors(mp, indent, table=None):
     return "".join("%s%9s  %s\n" % (indent, format(int(count[p]), ","), predictor_name(ids[p], table)) for p in order if count[p] > 0)
 
 
+def least_squares_share(maps, xdim, ydim):
+    """The share of the channels' predicted pixels (all but the first row and
+    the first and last columns) whose block's predictor uses least squares (LS
+    or LS wide, alone or averaged) (DeltaMapper.leastSquaresShare)."""
+    ls = total = 0
+    for mp in maps:
+        mp = np.asarray(mp, dtype=np.int64)
+        block = int(mp[0])
+        bwd, bht = _block_wh(block, xdim)
+        bw, bh = blocks_across(xdim, block), blocks_down(ydim, block)
+        head = map_header_length(mp)
+        pid = mp[2 + mp[head:head + bw * bh]].reshape(bh, bw)
+        width = np.minimum(bwd, xdim - 2 - np.arange(bw) * bwd)
+        height = np.minimum(bht, ydim - 1 - np.arange(bh) * bht)
+        area = height[:, None] * width[None, :]
+        uses = (TABLE_FIRST[pid] >= LS_FIRST) | (TABLE_SECOND[pid] >= LS_FIRST)
+        ls += int(area[uses].sum())
+        total += int(area.sum())
+    return ls / total if total else 0.0
+
+
 def describe_block_maps(set_id, maps, xdim, table=None):
     """The channel set, then each channel's block size, number of blocks and
     predictors (DeltaMapper.describeBlockMaps); table: the one the maps' ids

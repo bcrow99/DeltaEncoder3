@@ -231,7 +231,9 @@ class BlockCoder:
 
         if self.survey_time is not None:
             print(dm.describe_block_maps(self.min_set_id, self.map_list, self.delta_xdim), end="")
-            print("Analysis took " + vs.format_duration(self.survey_time))
+            print("Analysis took %s (%d x %d, %s pixels; least squares in %.1f%% of blocks' pixels)"
+                  % (vs.format_duration(self.survey_time), w, h, format(w * h, ","),
+                     100 * dm.least_squares_share(self.map_list, w, h)))
             print()
             self.survey_time = None
 
@@ -380,7 +382,7 @@ class BlockWriter:
         self.coder = c = BlockCoder(rgb, os.path.getsize(filename))
         self.updating = False
         self.analysing = False
-        print("Loaded %s, %d x %d" % (filename, c.image_xdim, c.image_ydim))
+        print("Loaded %s, %d x %d (%s pixels)" % (filename, c.image_xdim, c.image_ydim, format(c.image_xdim * c.image_ydim, ",")))
 
         self.view = view = vs.ImageWindow("Block Writer  " + filename, c.image_xdim, c.image_ydim)
         bar = view.menuBar()
