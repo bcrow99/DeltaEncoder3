@@ -3033,10 +3033,10 @@ def _survey_channel(ps, block, chosen_before, previous_map, ref=None):
         d = get_block_deltas_from_map(ps, m, ids)
         return ids, d, m, map_bytes(13, m, previous_map, xdim) + len(pack_context_deltas(d, chosen_before, xdim))
 
-    # The counts are coded _survey_width() at a time, on cores the other
+    # The counts are coded _survey_width at a time, on cores the other
     # block shapes leave idle; those past where the stopping rule ends are
     # thrown away, so the result (and the report) is the same.
-    width = _survey_width()
+    width = _survey_width(xdim * ydim)
     done = False
     for c0 in range(0, len(counts), width):
         for ids, d, m, size in _bounded_map(coded, range(c0, min(len(counts), c0 + width)), 64 * xdim * ydim):
@@ -3054,12 +3054,17 @@ def _survey_channel(ps, block, chosen_before, previous_map, ref=None):
     return result, line
 
 
-def _survey_width():
+SURVEY_WIDTH_PIXELS = 1 << 20     # pixels of work each extra count coded at once needs (see _survey_width)
+
+
+def _survey_width(pixels):
     """How many of a channel's predictor counts the survey codes at once at
     each block shape: the cores left over when the five block shapes run at
-    once, shared out (1 on up to 9 cores, 2 on 10-14, 3 on 15-19, at most 4)
-    (DeltaMapper.surveyWidth)."""
-    return max(1, min(4, _CPUS // 5))
+    once, shared out (1 on up to 9 cores, 2 on 10-14, 3 on 15-19, at most 4),
+    and no more than one per SURVEY_WIDTH_PIXELS of the channel (so 1 below
+    about 2 million pixels): on less, the counts the stopping rule throws
+    away cost more than the idle cores save (DeltaMapper.surveyWidth)."""
+    return max(1, min(4, _CPUS // 5, pixels // SURVEY_WIDTH_PIXELS))
 
 
 def _survey_block_size(ps, block, log):
