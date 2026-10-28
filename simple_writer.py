@@ -1,46 +1,80 @@
 #!/usr/bin/env python3
 """
-simple_writer.py version 2.2 -- SimpleWriter.java for Python (PySide6).
+simple_writer.py version 3.0 -- SimpleWriter.java for Python (PySide6).
 
-Quantizes an image, codes it as deltas packed into unary strings, and saves
-(to the file "foo", as the Java version does) in Simple format 'S' (version
-4 with the block map, version 3 otherwise): the same file layout as
-SimpleWriter.java, so either program's files open in either reader. The
-block map's block sizes and predictors come from the survey
-(delta_mapper.surveyed_block_maps).
+A writer with one predictor and one entropy coder: every interior pixel is
+predicted by the least-squares fit (at each pixel, the linear predictor that
+best fits a causal window of the pixels before it; delta_mapper's _ls_*),
+with no blocks and no map, and the deltas are mixed-context coded with the
+second opinions (delta_mapper.pack_mixed_deltas). The analysis picks the
+channel set, then, channel by channel, the window radius (from
+delta_mapper.WINDOW_RADII) and the clamp (narrow, to 2 beyond the range of
+the four nearest neighbours, or wide, of all eight) that code the channel
+smallest, by the real coded size (delta_mapper.survey_windows). It runs at
+startup and again after any change to the quantization (Pixel Resolution or
+Color Resolution). File > Bands splits the image into up to MAX_BANDS bands
+of rows that a reader can decode at the same time, for a small cost per band
+boundary (the fit and the contexts start again at each band's top). Saves
+(to the file "foo", as the Java version does) in Simple format 'S' version
+6, read by simple_reader.py and SimpleReader.java.
 
     python3 simple_writer.py [image]
-
-Deltas are always unary strings (get_string_list(delta, True)); StringMapper
-skips its own compression when it doesn't pay off. The delta type is the
-Delta menu's (default 2, average), not surveyed.
 
 The coding (class SimpleCoder) is separate from the window:
 
     coder = SimpleCoder(viewer_support.read_image("photo.png"))
-    coder.survey(); coder.apply(); coder.save("photo.smp")
+    coder.analyse(); coder.apply(); coder.save("photo.smp")
 """
 
 import os
 import sys
+import time
 
 import numpy as np
 
 import code_mapper as cm
 import delta_mapper as dm
 import resize_mapper as rm
-import string_mapper as sm
 import viewer_support as vs
-from delta_writer import context_code, entropy_code
 from java_io import DataOutput
 
 FORMAT_ID = ord('S')
-FORMAT_VERSION = 5   # 3: one predictor table (delta_mapper.TABLE_256) and cross-channel block maps; 4: block maps with a block size per channel; 5: the 225-entry predictor table (delta_mapper.TABLE)
-NO_BLOCK_MAP_VERSION = 3   # written for delta types other than the block map (13), whose files are as they were
+FORMAT_VERSION = 6   # 3 to 5: unary strings or block maps with a choice of delta type and entropy coder (no longer read); 6: least squares alone, a window radius and clamp per channel, in bands
+MAX_BANDS = 16       # the most bands Save offers
+BAND_MIN_ROWS = 64   # the fewest rows (of the quantized image) a band may have
 
-ENTROPY_NAMES = ["LZ77", "Huffman", "Arithmetic", "Adaptive", "Context"]
-DELTA_MENU_NAMES = ["H", "V", "Average", "Med", "Directional", "Adaptive", "Scanline 1", "Scanline 2",
-                    "Scanline 3", "Scanline 4", "Scanline 5", "Map 1", "Map 2", "Block Map"]
+QUANT_SETTLE_MS = 400   # how long a quantization slider must rest before the analysis runs again
+
+
+def best_set(channel_sum):
+    """The channel set with the smallest summed estimate (first on a tie)."""
+    best, best_sum = 0, 2147483647
+    for s in range(10):
+        c = dm.get_channels(s)
+        t = channel_sum[c[0]] + channel_sum[c[1]] + channel_sum[c[2]]
+        if t < best_sum:
+            best_sum, best = t, s
+    return best
+
+
+def band_start(b, n, rows):
+    """Band b's first row, of rows split into n bands (SimpleWriter.bandStart)."""
+    return b * rows // n
+
+
+def describe_bands(n, rows):
+    """"8 bands of 375 rows" (or "of 374 to 375 rows")."""
+    lo, hi = rows // n, -(-rows // n)
+    return "%d bands of %s rows" % (n, lo if lo == hi else "%d to %d" % (lo, hi))
+
+
+def describe_windows(set_id, s):
+    """The channel set and each channel's window, as apply prints them
+    (SimpleWriter.describeWindows)."""
+    t = "Channel set: " + dm.SET_NAMES[set_id] + "\n"
+    for i in range(3):
+        t += "Channel %d - %s: %s (%s bytes)\n" % (i, dm.channel_name(set_id, i), dm.describe_window(s.radius[i], s.wide[i]), format(s.bytes[i], ","))
+    return t
 
 
 # =============================================================================
@@ -48,8 +82,9 @@ DELTA_MENU_NAMES = ["H", "V", "Average", "Med", "Directional", "Adaptive", "Scan
 # =============================================================================
 
 class SimpleCoder:
-    """Holds an image and the settings; survey() picks the channel set,
-    apply() codes (and decodes, for the preview), save() writes the file."""
+    """Holds an image and the quantization; analyse() picks each channel's
+    window radius and clamp, apply() picks the channels (and makes the
+    preview), save() codes and writes the file."""
 
     def __init__(self, rgb, file_length=0):
         self.image_ydim, self.image_xdim = rgb.shape[:2]
@@ -58,123 +93,134 @@ class SimpleCoder:
 
         self.pixel_quant = 4
         self.pixel_shift = 3
-        self.pixel_segment = 10     # Arithmetic blocks: 10 = one block per channel; lower = blocks of 500+500*pixel_segment bytes
         self.correction = 0         # preview only
         self.min_set_id = 0
-        self.delta_type = 2         # average; the Delta menu selection
-        self.entropy_type = 0
-        self.scanline5_variant = 0
+        self.bands = 1              # independently decodable bands Save writes
+
+        # The last analysis (a delta_mapper.WindowSurvey; None before the
+        # first) and the quantization it was made for.
+        self.survey = None
+        self.survey_quant = self.survey_shift = -1
+        self.survey_time = None     # the analysis's seconds, printed with the next apply's listing
 
         self.channel_sum = [0] * 6
-        self.set_sum = [0] * 10
         self.channel_min = [0] * 6
         self.channel_init = [0] * 6
-        self.channel_delta_min = [0] * 6
-        self.channel_length = [0] * 6
-        self.channel_compressed_length = [0] * 6
-        self.channel_iterations = [0] * 3
         self.applied = False
 
-    def quantized_channels(self, size, keep=True):
-        """The six candidate channels after resizing and quantizing; sets
-        channel_min and channel_init (unless keep is False, so it can run in
-        the background)."""
+    def quantized_channels(self, size, quant=None, shift=None):
+        """(the six candidate channels after resizing and quantizing, their
+        minimums, their first values), at this quantization (the coder's by
+        default)."""
+        quant = self.pixel_quant if quant is None else quant
+        shift = self.pixel_shift if shift is None else shift
         q = [None] * 3
 
         def one(i):
             ch = self.source[i]
-            if self.pixel_quant != 0:
+            if quant != 0:
                 ch = rm.resize(ch, self.image_xdim, size[0], size[1])
-            q[i] = dm.quantize_channel(ch, self.pixel_shift)
+            q[i] = dm.quantize_channel(ch, shift)
         vs.parallel(3, one)
         qc, mins = dm.get_candidate_channels(q[0], q[1], q[2])
-        if keep:
-            self.channel_min = mins
-            self.channel_init = [int(c[0]) for c in qc]
-        return qc
+        return qc, list(mins), [int(c[0]) for c in qc]
 
-    def compute_set_sums(self, qc, size):
+    @staticmethod
+    def channel_sums(qc, size):
         # Java's getIdealFrequency; get_ideal_frequency2 gives the identical histogram.
+        s = [0] * 6
+
         def one(i):
-            self.channel_sum[i] = int(np.floor(cm.get_shannon_limit(dm.get_ideal_frequency2(qc[i], size[0], size[1]))))
+            s[i] = int(np.floor(cm.get_shannon_limit(dm.get_ideal_frequency2(qc[i], size[0], size[1]))))
         vs.parallel(6, one)
-        for s in range(10):
-            c = dm.get_channels(s)
-            self.set_sum[s] = self.channel_sum[c[0]] + self.channel_sum[c[1]] + self.channel_sum[c[2]]
-        self.min_set_id = min(range(10), key=lambda s: (self.set_sum[s], s))
+        return s
 
-    def survey(self):
-        """Picks the channel set with the smallest entropy estimate (Java: init)."""
-        size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
-        self.compute_set_sums(self.quantized_channels(size), size)
-        self.print_channel_set_ranking()
+    def survey_current(self):
+        """Whether the last analysis was made for the current quantization."""
+        return self.survey is not None and self.survey_quant == self.pixel_quant and self.survey_shift == self.pixel_shift
 
-    # ---- Block map (delta type 13) ----------------------------------------------
+    def analyse(self, quant=None, shift=None):
+        """Picks the channel set, then each channel's window radius and clamp,
+        for this quantization (the coder's by default) (dm.survey_windows;
+        Java: analyse). Returns the survey."""
+        quant = self.pixel_quant if quant is None else quant
+        shift = self.pixel_shift if shift is None else shift
+        start = time.perf_counter()
+        size = dm.get_quantized_size(self.image_xdim, self.image_ydim, quant)
+        qc, _, _ = self.quantized_channels(size, quant, shift)
+        ids = dm.get_channels(best_set(self.channel_sums(qc, size)))
+        self.survey = dm.survey_windows([qc[i] for i in ids], size[0], size[1], dm.WINDOW_RADII)
+        self.survey_quant, self.survey_shift = quant, shift
+        self.survey_time = time.perf_counter() - start
+        return self.survey
 
-    def block_channels(self, size):
-        """The three channels the block map codes, in coding order, for the
-        current settings (without setting channel_min and channel_init, so it
-        can run in the background)."""
-        qc = self.quantized_channels(size, keep=False)
-        ids = dm.get_channels(dm.best_channel_set(qc, size[0], size[1]))
-        return [qc[j] for j in ids]
+    def bands_used(self):
+        """The bands Save will write: bands, but no more than leave
+        BAND_MIN_ROWS rows in each."""
+        rows = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)[1]
+        return max(1, min(self.bands, rows // BAND_MIN_ROWS))
 
-    def survey_block_maps(self):
-        """Surveys the block map for the current settings (unless the survey
-        for these channels is kept) and prints the channel set and each
-        channel's block size, number of blocks and predictors."""
-        size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
-        survey = dm.surveyed_block_maps(self.block_channels(size), size[0], size[1])
-        qc = self.quantized_channels(size, keep=False)
-        print(dm.describe_block_maps(dm.best_channel_set(qc, size[0], size[1]), survey.maps, size[0]), end="")
+    def band_text(self):
+        """The Bands dialog's status line."""
+        n = self.bands_used()
+        if n == 1:
+            return "1 band: the image is too small for more" if self.bands > 1 else "1 band"
+        return describe_bands(n, dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)[1])
 
-    def print_channel_set_ranking(self):
-        order = sorted(range(10), key=lambda s: self.set_sum[s])
-        print("Channel sets (ranked):")
-        for r, s in enumerate(order):
-            c = dm.get_channels(s)
-            print("  %2d. %-32s %10d %10d %10d %12d%s" % (r + 1, dm.SET_NAMES[s], self.channel_sum[c[0]],
-                  self.channel_sum[c[1]], self.channel_sum[c[2]], self.set_sum[s], " **" if s == self.min_set_id else ""))
-        print()
+    def window_text(self):
+        """Each channel's window, and the bands Save will write (the Window menu's Radius)."""
+        if not self.applied:
+            return "No analysis yet."
+        t = describe_windows(self.min_set_id, self.survey)
+        if self.bands_used() > 1:
+            t += describe_bands(self.bands_used(), len(self.value_list[0]) // self.delta_xdim) + "\n"
+        return t
+
+    def sizes_text(self):
+        """Each channel's coded size at every radius tried, both clamps; the
+        chosen one starred (the Window menu's Sizes)."""
+        if not self.applied:
+            return "No analysis yet."
+        s = self.survey
+        parts = []
+        for i in range(3):
+            t = "Channel %d - %s:\n" % (i, dm.channel_name(self.min_set_id, i))
+            t += "  %6s %12s %12s\n" % ("radius", "narrow", "wide")
+            for r, radius in enumerate(s.radii):
+                chosen = radius == s.radius[i]
+                t += "  %6d %11s%s %11s%s\n" % (radius, format(s.tried[i][2 * r], ","), "*" if chosen and not s.wide[i] else " ",
+                                                format(s.tried[i][2 * r + 1], ","), "*" if chosen and s.wide[i] else " ")
+            parts.append(t)
+        return "\n".join(parts)
 
     def apply(self):
-        """Quantizes, picks the channel set, codes the deltas as unary strings
-        (what Save writes), then decodes them the way simple_reader does.
-        Returns the preview as an (ydim, xdim, 3) uint8 array."""
+        """Quantizes and picks the channel set (the channels Save codes), then
+        rebuilds the image for the preview. After a new analysis it prints the
+        channel set and each channel's window. Returns the preview as an
+        (ydim, xdim, 3) uint8 array."""
         self.applied = False
+        # An analysis for this quantization first, if there isn't one (a coder
+        # whose fields were set directly, or an analysis that failed).
+        if not self.survey_current():
+            self.analyse()
         size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
         w, h = size
-        qc = self.quantized_channels(size)
-        self.compute_set_sums(qc, size)
+        qc, self.channel_min, self.channel_init = self.quantized_channels(size)
+        self.channel_sum = self.channel_sums(qc, size)
+        self.min_set_id = best_set(self.channel_sum)
         ids = dm.get_channels(self.min_set_id)
-        self.delta_xdim = w
-        table, strings, maps, deltas, decoded = ([None] * 3 for _ in range(5))
+        # The reader rebuilds each channel exactly as quantized (before the
+        # minimum is added back), so the preview uses the quantized channels
+        # as they are: no need to decode the deltas here.
+        raw = [np.asarray(qc[j], dtype=np.int64) for j in ids]
+        decoded = [raw[i] + self.channel_min[ids[i]] if ids[i] > 2 else raw[i] for i in range(3)]
+        self.value_list, self.delta_xdim = raw, w
 
-        raw = [None] * 3   # decoded, before the minimum: the next channel's reference
-        # The block map: the survey's deltas and maps (kept from update, or
-        # surveyed now).
-        survey = dm.surveyed_block_maps([qc[j] for j in ids], w, h) if self.delta_type == 13 else None
-
-        def channel(i):
-            j = ids[i]
-            d, m, _ = dm.surveyed_deltas(survey, i, qc[j][0]) if survey is not None else dm.get_deltas(qc[j], w, h, self.delta_type, self.scanline5_variant)
-            maps[i] = m
-            deltas[i] = d
-            lo, bits, tbl, s = sm.get_string_list(d, True)
-            self.channel_delta_min[j], self.channel_length[j] = lo, bits
-            table[i], strings[i] = tbl, s
-            self.channel_compressed_length[j] = sm.get_bitlength(s)
-            self.channel_iterations[i] = sm.get_iterations(s)
-            d2 = sm.unpack_strings(sm.decompress_strings(s), tbl, w * h, bits)
-            d2[0] = 0
-            d2[1:] += lo
-            ch = dm.get_values_from_deltas(d2, w, h, self.channel_init[j], self.delta_type, m, self.scanline5_variant, ref=raw[i - 1] if i > 0 else None)
-            raw[i] = ch
-            if j > 2:
-                ch = ch + self.channel_min[j]
-            decoded[i] = ch
-        vs.channels(self.delta_type == 13, 3, channel)
-        self.table_list, self.string_list, self.map_list, self.delta_list = table, strings, maps, deltas
+        if self.survey_time is not None:
+            print(describe_windows(self.min_set_id, self.survey), end="")
+            print("Analysis took %s (%d x %d, %s pixels)" % (vs.format_duration(self.survey_time), w, h, format(w * h, ",")))
+            print()
+            self.survey_time = None
 
         # As the reader: recombine the channel set first, then resize, then shift.
         bgr = dm.get_blue_green_red(self.min_set_id, *decoded)
@@ -195,42 +241,74 @@ class SimpleCoder:
         return rgb
 
     def save(self, filename="foo"):
-        """Header, then per channel: min, init, delta min, bit lengths,
-        iterations, map (types 6-13), string table (not for Context), then the
-        entropy-coded payload (the same layouts as delta_writer). Returns the
-        file size."""
+        """Codes the image (encode) and writes it. Returns the file size."""
+        data = self.encode()
+        with open(filename, "wb") as f:
+            f.write(data)
+        n = self.bands_used()
+        raw = self.image_xdim * self.image_ydim * 3
+        if n > 1:
+            print("Saved %s: %s bytes (%s)" % (os.path.basename(filename), format(len(data), ","),
+                                               describe_bands(n, len(self.value_list[0]) // self.delta_xdim)))
+        else:
+            print("Saved %s: %s bytes" % (os.path.basename(filename), format(len(data), ",")))
+        print("Original compression rate: %.4f" % (self.file_length / raw))
+        print("Output  compression rate:  %.4f" % (len(data) / raw))
+        print()
+        return len(data)
+
+    def encode(self):
+        """Format 6. Header: FORMAT_ID, FORMAT_VERSION, width, height
+        (unsigned shorts), pixel_shift, pixel_quant, channel set; per channel
+        (coding order) int min, the window radius and the clamp (unsigned
+        bytes; 1: wide); the number of bands n (an unsigned byte), n int
+        lengths, and the n bands. Band b is rows band_start(b) to
+        band_start(b + 1) of the quantized image, coded as an image of its own
+        (the fit and the contexts start again at its top): per channel, int
+        init, then the least-squares deltas mixed-context coded with the
+        second opinions (pack_mixed_deltas). Channels 1 and 2 use the ones
+        before them (their values in the fit, their deltas as context), so a
+        band's channels are decoded in order; the bands can be decoded at the
+        same time. Returns the bytes."""
+        n = self.bands_used()
+        xdim = self.delta_xdim
+        rows = len(self.value_list[0]) // xdim
+        s = self.survey
+        band = []
+        for b in range(n):
+            y0, y1 = band_start(b, n, rows), band_start(b + 1, n, rows)
+            ch = [np.asarray(v[y0 * xdim:y1 * xdim], dtype=np.int64) for v in self.value_list]
+            # One band: the analysis's deltas.
+            d = [s.deltas[i] if n == 1 else dm.get_least_squares_deltas(ch[i], ch[i - 1] if i > 0 else None, xdim, y1 - y0, s.radius[i], s.wide[i])
+                 for i in range(3)]
+            coded = [None] * 3
+
+            def one(i):
+                coded[i] = dm.pack_mixed_deltas(d[i], ch[i], d[:i], xdim, True)
+                back = dm.unpack_mixed_deltas(coded[i], ch[i], d[:i], xdim, ch[i] - np.asarray(d[i], dtype=np.int64))
+                if not np.array_equal(back, d[i]):
+                    print("WARNING: band %d channel %d deltas do not decode back." % (b, i))
+            vs.parallel(3, one)
+            bo = DataOutput()
+            for i in range(3):
+                bo.write_int(int(ch[i][0]))
+                bo.write(coded[i])
+            band.append(bo.to_bytes())
+
         ids = dm.get_channels(self.min_set_id)
         out = DataOutput()
-        out.write_byte(FORMAT_ID); out.write_byte(FORMAT_VERSION if self.delta_type == 13 else NO_BLOCK_MAP_VERSION)
+        out.write_byte(FORMAT_ID); out.write_byte(FORMAT_VERSION)
         out.write_short(self.image_xdim); out.write_short(self.image_ydim)
-        for v in (self.pixel_shift, self.pixel_quant, self.min_set_id, self.delta_type, self.entropy_type, self.scanline5_variant):
-            out.write_byte(v)
-
-        timer = vs.Timer()
-        if self.entropy_type == 4:
-            coded = context_code(self.delta_list, self.delta_xdim)
-        else:
-            coded = entropy_code(self.string_list, self.entropy_type, self.pixel_segment)
-        print("Entropy coding [%s] took %s" % (ENTROPY_NAMES[self.entropy_type], timer.elapsed()))
-
+        out.write_byte(self.pixel_shift); out.write_byte(self.pixel_quant); out.write_byte(self.min_set_id)
         for i in range(3):
-            j = ids[i]
-            for v in (self.channel_min[j], self.channel_init[j], self.channel_delta_min[j],
-                      self.channel_length[j], self.channel_compressed_length[j]):
-                out.write_int(v)
-            out.write_byte(self.channel_iterations[i])
-            if dm.has_map(self.delta_type):
-                dm.write_map(out, self.delta_type, self.map_list[i], self.map_list[i - 1] if i > 0 else None, self.delta_xdim)
-            if self.entropy_type != 4:
-                dm.write_table(out, self.table_list[i])
-            out.write(coded[i])
-
-        with open(filename, "wb") as f:
-            f.write(out.to_bytes())
-        raw = self.image_xdim * self.image_ydim * 3
-        print("Original compression rate: %.4f" % (self.file_length / raw))
-        print("Output  compression rate:  %.4f" % (out.size() / raw))
-        return out.size()
+            out.write_int(self.channel_min[ids[i]])
+            out.write_byte(s.radius[i]); out.write_byte(1 if s.wide[i] else 0)
+        out.write_byte(n)
+        for bb in band:
+            out.write_int(len(bb))
+        for bb in band:
+            out.write(bb)
+        return out.to_bytes()
 
 
 # =============================================================================
@@ -250,7 +328,8 @@ _open_writers = []
 
 class SimpleWriter:
     def __init__(self, filename):
-        from PySide6.QtGui import QAction, QActionGroup, QKeySequence
+        from PySide6.QtCore import QTimer
+        from PySide6.QtGui import QAction, QKeySequence
 
         self.filename = filename
         try:
@@ -260,12 +339,20 @@ class SimpleWriter:
             return
         self.coder = c = SimpleCoder(rgb, os.path.getsize(filename))
         self.updating = False
-        print("Loaded %s, %d x %d" % (filename, c.image_xdim, c.image_ydim))
+        self.analysing = False
+        print("Loaded %s, %d x %d (%s pixels)" % (filename, c.image_xdim, c.image_ydim, format(c.image_xdim * c.image_ydim, ",")))
 
         self.view = view = vs.ImageWindow("Simple Writer  " + filename, c.image_xdim, c.image_ydim)
         bar = view.menuBar()
         _open_writers.append(self)
         view.destroyed.connect(lambda *_: _open_writers.remove(self) if self in _open_writers else None)
+
+        # A quantization change analyses again, once the slider has stopped
+        # moving for QUANT_SETTLE_MS.
+        self.quant_timer = QTimer(view)
+        self.quant_timer.setSingleShot(True)
+        self.quant_timer.setInterval(QUANT_SETTLE_MS)
+        self.quant_timer.timeout.connect(self.run_analysis)
 
         file_menu = bar.addMenu("File")
         a = QAction("Open...", view, shortcut=QKeySequence("Ctrl+O"))
@@ -275,6 +362,12 @@ class SimpleWriter:
         a = QAction("Reset", view)
         a.triggered.connect(self.reset)
         file_menu.addAction(a)
+        # Bands: Save codes the image as this many bands of rows, each
+        # decodable on its own (so a reader can decode them at the same time),
+        # for a small cost per band boundary. Like Save itself, it never
+        # changes the preview.
+        act, self.bands_slider = vs.make_slider_dialog(view, "Bands", 1, MAX_BANDS, c.bands, self._set_bands)
+        file_menu.addAction(act)
         a = QAction("Save", view)
         a.triggered.connect(self.save)
         file_menu.addAction(a)
@@ -284,59 +377,48 @@ class SimpleWriter:
         quant = bar.addMenu("Quantization")
         self.sliders = {}
         for key, title, lo, hi in (("pixel_quant", "Pixel Resolution", 0, 10), ("pixel_shift", "Color Resolution", 0, 7)):
-            act, self.sliders[key] = vs.make_slider_dialog(view, title, lo, hi, getattr(c, key), self._setter(key, True))
+            act, self.sliders[key] = vs.make_slider_dialog(view, title, lo, hi, getattr(c, key), self._quant_setter(key))
             quant.addAction(act)
         # Error Correction blends the preview back toward the original by
-        # correction/10. Preview only; the saved file is unaffected.
+        # correction/10. Preview only; the saved file is unaffected, and there
+        # is nothing to analyse again.
         quant.addSeparator()
-        act, self.sliders["correction"] = vs.make_slider_dialog(view, "Error Correction", 0, 10, c.correction, self._setter("correction"))
+        act, self.sliders["correction"] = vs.make_slider_dialog(view, "Error Correction", 0, 10, c.correction, self._set_correction)
         quant.addAction(act)
 
-        delta_menu = bar.addMenu("Delta")
-        group = QActionGroup(view)
-        self.delta_actions = []
-        for t, name in enumerate(DELTA_MENU_NAMES):
-            a = QAction(name, view, checkable=True)
-            a.setChecked(t == c.delta_type)
-            group.addAction(a)
-            delta_menu.addAction(a)
-            a.triggered.connect(lambda _=False, t=t: self.set_delta_type(t))
-            self.delta_actions.append(a)
-        # The block map (delta type 13) has no settings: the survey chooses each
-        # channel's block size and predictor set (see update).
-
-        entropy_menu = bar.addMenu("Entropy")
-        group = QActionGroup(view)
-        for et, name in enumerate(ENTROPY_NAMES):
-            a = QAction(name, view, checkable=True)
-            a.setChecked(et == c.entropy_type)
-            group.addAction(a)
-            entropy_menu.addAction(a)
-            a.triggered.connect(lambda _=False, et=et: setattr(self.coder, "entropy_type", et))
-        entropy_menu.addSeparator()
-        act, _ = vs.make_slider_dialog(view, "Segment Size", 0, 10, c.pixel_segment, lambda v: setattr(c, "pixel_segment", v))
-        entropy_menu.addAction(act)
+        # Window menu: what the analysis chose (nothing to set by hand).
+        window_menu = bar.addMenu("Window")
+        a = QAction("Radius", view)
+        a.triggered.connect(lambda: self.show_text("Window", self.coder.window_text()))
+        window_menu.addAction(a)
+        a = QAction("Sizes", view)
+        a.triggered.connect(lambda: self.show_text("Coded Size by Radius", self.coder.sizes_text()))
+        window_menu.addAction(a)
 
         view.set_image(rgb)
         view.show_window()
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(0, self.show_initial_image)
+        QTimer.singleShot(0, self.run_analysis)    # the preview shows the original until the analysis is done
 
-    def _setter(self, key, quantizing=False):
-        """Sets key; a quantization setting resurveys the block map (update)."""
+    def _quant_setter(self, key):
+        """A quantization slider's change: analyses again once the sliders settle."""
         def set_value(v):
             setattr(self.coder, key, v)
             if not self.updating:
-                if quantizing:
-                    self.update()
-                else:
-                    self.apply()
+                self.quant_changed()
         return set_value
 
-    def set_delta_type(self, t):
-        if self.coder.delta_type != t:
-            self.coder.delta_type = t
-            self.update()
+    def _set_bands(self, v):
+        self.coder.bands = v
+        self.view.set_status(self.coder.band_text())
+
+    def _set_correction(self, v):
+        self.coder.correction = v
+        if not self.updating and self.coder.survey_current():
+            self.apply()
+
+    def quant_changed(self):
+        self.view.set_status("waiting to analyse…")
+        self.quant_timer.start()
 
     def reset(self):
         c = self.coder
@@ -345,25 +427,26 @@ class SimpleWriter:
         for key, slider in self.sliders.items():
             slider.setValue(getattr(c, key))
         self.updating = False
-        self.update()
+        self.quant_changed()
 
-    def update(self):
-        """After a change to the settings: with the block map, surveys first
-        (in the background, with the other menus disabled) unless the survey
-        for these channels is kept, then applies."""
-        if self.coder.delta_type != 13:
-            self.apply()
-            return
-        self.view.set_menus_enabled(False)
-        self.view.set_status("surveying…")
-
-        def done(result, error):
-            if error is not None:
-                print("Survey: %r" % error)
-            self.view.set_menus_enabled(True)
-            self.view.set_status(None)
-            self.apply()
-        vs.run_in_background(self.coder.survey_block_maps, done)
+    def show_text(self, title, text):
+        """Shows text in a dialog, in a fixed-width font so the columns line up."""
+        from PySide6.QtGui import QFontDatabase
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QPlainTextEdit, QVBoxLayout
+        dialog = QDialog(self.view)
+        dialog.setWindowTitle(title)
+        edit = QPlainTextEdit(text.strip())
+        edit.setReadOnly(True)
+        edit.setFont(QFontDatabase.systemFont(QFontDatabase.FixedFont))
+        metrics = edit.fontMetrics()
+        lines = text.strip().split("\n")
+        edit.setMinimumSize(min(900, metrics.horizontalAdvance(max(lines, key=len)) + 40), min(600, metrics.lineSpacing() * (len(lines) + 2)))
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok)
+        buttons.accepted.connect(dialog.accept)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(edit)
+        layout.addWidget(buttons)
+        dialog.exec()
 
     def apply(self):
         try:
@@ -373,21 +456,34 @@ class SimpleWriter:
             traceback.print_exc()
             print("Apply: %r" % e)
 
-    def show_initial_image(self):
-        """Applies the default quantization, then runs the survey in the
-        background with the menus disabled so Apply and Save can't overlap it."""
-        self.apply()
+    def run_analysis(self):
+        """Analyses in the background with the menus disabled, then applies
+        (which prints the listing). If the quantization changed meanwhile, it
+        analyses again."""
+        if self.analysing:
+            return      # done() checks the quantization again
+        self.analysing = True
         self.view.set_menus_enabled(False)
-        self.view.set_status("analyzing…")
+        self.view.set_status("analysing…")
+        c = self.coder
+        quant, shift = c.pixel_quant, c.pixel_shift
 
         def done(result, error):
+            self.analysing = False
             if error is not None:
-                print("init: %r" % error)
+                print("analysis: %r" % error)
+            changed = (quant, shift) != (c.pixel_quant, c.pixel_shift)
+            if changed and not self.quant_timer.isActive():
+                self.run_analysis()
+                return
             self.view.set_menus_enabled(True)
+            if error is not None:
+                self.view.set_status("analysis failed")
+                return
             self.view.set_status(None)
-            self.delta_actions[self.coder.delta_type].setChecked(True)
-            self.apply()
-        vs.run_in_background(self.coder.survey, done)
+            if c.survey_current():
+                self.apply()
+        vs.run_in_background(lambda: c.analyse(quant, shift), done)
 
     def save(self):
         if not self.coder.applied:
