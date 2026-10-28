@@ -1896,138 +1896,168 @@ def get_values_from_mixed_deltas(value, coded, previous, xdim, ydim, init, mp, r
 # Least squares alone (the Simple format; DeltaMapper.surveyWindows)
 # =============================================================================
 #
-# Every interior pixel predicted by the least-squares fit, with no blocks
-# and no map: per channel only the window radius and the clamp (narrow, LS;
-# wide, LS wide). The edges are as the block map's, and the deltas are
-# mixed-context coded with the second opinions (the prediction is the
-# fit's). survey_windows picks each channel's radius and clamp by the real
-# coded size.
+# Every interior pixel predicted by the least-squares fit with the wide clamp
+# (LS wide), with no blocks and no map: per channel only the window radius.
+# The edges are as the block map's, and the deltas are mixed-context coded
+# with the second opinions (the prediction is the fit's). survey_windows
+# picks each channel's radius by the real coded size.
 
 WINDOW_RADII = [4, 8, 16]   # the radii survey_windows tries, smallest first
 
 
-def _least_squares_deltas(v, p, xdim, ydim):
-    """A channel's deltas from a prediction at each interior pixel, with the block map's edges."""
-    d = np.zeros(v.shape[0], dtype=np.int64)
-    _edges(v, d, xdim, ydim)
-    if ydim > 1 and xdim > 2:
-        vv = v.reshape(ydim, xdim)
-        pp = p.reshape(ydim, xdim)
-        d.reshape(ydim, xdim)[1:, 1:-1] = vv[1:, 1:-1] - pp[1:, 1:-1]
-    return d
-
-
-def get_least_squares_deltas(v, ref, xdim, ydim, radius, wide):
-    """A channel's deltas from the least-squares fit alone, with the window of
-    the given radius and the wide clamp or not (DeltaMapper.getLeastSquaresDeltas)."""
+def get_least_squares_deltas(v, ref, xdim, ydim, radius):
+    """A channel's deltas from the least-squares fit alone (the wide clamp),
+    with the window of the given radius (DeltaMapper.getLeastSquaresDeltas)."""
     v = np.asarray(v, dtype=np.int64)
     has_ref = ref is not None
     r = np.asarray(ref, dtype=np.int64) if has_ref else np.zeros(1, dtype=np.int64)
-    return _least_squares_deltas(v, _ls_planes(v, r, has_ref, xdim, ydim, radius)[1 if wide else 0], xdim, ydim)
+    p = _ls_planes(v, r, has_ref, xdim, ydim, radius)[1]
+    d = np.zeros(v.shape[0], dtype=np.int64)
+    _edges(v, d, xdim, ydim)
+    if ydim > 1 and xdim > 2:
+        d.reshape(ydim, xdim)[1:, 1:-1] = v.reshape(ydim, xdim)[1:, 1:-1] - p.reshape(ydim, xdim)[1:, 1:-1]
+    return d
 
 
 @njit
-def _from_least_squares(ref, has_ref, xdim, ydim, init, radius, wide, data, value, cb, fwd, c9b, m, act_table, n_contexts, delta):
-    """Decodes a channel's least-squares deltas (each just before it is
-    used, into delta) while rebuilding it; returns the values."""
-    state = _mix_state(data, m, value.shape[0], n_contexts)
-    n = xdim * ydim
-    dst = np.zeros(n, dtype=np.int64)
-    row, col, win, cur, ring, z, a, b, coef, dg = _ls_state(xdim, has_ref, radius)
-    _mix_decode_one(state, data, 0, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, 0)
-    dst[0] = init
-    for x in range(1, xdim):
-        _mix_decode_one(state, data, x, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, 0)
-        dst[x] = dst[x - 1] + delta[x]
-    for y in range(1, ydim):
+def _least_squares_rows(ref, has_ref, xdim, ydim, init, radius, data, value, previous, cross, cb, fwd, c9b, earlier, m,
+                        act_table, state, ls, delta, dst, y0, y1):
+    """Decodes rows y0..y1-1 of a channel's least-squares deltas (into delta,
+    each just before it is used) and rebuilds them (into dst), continuing
+    from the rows before: state is the delta decoder's (_mix_state), ls the
+    fit's (_ls_state); cross, cb, fwd, c9b and earlier hold the earlier
+    channels' terms, filled here as far as row y1 (_mix_earlier_rows; the
+    earlier channels must be decoded to row y1)."""
+    row, col, win, cur, ring, z, a, b, coef, dg = ls
+    if m == 3:
+        _mix_earlier_rows(previous, xdim, ydim, MIX_CROSS_TABLE, cross, cb, fwd, c9b, earlier, y1)
+    for y in range(y0, y1):
+        if y == 0:
+            _mix_decode_one(state, data, 0, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, 0)
+            dst[0] = init
+            for x in range(1, xdim):
+                _mix_decode_one(state, data, x, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, 0)
+                dst[x] = dst[x - 1] + delta[x]
+            continue
         k = y * xdim
         _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, 0)
         dst[k] = dst[k - xdim] + delta[k]
         for x in range(1, xdim - 1):
             k += 1
-            narrow, w = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg, True, radius)
-            p = w if wide else narrow
+            p = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg, True, radius)[1]
             _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, p)
             dst[k] = delta[k] + p
         k += 1
         _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, 0)
         dst[k] = dst[k - 1] + delta[k]
-    return dst
 
 
-def get_values_from_least_squares_deltas(value, coded, previous, xdim, ydim, init, ref, radius, wide):
-    """Decodes a channel pack_mixed_deltas coded (with the second opinions;
-    value, coded: from read_mixed_deltas) from its least-squares deltas,
-    rebuilding it as it goes (DeltaMapper.getValuesFromLeastSquaresDeltas).
-    previous: the deltas of the channels decoded before it; ref: the
-    previous channel's values. Returns (deltas, values)."""
-    has_ref = ref is not None
-    r = np.asarray(ref, dtype=np.int64) if has_ref else np.zeros(1, dtype=np.int64)
-    n = xdim * ydim
-    cb, fwd, c9b, m = _mix_setup(previous, xdim, n)
-    delta = np.zeros(n, dtype=np.int64)
-    values = _from_least_squares(r, has_ref, xdim, ydim, init, radius, bool(wide), coded, value, cb, fwd, c9b, m,
-                                 MIX_ACTIVITY_TABLE, _mix_contexts_count(True), delta)
-    return delta, values
+LS_DECODE_ROWS = 8   # the rows a channel decodes between looking at the channel before (get_values_from_least_squares_channels)
+
+
+def get_values_from_least_squares_channels(mixed, xdim, ydim, init, radius):
+    """Decodes channels pack_mixed_deltas coded (with the second opinions;
+    mixed: each channel's (value, coded) from read_mixed_deltas, in coding
+    order) from their least-squares deltas, rebuilding them as it goes
+    (DeltaMapper.getValuesFromLeastSquaresChannels): each channel's fit uses
+    the one before it, and its contexts the deltas of all the ones before
+    it. Each channel decodes in its own thread, LS_DECODE_ROWS rows at a time,
+    once the channel before it has decoded a row further (its contexts look
+    one row down into the earlier channels), so the channels decode at the
+    same time. Returns (deltas, values), each per channel."""
+    nch, n = len(mixed), xdim * ydim
+    delta = np.zeros((nch, n), dtype=np.int64)     # rows of one array: a channel's previous is delta[:i], no copy
+    value = np.zeros((nch, n), dtype=np.int64)
+    done = [0] * nch
+    cond = threading.Condition()
+    failed = []
+
+    def run(i):
+        try:
+            table, coded = mixed[i]
+            m = 3 if i > 0 else 2
+            state = _mix_state(coded, m, len(table), _mix_contexts_count(True))
+            ls = _ls_state(xdim, i > 0, radius[i])
+            ref = value[i - 1] if i > 0 else np.zeros(1, dtype=np.int64)
+            terms = [np.zeros(n, dtype=np.int64) for _ in range(4)]   # cross, cb, fwd, c9b (zero for the first channel)
+            earlier = np.zeros(2, dtype=np.int64)
+            for y0 in range(0, ydim, LS_DECODE_ROWS):
+                y1 = min(ydim, y0 + LS_DECODE_ROWS)
+                if i > 0:
+                    need = min(ydim, y1 + 1)
+                    with cond:
+                        while done[i - 1] < need and not failed:
+                            cond.wait()
+                        if failed:
+                            return
+                _least_squares_rows(ref, i > 0, xdim, ydim, int(init[i]), radius[i], coded, table, delta[:i], terms[0], terms[1], terms[2], terms[3],
+                                    earlier, m, MIX_ACTIVITY_TABLE, state, ls, delta[i], value[i], y0, y1)
+                with cond:
+                    done[i] = y1
+                    cond.notify_all()
+        except BaseException as e:
+            with cond:
+                failed.append(e)
+                cond.notify_all()
+
+    threads = [threading.Thread(target=run, args=(i,), daemon=True) for i in range(nch)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if failed:
+        raise failed[0]
+    return list(delta), list(value)
 
 
 class WindowSurvey:
     """What survey_windows chose for each channel, and what it measured
-    (DeltaMapper.WindowSurvey): radius, wide, deltas and bytes per channel
-    (coding order), their total, the radii tried, and tried[channel][2 * r +
-    clamp] (clamp 0 narrow, 1 wide), each channel's coded size at each."""
+    (DeltaMapper.WindowSurvey): radius, deltas, coded (pack_mixed_deltas with
+    the second opinions) and bytes per channel (coding order), their total, the radii tried, and tried[channel][radius index],
+    each channel's coded size at each."""
 
     def __init__(self, n, radii):
         self.radius = [0] * n
-        self.wide = [False] * n
         self.deltas = [None] * n
+        self.coded = [None] * n
         self.bytes = [0] * n
         self.total = 0
         self.radii = list(radii)
-        self.tried = [[0] * (2 * len(radii)) for _ in range(n)]
+        self.tried = [[0] * len(radii) for _ in range(n)]
 
 
 def survey_windows(channel, xdim, ydim, radii=None):
-    """Each channel's window radius and clamp, in turn: the pair (from radii,
-    and narrow before wide) whose deltas code smallest with the mixed coder
-    and second opinions, given the deltas chosen for the channels before (the
-    first smallest on a tie) (DeltaMapper.surveyWindows). The radii are tried
-    at the same time, as memory allows."""
+    """Each channel's window radius, in turn: the one from radii whose deltas
+    code smallest with the mixed coder and second opinions, given the deltas
+    chosen for the channels before (the first smallest on a tie)
+    (DeltaMapper.surveyWindows). The radii are tried at the same time, as
+    memory allows."""
     radii = WINDOW_RADII if radii is None else radii
     channel = [np.asarray(c, dtype=np.int64) for c in channel]
     n, nr = len(channel), len(radii)
     s = WindowSurvey(n, radii)
     for i in range(n):
         v = channel[i]
-        has_ref = i > 0
-        ref = channel[i - 1] if has_ref else np.zeros(1, dtype=np.int64)
+        ref = channel[i - 1] if i > 0 else None
         previous = s.deltas[:i]
 
         def one(r):
-            plane = _ls_planes(v, ref, has_ref, xdim, ydim, radii[r])
-            got = []
-            for c in range(2):
-                d = _least_squares_deltas(v, plane[c], xdim, ydim)
-                got.append((len(pack_mixed_deltas(d, v, previous, xdim, True)), d))
-            return got
-        results = [g for pair in _bounded_map(one, range(nr), 96 * xdim * ydim) for g in pair]
+            d = get_least_squares_deltas(v, ref, xdim, ydim, radii[r])
+            c = pack_mixed_deltas(d, v, previous, xdim, True)
+            return len(c), d, c
+        results = _bounded_map(one, range(nr), 80 * xdim * ydim)
         size = [g[0] for g in results]
         s.tried[i] = size
         best = 0
-        for t in range(1, 2 * nr):
-            if size[t] < size[best]:
-                best = t
-        s.radius[i] = radii[best // 2]
-        s.wide[i] = best % 2 == 1
+        for r in range(1, nr):
+            if size[r] < size[best]:
+                best = r
+        s.radius[i] = radii[best]
         s.deltas[i] = results[best][1]
+        s.coded[i] = results[best][2]
         s.bytes[i] = size[best]
         s.total += size[best]
     return s
-
-
-def describe_window(radius, wide):
-    """A channel's window in words: "radius 8, wide clamp" (DeltaMapper.describeWindow)."""
-    return "radius %d, %s clamp" % (radius, "wide" if wide else "narrow")
 
 
 # =============================================================================
@@ -2557,14 +2587,31 @@ def _mix_earlier(previous, xdim, ydim, cross_table):
     (E, SW, S, SE) and the 3x3 cross bucket, per pixel."""
     n = xdim * ydim
     cross = np.zeros(n, dtype=np.int64)
-    for p in range(previous.shape[0]):
-        for k in range(n):
-            cross[k] += abs(previous[p, k])
-    top = cross_table.shape[0] - 1
     cb = np.zeros(n, dtype=np.int64)
     fwd = np.zeros(n, dtype=np.int64)
     c9b = np.zeros(n, dtype=np.int64)
-    for y in range(ydim):
+    done = np.zeros(2, dtype=np.int64)
+    _mix_earlier_rows(previous, xdim, ydim, cross_table, cross, cb, fwd, c9b, done, ydim)
+    return cb, fwd, c9b
+
+
+@njit
+def _mix_earlier_rows(previous, xdim, ydim, cross_table, cross, cb, fwd, c9b, done, y1):
+    """_mix_earlier's cb, fwd and c9b up to row y1 (not included), which
+    needs the earlier channels' deltas up to row y1 (included); done holds
+    the rows of cross and of the rest filled so far (DeltaMapper.MixedModels.earlierRows):
+    so a decoder can decode a channel while the earlier ones are still being
+    decoded, a row or two ahead."""
+    y1 = min(y1, ydim)
+    c1 = min(ydim, y1 + 1)
+    for k in range(done[0] * xdim, c1 * xdim):
+        t = 0
+        for p in range(previous.shape[0]):
+            t += abs(previous[p, k])
+        cross[k] = t
+    done[0] = max(done[0], c1)
+    top = cross_table.shape[0] - 1
+    for y in range(done[1], y1):
         for x in range(xdim):
             k = y * xdim + x
             s9 = 0
@@ -2583,7 +2630,7 @@ def _mix_earlier(previous, xdim, ydim, cross_table):
             cb[k] = cross_table[min(cross[k], top)]
             c9b[k] = cross_table[min(s9 // 3, top)]
             fwd[k] = f
-    return cb, fwd, c9b
+    done[1] = max(done[1], y1)
 
 
 @njit

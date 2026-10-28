@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-simple_reader.py version 3.1 -- SimpleReader.java for Python (PySide6).
+simple_reader.py version 3.2 -- SimpleReader.java for Python (PySide6).
 
-Reads Simple format 'S' version 7, from simple_writer.py or
+Reads Simple format 'S' version 8, from simple_writer.py or
 SimpleWriter.java: every interior pixel predicted by the least-squares fit
-with each channel's window radius and clamp, the deltas mixed-context coded
-with the second opinions, in bands of rows decoded at the same time, resized
-back with resize_mapper.resize2 (centred). See simple_writer.SimpleCoder.encode
-for the layout. Older Simple files (formats 3 to 6) are not read.
+(the wide clamp) with each channel's window radius, the deltas mixed-context
+coded with the second opinions, in bands of rows decoded at the same time,
+resized back with resize_mapper.resize2 (centred). See
+simple_writer.SimpleCoder.encode for the layout. Older Simple files (formats 3 to 7) are not read.
 
     python3 simple_reader.py file
 
@@ -27,7 +27,7 @@ import viewer_support as vs
 from java_io import DataInput
 
 FORMAT_ID = ord('S')
-FORMAT_VERSION = 7   # 6: least squares alone, a window radius and clamp per channel, in bands; 7: 6 with centred resizing (resize_mapper.resize2)
+FORMAT_VERSION = 8   # 6: least squares alone, a window radius and clamp per channel, in bands; 7: 6 with centred resizing (resize_mapper.resize2); 8: 7 with the wide clamp only (no clamp byte)
 
 
 class SimpleDecoder:
@@ -49,11 +49,10 @@ class SimpleDecoder:
         self.pixel_shift, self.pixel_quant, self.set_id = [inp.read_byte() for _ in range(3)]
         self.size = dm.get_quantized_size(self.xdim, self.ydim, self.pixel_quant)
         w, h = self.size
-        self.min, self.radius, self.wide = [0] * 3, [0] * 3, [False] * 3
+        self.min, self.radius = [0] * 3, [0] * 3
         for i in range(3):
             self.min[i] = inp.read_int()
             self.radius[i] = inp.read_unsigned_byte()
-            self.wide[i] = inp.read_unsigned_byte() != 0
             if self.radius[i] < 1:
                 raise IOError("%s: channel %d has window radius %d." % (self.filename, i, self.radius[i]))
         n = self.bands = inp.read_unsigned_byte()
@@ -72,16 +71,17 @@ class SimpleDecoder:
         print("Image:        %d x %d" % (self.xdim, self.ydim))
         print("Channel set:  " + dm.SET_NAMES[self.set_id])
         for i in range(3):
-            print("Channel %d - %s: %s" % (i, dm.channel_name(self.set_id, i), dm.describe_window(self.radius[i], self.wide[i])))
+            print("Channel %d - %s: radius %d" % (i, dm.channel_name(self.set_id, i), self.radius[i]))
         if n > 1:
             print(sw.describe_bands(n, h))
         print()
 
     def decode(self):
         """The image as an (ydim, xdim, 3) uint8 array, R, G, B: the bands
-        decoded at the same time (each band's channels in order: a channel's
-        fit and contexts use the ones before it), then the channel set
-        recombined, resized and shifted."""
+        decoded at the same time (each band's channels at the same time too,
+        each a few rows behind the one before: a channel's fit and contexts
+        use the ones before it), then the channel set recombined, resized and
+        shifted."""
         timer = vs.Timer()
         w, h = self.size
         n = self.bands
@@ -89,11 +89,8 @@ class SimpleDecoder:
 
         def one(b):
             y0, y1 = sw.band_start(b, n, h), sw.band_start(b + 1, n, h)
-            d, v = [None] * 3, [None] * 3
+            v = dm.get_values_from_least_squares_channels(self.band_delta[b], w, y1 - y0, self.band_init[b], self.radius)[1]
             for i in range(3):
-                value, coded = self.band_delta[b][i]
-                d[i], v[i] = dm.get_values_from_least_squares_deltas(value, coded, d[:i], w, y1 - y0, self.band_init[b][i],
-                                                                     v[i - 1] if i > 0 else None, self.radius[i], self.wide[i])
                 raw[i][y0 * w:y1 * w] = v[i]
         vs.parallel(n, one)
         ids = dm.get_channels(self.set_id)

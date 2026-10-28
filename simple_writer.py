@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-simple_writer.py version 3.1 -- SimpleWriter.java for Python (PySide6).
+simple_writer.py version 3.2 -- SimpleWriter.java for Python (PySide6).
 
 A writer with one predictor and one entropy coder: every interior pixel is
 predicted by the least-squares fit (at each pixel, the linear predictor that
-best fits a causal window of the pixels before it; delta_mapper's _ls_*),
-with no blocks and no map, and the deltas are mixed-context coded with the
-second opinions (delta_mapper.pack_mixed_deltas). The analysis picks the
-channel set, then, channel by channel, the window radius (4, 8 or 16:
-delta_mapper.WINDOW_RADII) and the clamp (narrow, to 2 beyond the range of
-the four nearest neighbours, or wide, of all eight) that code the channel
-smallest, by the real coded size (delta_mapper.survey_windows). It runs at
-startup and again after any change to the quantization (Pixel Resolution or
-Color Resolution). Pixel Resolution resizes with resize_mapper.resize2
-(centred). File > Bands splits the image into up to MAX_BANDS bands
-of rows that a reader can decode at the same time, for a small cost per band
-boundary (the fit and the contexts start again at each band's top). Saves
+best fits a causal window of the pixels before it, clamped to 2 beyond the
+range of its eight neighbours; delta_mapper's _ls_*), with no blocks and no
+map, and the deltas are mixed-context coded with the second opinions
+(delta_mapper.pack_mixed_deltas). The analysis picks the channel set, then,
+channel by channel, the window radius (4, 8 or 16: delta_mapper.WINDOW_RADII)
+that codes the channel smallest, by the real coded size
+(delta_mapper.survey_windows). It runs at startup and again after any change
+to the quantization (Pixel Resolution or Color Resolution). Pixel Resolution
+resizes with resize_mapper.resize2 (centred). The Bands menu splits the image
+into up to MAX_BANDS bands of rows that a reader can decode at the same time,
+for a small cost per band boundary (the fit and the contexts start again at
+each band's top); the reader also decodes a band's three channels at the same
+time. Saves
 (to the file "foo", as the Java version does) in Simple format 'S' version
-7, read by simple_reader.py and SimpleReader.java.
+8, read by simple_reader.py and SimpleReader.java.
 
     python3 simple_writer.py [image]
 
@@ -30,6 +31,7 @@ The coding (class SimpleCoder) is separate from the window:
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 
@@ -40,7 +42,7 @@ import viewer_support as vs
 from java_io import DataOutput
 
 FORMAT_ID = ord('S')
-FORMAT_VERSION = 7   # 3 to 5: unary strings or block maps with a choice of delta type and entropy coder (no longer read); 6: least squares alone, a window radius and clamp per channel, in bands; 7: 6 with centred resizing (resize_mapper.resize2)
+FORMAT_VERSION = 8   # 3 to 5: unary strings or block maps with a choice of delta type and entropy coder (no longer read); 6: least squares alone, a window radius and clamp per channel, in bands; 7: 6 with centred resizing (resize_mapper.resize2); 8: 7 with the wide clamp only (no clamp byte)
 MAX_BANDS = 16       # the most bands Save offers
 BAND_MIN_ROWS = 64   # the fewest rows (of the quantized image) a band may have
 
@@ -74,7 +76,7 @@ def describe_windows(set_id, s):
     (SimpleWriter.describeWindows)."""
     t = "Channel set: " + dm.SET_NAMES[set_id] + "\n"
     for i in range(3):
-        t += "Channel %d - %s: %s (%s bytes)\n" % (i, dm.channel_name(set_id, i), dm.describe_window(s.radius[i], s.wide[i]), format(s.bytes[i], ","))
+        t += "Channel %d - %s: radius %d (%s bytes)\n" % (i, dm.channel_name(set_id, i), s.radius[i], format(s.bytes[i], ","))
     return t
 
 
@@ -84,7 +86,7 @@ def describe_windows(set_id, s):
 
 class SimpleCoder:
     """Holds an image and the quantization; analyse() picks each channel's
-    window radius and clamp, apply() picks the channels (and makes the
+    window radius, apply() picks the channels (and makes the
     preview), save() codes and writes the file."""
 
     def __init__(self, rgb, file_length=0):
@@ -141,8 +143,8 @@ class SimpleCoder:
         return self.survey is not None and self.survey_quant == self.pixel_quant and self.survey_shift == self.pixel_shift
 
     def analyse(self, quant=None, shift=None):
-        """Picks the channel set, then each channel's window radius and clamp,
-        for this quantization (the coder's by default) (dm.survey_windows;
+        """Picks the channel set, then each channel's window radius, for this
+        quantization (the coder's by default) (dm.survey_windows;
         Java: analyse). Returns the survey."""
         quant = self.pixel_quant if quant is None else quant
         shift = self.pixel_shift if shift is None else shift
@@ -178,19 +180,17 @@ class SimpleCoder:
         return t
 
     def sizes_text(self):
-        """Each channel's coded size at every radius tried, both clamps; the
-        chosen one starred (the Window menu's Sizes)."""
+        """Each channel's coded size at every radius tried; the chosen one
+        starred (the Window menu's Sizes)."""
         if not self.applied:
             return "No analysis yet."
         s = self.survey
         parts = []
         for i in range(3):
             t = "Channel %d - %s:\n" % (i, dm.channel_name(self.min_set_id, i))
-            t += "  %6s %12s %12s\n" % ("radius", "narrow", "wide")
+            t += "  %6s %12s\n" % ("radius", "bytes")
             for r, radius in enumerate(s.radii):
-                chosen = radius == s.radius[i]
-                t += "  %6d %11s%s %11s%s\n" % (radius, format(s.tried[i][2 * r], ","), "*" if chosen and not s.wide[i] else " ",
-                                                format(s.tried[i][2 * r + 1], ","), "*" if chosen and s.wide[i] else " ")
+                t += "  %6d %11s%s\n" % (radius, format(s.tried[i][r], ","), "*" if radius == s.radius[i] else " ")
             parts.append(t)
         return "\n".join(parts)
 
@@ -259,33 +259,33 @@ class SimpleCoder:
         return len(data)
 
     def encode(self):
-        """Format 7. Header: FORMAT_ID, FORMAT_VERSION, width, height
+        """Format 8. Header: FORMAT_ID, FORMAT_VERSION, width, height
         (unsigned shorts), pixel_shift, pixel_quant, channel set; per channel
-        (coding order) int min, the window radius and the clamp (unsigned
-        bytes; 1: wide); the number of bands n (an unsigned byte), n int
-        lengths, and the n bands. Band b is rows band_start(b) to
-        band_start(b + 1) of the quantized image, coded as an image of its own
-        (the fit and the contexts start again at its top): per channel, int
-        init, then the least-squares deltas mixed-context coded with the
-        second opinions (pack_mixed_deltas). Channels 1 and 2 use the ones
-        before them (their values in the fit, their deltas as context), so a
-        band's channels are decoded in order; the bands can be decoded at the
-        same time. Returns the bytes."""
+        (coding order) int min and the window radius (an unsigned byte); the
+        number of bands n (an unsigned byte), n int lengths, and the n bands.
+        Band b is rows band_start(b) to band_start(b + 1) of the quantized
+        image, coded as an image of its own (the fit and the contexts start
+        again at its top): per channel, int init, then the least-squares
+        deltas mixed-context coded with the second opinions
+        (pack_mixed_deltas). Channels 1 and 2 use the ones before them (their
+        values in the fit, their deltas as context), so a band's channels are
+        decoded in order, each a few rows behind the one before; the bands
+        can be decoded at the same time. One band is what the analysis
+        already coded; bands are coded at the same time. Returns the bytes."""
         n = self.bands_used()
         xdim = self.delta_xdim
         rows = len(self.value_list[0]) // xdim
         s = self.survey
-        band = []
-        for b in range(n):
+
+        def one_band(b):
             y0, y1 = band_start(b, n, rows), band_start(b + 1, n, rows)
             ch = [np.asarray(v[y0 * xdim:y1 * xdim], dtype=np.int64) for v in self.value_list]
-            # One band: the analysis's deltas.
-            d = [s.deltas[i] if n == 1 else dm.get_least_squares_deltas(ch[i], ch[i - 1] if i > 0 else None, xdim, y1 - y0, s.radius[i], s.wide[i])
+            d = [s.deltas[i] if n == 1 else dm.get_least_squares_deltas(ch[i], ch[i - 1] if i > 0 else None, xdim, y1 - y0, s.radius[i])
                  for i in range(3)]
             coded = [None] * 3
 
             def one(i):
-                coded[i] = dm.pack_mixed_deltas(d[i], ch[i], d[:i], xdim, True)
+                coded[i] = s.coded[i] if n == 1 else dm.pack_mixed_deltas(d[i], ch[i], d[:i], xdim, True)
                 back = dm.unpack_mixed_deltas(coded[i], ch[i], d[:i], xdim, ch[i] - np.asarray(d[i], dtype=np.int64))
                 if not np.array_equal(back, d[i]):
                     print("WARNING: band %d channel %d deltas do not decode back." % (b, i))
@@ -294,7 +294,15 @@ class SimpleCoder:
             for i in range(3):
                 bo.write_int(int(ch[i][0]))
                 bo.write(coded[i])
-            band.append(bo.to_bytes())
+            return bo.to_bytes()
+
+        if n == 1:
+            band = [one_band(0)]
+        else:
+            # The bands in a pool of their own: each waits for its channels,
+            # which run in the shared one.
+            with ThreadPoolExecutor(min(n, os.cpu_count() or 1)) as pool:
+                band = list(pool.map(one_band, range(n)))
 
         ids = dm.get_channels(self.min_set_id)
         out = DataOutput()
@@ -303,7 +311,7 @@ class SimpleCoder:
         out.write_byte(self.pixel_shift); out.write_byte(self.pixel_quant); out.write_byte(self.min_set_id)
         for i in range(3):
             out.write_int(self.channel_min[ids[i]])
-            out.write_byte(s.radius[i]); out.write_byte(1 if s.wide[i] else 0)
+            out.write_byte(s.radius[i])
         out.write_byte(n)
         for bb in band:
             out.write_int(len(bb))
@@ -363,12 +371,6 @@ class SimpleWriter:
         a = QAction("Reset", view)
         a.triggered.connect(self.reset)
         file_menu.addAction(a)
-        # Bands: Save codes the image as this many bands of rows, each
-        # decodable on its own (so a reader can decode them at the same time),
-        # for a small cost per band boundary. Like Save itself, it never
-        # changes the preview.
-        act, self.bands_slider = vs.make_slider_dialog(view, "Bands", 1, MAX_BANDS, c.bands, self._set_bands)
-        file_menu.addAction(act)
         a = QAction("Save", view)
         a.triggered.connect(self.save)
         file_menu.addAction(a)
@@ -386,6 +388,14 @@ class SimpleWriter:
         quant.addSeparator()
         act, self.sliders["correction"] = vs.make_slider_dialog(view, "Error Correction", 0, 10, c.correction, self._set_correction)
         quant.addAction(act)
+
+        # Bands menu: Save codes the image as this many bands of rows, each
+        # decodable on its own (so a reader can decode them at the same time),
+        # for a small cost per band boundary. Like Save itself, it never
+        # changes the preview.
+        bands_menu = bar.addMenu("Bands")
+        act, self.bands_slider = vs.make_slider_dialog(view, "Number of Bands", 1, MAX_BANDS, c.bands, self._set_bands)
+        bands_menu.addAction(act)
 
         # Window menu: what the analysis chose (nothing to set by hand).
         window_menu = bar.addMenu("Window")
