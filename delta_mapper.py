@@ -1964,6 +1964,21 @@ def get_least_squares_deltas(v, ref, xdim, ydim, radius):
     return d
 
 
+def get_least_squares_band_deltas(whole, v, ref, xdim, y0, y1, radius):
+    """A band's least-squares deltas -- what get_least_squares_deltas gives for
+    rows y0 to y1 - 1 alone, coded as an image of their own -- from the whole
+    channel's (DeltaMapper.getLeastSquaresBandDeltas). They differ only in
+    the band's first radius + 2 rows (the band's top row is an edge, and the
+    window's first row uses the row above it), so only those are fitted
+    again; the sums are exact, so the rest are the same."""
+    h = y1 - y0
+    k = min(h, radius + 2)
+    v = np.asarray(v, dtype=np.int64)
+    top = get_least_squares_deltas(v[y0 * xdim:(y0 + k) * xdim],
+                                   None if ref is None else np.asarray(ref, dtype=np.int64)[y0 * xdim:(y0 + k) * xdim], xdim, k, radius)
+    return np.concatenate([top, np.asarray(whole, dtype=np.int64)[(y0 + k) * xdim:y1 * xdim]])
+
+
 @njit
 def _least_squares_rows(ref, has_ref, xdim, ydim, init, radius, data, value, previous, cross, cb, fwd, c9b, earlier, m,
                         act_table, state, ls, delta, dst, y0, y1):
@@ -2074,33 +2089,45 @@ def survey_windows(channel, xdim, ydim, radii=None):
     """Each channel's window radius, in turn: the one from radii whose deltas
     code smallest with the mixed coder and second opinions, given the deltas
     chosen for the channels before (the first smallest on a tie)
-    (DeltaMapper.surveyWindows). The radii are tried at the same time, as
-    memory allows."""
+    (DeltaMapper.surveyWindows). The radii are fitted at the same time, as
+    memory allows (each fit also splits itself across the cores: _ls_planes),
+    and a channel's radii are coded, in a thread of their own, while the
+    next channel's are fitted: the coding needs only the deltas chosen
+    before, and the fit only the channels' values."""
     radii = WINDOW_RADII if radii is None else radii
     channel = [np.asarray(c, dtype=np.int64) for c in channel]
     n, nr = len(channel), len(radii)
+    task = 80 * xdim * ydim
     s = WindowSurvey(n, radii)
-    for i in range(n):
-        v = channel[i]
-        ref = channel[i - 1] if i > 0 else None
-        previous = s.deltas[:i]
 
-        def one(r):
-            d = get_least_squares_deltas(v, ref, xdim, ydim, radii[r])
-            c = pack_mixed_deltas(d, v, previous, xdim, True)
-            return len(c), d, c
-        results = _bounded_map(one, range(nr), 80 * xdim * ydim)
-        size = [g[0] for g in results]
+    def fit(i):
+        v, ref = channel[i], channel[i - 1] if i > 0 else None
+        return _bounded_map(lambda r: get_least_squares_deltas(v, ref, xdim, ydim, radii[r]), range(nr), task)
+
+    def code(i, got):
+        previous = s.deltas[:i]
+        coded = _bounded_map(lambda r: pack_mixed_deltas(got[r], channel[i], previous, xdim, True), range(nr), task)
+        size = [len(c) for c in coded]
         s.tried[i] = size
         best = 0
         for r in range(1, nr):
             if size[r] < size[best]:
                 best = r
         s.radius[i] = radii[best]
-        s.deltas[i] = results[best][1]
-        s.coded[i] = results[best][2]
+        s.deltas[i] = got[best]
+        s.coded[i] = coded[best]
         s.bytes[i] = size[best]
         s.total += size[best]
+
+    got = fit(0)
+    with ThreadPoolExecutor(1) as coder:
+        for i in range(n):
+            job = coder.submit(code, i, got)
+            try:
+                following = fit(i + 1) if i + 1 < n else None
+            finally:
+                job.result()
+            got = following
     return s
 
 
