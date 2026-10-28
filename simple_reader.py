@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-simple_reader.py version 3.0 -- SimpleReader.java for Python (PySide6).
+simple_reader.py version 3.1 -- SimpleReader.java for Python (PySide6).
 
-Reads Simple format 'S' version 6, from simple_writer.py or
+Reads Simple format 'S' version 7, from simple_writer.py or
 SimpleWriter.java: every interior pixel predicted by the least-squares fit
 with each channel's window radius and clamp, the deltas mixed-context coded
-with the second opinions, in bands of rows decoded at the same time. See
-simple_writer.SimpleCoder.encode for the layout. Older Simple files (formats
-3 to 5) are not read.
+with the second opinions, in bands of rows decoded at the same time, resized
+back with resize_mapper.resize2 (centred). See simple_writer.SimpleCoder.encode
+for the layout. Older Simple files (formats 3 to 6) are not read.
 
     python3 simple_reader.py file
 
@@ -27,7 +27,7 @@ import viewer_support as vs
 from java_io import DataInput
 
 FORMAT_ID = ord('S')
-FORMAT_VERSION = 6   # 6: least squares alone, a window radius and clamp per channel, in bands
+FORMAT_VERSION = 7   # 6: least squares alone, a window radius and clamp per channel, in bands; 7: 6 with centred resizing (resize_mapper.resize2)
 
 
 class SimpleDecoder:
@@ -101,7 +101,7 @@ class SimpleDecoder:
         bgr = dm.get_blue_green_red(self.set_id, *channel)
         if self.pixel_quant != 0:
             def resize(c):
-                bgr[c] = rm.resize(bgr[c], w, self.xdim, self.ydim)
+                bgr[c] = rm.resize2(bgr[c], w, self.xdim, self.ydim)
             vs.parallel(3, resize)
         rgb = np.stack([np.clip(dm.shift(v, self.pixel_shift), 0, 255).reshape(self.ydim, self.xdim) for v in bgr], axis=2)
         print("Image rebuilt in " + timer.elapsed() + ".")

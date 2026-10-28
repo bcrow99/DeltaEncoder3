@@ -1151,12 +1151,12 @@ def _bias_corrections(v, xdim, ydim, bias_base):
 # ---- The least-squares primitive (DeltaMapper.LeastSquares) -------------------
 #
 # At each pixel, the linear predictor (with a constant term) that best fits
-# the pixels in a causal window -- the LS_RADIUS rows above, LS_RADIUS
-# columns either side, and the LS_RADIUS pixels to the left -- from 8
+# the pixels in a causal window -- the r rows above, r columns either side,
+# and the r pixels to the left (r = LS_RADIUS for the table's LS) -- from 8
 # neighbours and, after the first channel, the previous channel at the
 # pixel, to its left and above. The window's sums are exact integers, kept
-# as it slides (each pixel's products computed once, kept in a ring of
-# LS_RADIUS + 1 rows); the fit (ridge 1, solved by L D L^T) is done in the
+# as it slides (each pixel's products computed once, kept in a ring of r + 1
+# rows); the fit (ridge 1, solved by L D L^T) is done in the
 # Java's order, so both get the same values.
 # _ls_next must be called for every interior pixel in raster order, from
 # row 1 or from a row given to _ls_start; because the sums are exact, the
@@ -1187,16 +1187,16 @@ def _ls_features(v, ref, has_ref, xdim, nf, y, x, z):
 
 
 @njit
-def _ls_slot(y, x, xdim, nt):
-    return ((y % (LS_RADIUS + 1)) * xdim + x) * nt
+def _ls_slot(y, x, xdim, nt, r):
+    return ((y % (r + 1)) * xdim + x) * nt
 
 
 @njit
-def _ls_products(v, ref, has_ref, xdim, nf, y, x, z, ring):
-    """Pixel (y, x)'s products into its slot in ring."""
+def _ls_products(v, ref, has_ref, xdim, nf, y, x, z, ring, r):
+    """Pixel (y, x)'s products into its slot in ring (r: the window radius)."""
     _ls_features(v, ref, has_ref, xdim, nf, y, x, z)
     m = nf + 2
-    t = _ls_slot(y, x, xdim, m * (m + 1) // 2)
+    t = _ls_slot(y, x, xdim, m * (m + 1) // 2, r)
     for i in range(m):
         zi = z[i]
         for j in range(i, m):
@@ -1205,55 +1205,54 @@ def _ls_products(v, ref, has_ref, xdim, nf, y, x, z, ring):
 
 
 @njit
-def _ls_state(xdim, has_ref):
+def _ls_state(xdim, has_ref, r):
     nf = 11 if has_ref else 8
     m = nf + 2
     nt = m * (m + 1) // 2
     return (np.full(1, -1, dtype=np.int64), np.zeros(xdim * nt, dtype=np.int64), np.zeros(nt, dtype=np.int64),
-            np.zeros(nt, dtype=np.int64), np.zeros((LS_RADIUS + 1) * xdim * nt, dtype=np.int32), np.zeros(m, dtype=np.int64),
+            np.zeros(nt, dtype=np.int64), np.zeros((r + 1) * xdim * nt, dtype=np.int32), np.zeros(m, dtype=np.int64),
             np.zeros((nf + 1, nf + 1)), np.zeros(nf + 1), np.zeros(nf + 1), np.zeros(nf + 1))
 
 
 @njit
-def _ls_start(v, ref, has_ref, xdim, y0, row, col, ring, z):
+def _ls_start(v, ref, has_ref, xdim, y0, row, col, ring, z, r):
     """Sets the window up as if the rows before y0 had been gone through."""
     nf = 11 if has_ref else 8
     m = nf + 2
     nt = m * (m + 1) // 2
-    for ty in range(max(1, y0 - 1 - LS_RADIUS), y0):
+    for ty in range(max(1, y0 - 1 - r), y0):
         for tx in range(1, xdim - 1):
-            _ls_products(v, ref, has_ref, xdim, nf, ty, tx, z, ring)
+            _ls_products(v, ref, has_ref, xdim, nf, ty, tx, z, ring, r)
             if ty <= y0 - 2:
                 c = tx * nt
-                sl = _ls_slot(ty, tx, xdim, nt)
+                sl = _ls_slot(ty, tx, xdim, nt, r)
                 for t in range(nt):
                     col[c + t] += ring[sl + t]
     row[0] = y0 - 1
 
 
 @njit
-def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg, fit):
-    """Moves the window to interior pixel k and, if fit, returns the
-    least-squares primitives there, (LS, LS wide) (the decoder fits only
+def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg, fit, r):
+    """Moves the window (radius r) to interior pixel k and, if fit, returns
+    the least-squares primitives there, (LS, LS wide) (the decoder fits only
     where they are used)."""
     nf = 11 if has_ref else 8
     m = nf + 2
     nt = m * (m + 1) // 2
-    r = LS_RADIUS
     y = k // xdim
     x = k % xdim
     if y != row[0]:
         if y - 1 >= 1:
-            _ls_products(v, ref, has_ref, xdim, nf, y - 1, xdim - 2, z, ring)
+            _ls_products(v, ref, has_ref, xdim, nf, y - 1, xdim - 2, z, ring, r)
             for tx in range(1, xdim - 1):
                 c = tx * nt
-                sl = _ls_slot(y - 1, tx, xdim, nt)
+                sl = _ls_slot(y - 1, tx, xdim, nt, r)
                 for t in range(nt):
                     col[c + t] += ring[sl + t]
         if y - 1 - r >= 1:
             for tx in range(1, xdim - 1):
                 c = tx * nt
-                sl = _ls_slot(y - 1 - r, tx, xdim, nt)
+                sl = _ls_slot(y - 1 - r, tx, xdim, nt, r)
                 for t in range(nt):
                     col[c + t] -= ring[sl + t]
         row[0] = y
@@ -1271,12 +1270,12 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, 
             c = (x - r - 1) * nt
             for t in range(nt):
                 win[t] -= col[c + t]
-        _ls_products(v, ref, has_ref, xdim, nf, y, x - 1, z, ring)
-        sl = _ls_slot(y, x - 1, xdim, nt)
+        _ls_products(v, ref, has_ref, xdim, nf, y, x - 1, z, ring, r)
+        sl = _ls_slot(y, x - 1, xdim, nt, r)
         for t in range(nt):
             cur[t] += ring[sl + t]
         if x - 1 - r >= 1:
-            sl = _ls_slot(y, x - 1 - r, xdim, nt)
+            sl = _ls_slot(y, x - 1 - r, xdim, nt, r)
             for t in range(nt):
                 cur[t] -= ring[sl + t]
     if not fit:
@@ -1339,38 +1338,45 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, 
 
 
 @njit
-def _ls_band(v, ref, has_ref, xdim, y0, y1, out, wide):
-    row, col, win, cur, ring, z, a, b, coef, dg = _ls_state(xdim, has_ref)
-    _ls_start(v, ref, has_ref, xdim, y0, row, col, ring, z)
+def _ls_band(v, ref, has_ref, xdim, y0, y1, out, wide, r):
+    row, col, win, cur, ring, z, a, b, coef, dg = _ls_state(xdim, has_ref, r)
+    _ls_start(v, ref, has_ref, xdim, y0, row, col, ring, z, r)
     for y in range(y0, y1):
         for x in range(1, xdim - 1):
             k = y * xdim + x
-            out[k], wide[k] = _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg, True)
+            out[k], wide[k] = _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg, True, r)
 
 
-_LS_CACHE = []        # recently computed planes: (xdim, channel copy, previous channel copy or None, (LS, LS wide))
+_LS_CACHE = []        # recently computed planes: (xdim, radius, channel copy, previous channel copy or None, (LS, LS wide))
 _LS_CACHE_SIZE = 3    # a channel set's three
 _LS_CACHE_LOCK = threading.Lock()
 _LS_POOL = ThreadPoolExecutor(_CPUS)   # its own: PixelSources are made in _ROW_POOL's threads
 
 
-def _ls_plane(v, ref, has_ref, xdim, ydim):
-    """The encoder's least-squares primitives for the whole channel, (LS, LS
-    wide) (DeltaMapper.leastSquaresPlanes): bands of rows in parallel, reused
-    if the same channel (and previous channel) was just done."""
-    r = ref if has_ref else None
-    with _LS_CACHE_LOCK:
-        for xd, cv, cr, plane in _LS_CACHE:
-            if xd == xdim and np.array_equal(cv, v) and ((cr is None and r is None) or (cr is not None and r is not None and np.array_equal(cr, r))):
-                return plane
+def _ls_planes(v, ref, has_ref, xdim, ydim, radius):
+    """(LS, LS wide) for the whole channel with the window of the given
+    radius, in bands of rows computed in parallel (DeltaMapper.LeastSquares.plane)."""
     out = np.zeros(v.shape[0], dtype=np.int16)
     wide = np.zeros(v.shape[0], dtype=np.int16)
-    band = max(4 * (LS_RADIUS + 1), (ydim - 1 + _CPUS - 1) // _CPUS)
-    for f in [_LS_POOL.submit(_ls_band, v, ref, has_ref, xdim, y0, min(ydim, y0 + band), out, wide) for y0 in range(1, ydim, band)]:
+    band = max(4 * (radius + 1), (ydim - 1 + _CPUS - 1) // _CPUS)
+    for f in [_LS_POOL.submit(_ls_band, v, ref, has_ref, xdim, y0, min(ydim, y0 + band), out, wide, radius) for y0 in range(1, ydim, band)]:
         f.result()
-    out = (out, wide)
+    return out, wide
+
+
+def _ls_plane(v, ref, has_ref, xdim, ydim, radius=LS_RADIUS):
+    """The encoder's least-squares primitives for the whole channel, (LS, LS
+    wide), with the window of the given radius (DeltaMapper.leastSquaresPlanes):
+    bands of rows in parallel, reused if the same channel (and previous
+    channel) was just done."""
+    r = ref if has_ref else None
     with _LS_CACHE_LOCK:
-        _LS_CACHE.append((xdim, v.copy(), None if r is None else r.copy(), out))
+        for xd, rd, cv, cr, plane in _LS_CACHE:
+            if xd == xdim and rd == radius and np.array_equal(cv, v) and ((cr is None and r is None) or (cr is not None and r is not None and np.array_equal(cr, r))):
+                return plane
+    out = _ls_planes(v, ref, has_ref, xdim, ydim, radius)
+    with _LS_CACHE_LOCK:
+        _LS_CACHE.append((xdim, radius, v.copy(), None if r is None else r.copy(), out))
         del _LS_CACHE[:-_LS_CACHE_SIZE]
     return out
 
@@ -1808,7 +1814,7 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
     bsum = np.zeros((4, 729), dtype=np.int64)
     bcount = np.zeros((4, 729), dtype=np.int64)
     prim = np.zeros(ALL_PRIMITIVES, dtype=np.int64)
-    row, col, win, cur, ring, z, a, b, coef, dg = _ls_state(xdim, has_ref)
+    row, col, win, cur, ring, z, a, b, coef, dg = _ls_state(xdim, has_ref, LS_RADIUS)
     if mixed:
         _mix_decode_one(state, data, 0, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, opinions, 0)
     dst[0] = init
@@ -1828,7 +1834,7 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
             if use_ls:
                 corr[4, k], corr[5, k] = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg,
                                                   first[pid] == LS_FIRST or second[pid] == LS_FIRST
-                                                  or first[pid] == LS_WIDE or second[pid] == LS_WIDE)
+                                                  or first[pid] == LS_WIDE or second[pid] == LS_WIDE, LS_RADIUS)
             _bias_prepare(dst, k, xdim, ctx, corr, bsum, bcount)
             _all_primitives(dst, ref, has_ref, corr, k, xdim, prim)
             i = first[pid]
@@ -1884,6 +1890,144 @@ def get_values_from_mixed_deltas(value, coded, previous, xdim, ydim, init, mp, r
     values = _from_block(delta, r, has_ref, xdim, ydim, init, mp, ids, first, second, CROSS_BASE, BIAS_BASE,
                          use_ls, True, coded, value, cb, fwd, c9b, m, MIX_ACTIVITY_TABLE, _mix_contexts_count(opinions), opinions)
     return delta, values
+
+
+# =============================================================================
+# Least squares alone (the Simple format; DeltaMapper.surveyWindows)
+# =============================================================================
+#
+# Every interior pixel predicted by the least-squares fit, with no blocks
+# and no map: per channel only the window radius and the clamp (narrow, LS;
+# wide, LS wide). The edges are as the block map's, and the deltas are
+# mixed-context coded with the second opinions (the prediction is the
+# fit's). survey_windows picks each channel's radius and clamp by the real
+# coded size.
+
+WINDOW_RADII = [4, 8, 16]   # the radii survey_windows tries, smallest first
+
+
+def _least_squares_deltas(v, p, xdim, ydim):
+    """A channel's deltas from a prediction at each interior pixel, with the block map's edges."""
+    d = np.zeros(v.shape[0], dtype=np.int64)
+    _edges(v, d, xdim, ydim)
+    if ydim > 1 and xdim > 2:
+        vv = v.reshape(ydim, xdim)
+        pp = p.reshape(ydim, xdim)
+        d.reshape(ydim, xdim)[1:, 1:-1] = vv[1:, 1:-1] - pp[1:, 1:-1]
+    return d
+
+
+def get_least_squares_deltas(v, ref, xdim, ydim, radius, wide):
+    """A channel's deltas from the least-squares fit alone, with the window of
+    the given radius and the wide clamp or not (DeltaMapper.getLeastSquaresDeltas)."""
+    v = np.asarray(v, dtype=np.int64)
+    has_ref = ref is not None
+    r = np.asarray(ref, dtype=np.int64) if has_ref else np.zeros(1, dtype=np.int64)
+    return _least_squares_deltas(v, _ls_planes(v, r, has_ref, xdim, ydim, radius)[1 if wide else 0], xdim, ydim)
+
+
+@njit
+def _from_least_squares(ref, has_ref, xdim, ydim, init, radius, wide, data, value, cb, fwd, c9b, m, act_table, n_contexts, delta):
+    """Decodes a channel's least-squares deltas (each just before it is
+    used, into delta) while rebuilding it; returns the values."""
+    state = _mix_state(data, m, value.shape[0], n_contexts)
+    n = xdim * ydim
+    dst = np.zeros(n, dtype=np.int64)
+    row, col, win, cur, ring, z, a, b, coef, dg = _ls_state(xdim, has_ref, radius)
+    _mix_decode_one(state, data, 0, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, 0)
+    dst[0] = init
+    for x in range(1, xdim):
+        _mix_decode_one(state, data, x, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, 0)
+        dst[x] = dst[x - 1] + delta[x]
+    for y in range(1, ydim):
+        k = y * xdim
+        _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, 0)
+        dst[k] = dst[k - xdim] + delta[k]
+        for x in range(1, xdim - 1):
+            k += 1
+            narrow, w = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg, True, radius)
+            p = w if wide else narrow
+            _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, p)
+            dst[k] = delta[k] + p
+        k += 1
+        _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, 0)
+        dst[k] = dst[k - 1] + delta[k]
+    return dst
+
+
+def get_values_from_least_squares_deltas(value, coded, previous, xdim, ydim, init, ref, radius, wide):
+    """Decodes a channel pack_mixed_deltas coded (with the second opinions;
+    value, coded: from read_mixed_deltas) from its least-squares deltas,
+    rebuilding it as it goes (DeltaMapper.getValuesFromLeastSquaresDeltas).
+    previous: the deltas of the channels decoded before it; ref: the
+    previous channel's values. Returns (deltas, values)."""
+    has_ref = ref is not None
+    r = np.asarray(ref, dtype=np.int64) if has_ref else np.zeros(1, dtype=np.int64)
+    n = xdim * ydim
+    cb, fwd, c9b, m = _mix_setup(previous, xdim, n)
+    delta = np.zeros(n, dtype=np.int64)
+    values = _from_least_squares(r, has_ref, xdim, ydim, init, radius, bool(wide), coded, value, cb, fwd, c9b, m,
+                                 MIX_ACTIVITY_TABLE, _mix_contexts_count(True), delta)
+    return delta, values
+
+
+class WindowSurvey:
+    """What survey_windows chose for each channel, and what it measured
+    (DeltaMapper.WindowSurvey): radius, wide, deltas and bytes per channel
+    (coding order), their total, the radii tried, and tried[channel][2 * r +
+    clamp] (clamp 0 narrow, 1 wide), each channel's coded size at each."""
+
+    def __init__(self, n, radii):
+        self.radius = [0] * n
+        self.wide = [False] * n
+        self.deltas = [None] * n
+        self.bytes = [0] * n
+        self.total = 0
+        self.radii = list(radii)
+        self.tried = [[0] * (2 * len(radii)) for _ in range(n)]
+
+
+def survey_windows(channel, xdim, ydim, radii=None):
+    """Each channel's window radius and clamp, in turn: the pair (from radii,
+    and narrow before wide) whose deltas code smallest with the mixed coder
+    and second opinions, given the deltas chosen for the channels before (the
+    first smallest on a tie) (DeltaMapper.surveyWindows). The radii are tried
+    at the same time, as memory allows."""
+    radii = WINDOW_RADII if radii is None else radii
+    channel = [np.asarray(c, dtype=np.int64) for c in channel]
+    n, nr = len(channel), len(radii)
+    s = WindowSurvey(n, radii)
+    for i in range(n):
+        v = channel[i]
+        has_ref = i > 0
+        ref = channel[i - 1] if has_ref else np.zeros(1, dtype=np.int64)
+        previous = s.deltas[:i]
+
+        def one(r):
+            plane = _ls_planes(v, ref, has_ref, xdim, ydim, radii[r])
+            got = []
+            for c in range(2):
+                d = _least_squares_deltas(v, plane[c], xdim, ydim)
+                got.append((len(pack_mixed_deltas(d, v, previous, xdim, True)), d))
+            return got
+        results = [g for pair in _bounded_map(one, range(nr), 96 * xdim * ydim) for g in pair]
+        size = [g[0] for g in results]
+        s.tried[i] = size
+        best = 0
+        for t in range(1, 2 * nr):
+            if size[t] < size[best]:
+                best = t
+        s.radius[i] = radii[best // 2]
+        s.wide[i] = best % 2 == 1
+        s.deltas[i] = results[best][1]
+        s.bytes[i] = size[best]
+        s.total += size[best]
+    return s
+
+
+def describe_window(radius, wide):
+    """A channel's window in words: "radius 8, wide clamp" (DeltaMapper.describeWindow)."""
+    return "radius %d, %s clamp" % (radius, "wide" if wide else "narrow")
 
 
 # =============================================================================

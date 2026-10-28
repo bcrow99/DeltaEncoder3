@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
-simple_writer.py version 3.0 -- SimpleWriter.java for Python (PySide6).
+simple_writer.py version 3.1 -- SimpleWriter.java for Python (PySide6).
 
 A writer with one predictor and one entropy coder: every interior pixel is
 predicted by the least-squares fit (at each pixel, the linear predictor that
 best fits a causal window of the pixels before it; delta_mapper's _ls_*),
 with no blocks and no map, and the deltas are mixed-context coded with the
 second opinions (delta_mapper.pack_mixed_deltas). The analysis picks the
-channel set, then, channel by channel, the window radius (from
+channel set, then, channel by channel, the window radius (4, 8 or 16:
 delta_mapper.WINDOW_RADII) and the clamp (narrow, to 2 beyond the range of
 the four nearest neighbours, or wide, of all eight) that code the channel
 smallest, by the real coded size (delta_mapper.survey_windows). It runs at
 startup and again after any change to the quantization (Pixel Resolution or
-Color Resolution). File > Bands splits the image into up to MAX_BANDS bands
+Color Resolution). Pixel Resolution resizes with resize_mapper.resize2
+(centred). File > Bands splits the image into up to MAX_BANDS bands
 of rows that a reader can decode at the same time, for a small cost per band
 boundary (the fit and the contexts start again at each band's top). Saves
 (to the file "foo", as the Java version does) in Simple format 'S' version
-6, read by simple_reader.py and SimpleReader.java.
+7, read by simple_reader.py and SimpleReader.java.
 
     python3 simple_writer.py [image]
 
@@ -39,7 +40,7 @@ import viewer_support as vs
 from java_io import DataOutput
 
 FORMAT_ID = ord('S')
-FORMAT_VERSION = 6   # 3 to 5: unary strings or block maps with a choice of delta type and entropy coder (no longer read); 6: least squares alone, a window radius and clamp per channel, in bands
+FORMAT_VERSION = 7   # 3 to 5: unary strings or block maps with a choice of delta type and entropy coder (no longer read); 6: least squares alone, a window radius and clamp per channel, in bands; 7: 6 with centred resizing (resize_mapper.resize2)
 MAX_BANDS = 16       # the most bands Save offers
 BAND_MIN_ROWS = 64   # the fewest rows (of the quantized image) a band may have
 
@@ -119,7 +120,7 @@ class SimpleCoder:
         def one(i):
             ch = self.source[i]
             if quant != 0:
-                ch = rm.resize(ch, self.image_xdim, size[0], size[1])
+                ch = rm.resize2(ch, self.image_xdim, size[0], size[1])
             q[i] = dm.quantize_channel(ch, shift)
         vs.parallel(3, one)
         qc, mins = dm.get_candidate_channels(q[0], q[1], q[2])
@@ -222,13 +223,13 @@ class SimpleCoder:
             print()
             self.survey_time = None
 
-        # As the reader: recombine the channel set first, then resize, then shift.
+        # As the reader: recombine the channel set first, then resize (centred: resize2), then shift.
         bgr = dm.get_blue_green_red(self.min_set_id, *decoded)
 
         def restore(c):
             v = bgr[c]
             if self.pixel_quant != 0:
-                v = rm.resize(v, w, self.image_xdim, self.image_ydim)
+                v = rm.resize2(v, w, self.image_xdim, self.image_ydim)
             if self.pixel_shift != 0:
                 v = dm.shift(v, self.pixel_shift)
             if self.correction != 0:
@@ -258,7 +259,7 @@ class SimpleCoder:
         return len(data)
 
     def encode(self):
-        """Format 6. Header: FORMAT_ID, FORMAT_VERSION, width, height
+        """Format 7. Header: FORMAT_ID, FORMAT_VERSION, width, height
         (unsigned shorts), pixel_shift, pixel_quant, channel set; per channel
         (coding order) int min, the window radius and the clamp (unsigned
         bytes; 1: wide); the number of bands n (an unsigned byte), n int

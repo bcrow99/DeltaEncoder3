@@ -15,7 +15,7 @@ formats as their Java versions, and also save to "foo":
 
 ```
 python3 delta_writer2.py [image]     # Delta format, read by delta_reader.py
-python3 simple_writer.py [image]     # Simple format 'S'
+python3 simple_writer.py [image]     # Simple format 'S' version 7
 python3 simple_reader.py foo
 python3 block_writer.py [image]      # Block format 'B'
 python3 block_reader.py foo
@@ -51,7 +51,7 @@ after that it loads from the cache in `__pycache__`.
 | `delta_writer.py` | DeltaWriter | `DeltaCoder` (survey, apply, save — usable without a window) and the window |
 | `delta_reader.py` | DeltaReader | `DeltaDecoder` (usable without a window) and the window |
 | `delta_writer2.py` | DeltaWriter2 | `DeltaCoder2`: delta types 6–13 only, String* datatype, map-coding report |
-| `simple_writer.py` | SimpleWriter | `SimpleCoder`: unary strings, delta type from the menu |
+| `simple_writer.py` | SimpleWriter | `SimpleCoder`: least squares alone, mixed-context-coded deltas; each channel's window radius and clamp chosen by the analysis |
 | `simple_reader.py` | SimpleReader | `SimpleDecoder` |
 | `block_writer.py` | BlockWriter | `BlockCoder`: block map with mixed-context-coded deltas; each channel's block size and predictors chosen by the survey |
 | `block_reader.py` | BlockReader | `BlockDecoder` |
