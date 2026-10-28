@@ -49,7 +49,7 @@ def _enc_init(n):
     return st, out
 
 
-@njit
+@njit(inline="always")   # called per symbol: a call passing arrays is slow in Numba
 def _put(st, out, b):
     if st[4] == out.shape[0]:
         bigger = np.zeros(out.shape[0] * 2, dtype=np.uint8)
@@ -60,7 +60,7 @@ def _put(st, out, b):
     return out
 
 
-@njit
+@njit(inline="always")   # called per symbol: a call passing arrays is slow in Numba
 def _shift_low(st, out):
     low = st[0]
     if low < 0xFF00000000 or low >= RANGE_TOP:
@@ -78,7 +78,7 @@ def _shift_low(st, out):
     return out
 
 
-@njit
+@njit(inline="always")   # called per symbol: a call passing arrays is slow in Numba
 def _encode(st, out, start, count, total):
     r = st[1] // total
     st[0] += start * r
@@ -97,7 +97,7 @@ def _finish(st, out):
 
 
 # Decoder state: dt = [pos, code, range, r].
-@njit
+@njit(inline="always")   # called per symbol: a call passing arrays is slow in Numba
 def _next(dt, data):
     p = dt[0]
     if p < data.shape[0]:
@@ -116,14 +116,14 @@ def _dec_init(data):
     return dt
 
 
-@njit
+@njit(inline="always")   # called per symbol: a call passing arrays is slow in Numba
 def _target(dt, total):
     dt[3] = dt[2] // total
     t = dt[1] // dt[3]
     return min(t, total - 1)
 
 
-@njit
+@njit(inline="always")   # called per symbol: a call passing arrays is slow in Numba
 def _decode(dt, data, start, count):
     dt[1] -= start * dt[3]
     dt[2] = count * dt[3]

@@ -1104,7 +1104,7 @@ def _bias_context(a, b, c, d):
     return (_gradient_level(d - b) + 4) * 81 + (_gradient_level(b - c) + 4) * 9 + _gradient_level(c - a) + 4
 
 
-@njit
+@njit(inline="always")   # a call per pixel passing arrays is slow in Numba
 def _bias_prepare(v, k, xdim, ctx, corr, bsum, bcount):
     a = v[k - 1]; b = v[k - xdim]; c = v[k - xdim - 1]; d = v[k - xdim + 1]
     t = _bias_context(a, b, c, d)
@@ -1120,7 +1120,7 @@ def _bias_prepare(v, k, xdim, ctx, corr, bsum, bcount):
             corr[s, k] = -((-e + n // 2) // n)
 
 
-@njit
+@njit(inline="always")   # a call per pixel passing arrays is slow in Numba
 def _bias_commit(v, k, xdim, ctx, bsum, bcount, bias_base):
     a = v[k - 1]; b = v[k - xdim]; c = v[k - xdim - 1]; d = v[k - xdim + 1]
     t = ctx[0]
@@ -1162,7 +1162,7 @@ def _bias_corrections(v, xdim, ydim, bias_base):
 # row 1 or from a row given to _ls_start; because the sums are exact, the
 # encoder computes bands of rows independently (_ls_plane).
 
-@njit
+@njit(inline="always")   # a call per pixel passing arrays is slow in Numba
 def _ls_at(v, y, x, xdim):
     if y < 0:
         y = 0
@@ -1173,7 +1173,7 @@ def _ls_at(v, y, x, xdim):
     return v[y * xdim + x]
 
 
-@njit
+@njit(inline="always")   # a call per pixel passing arrays is slow in Numba
 def _ls_features(v, ref, has_ref, xdim, nf, y, x, z):
     z[0] = _ls_at(v, y, x - 1, xdim); z[1] = _ls_at(v, y - 1, x, xdim)
     z[2] = _ls_at(v, y - 1, x - 1, xdim); z[3] = _ls_at(v, y - 1, x + 1, xdim)
@@ -1186,12 +1186,12 @@ def _ls_features(v, ref, has_ref, xdim, nf, y, x, z):
     z[nf + 1] = v[y * xdim + x]
 
 
-@njit
+@njit(inline="always")   # a call per pixel passing arrays is slow in Numba
 def _ls_slot(y, x, xdim, nt, r):
     return ((y % (r + 1)) * xdim + x) * nt
 
 
-@njit
+@njit(inline="always")   # a call per pixel passing arrays is slow in Numba
 def _ls_products(v, ref, has_ref, xdim, nf, y, x, z, ring, r):
     """Pixel (y, x)'s products into its slot in ring (r: the window radius)."""
     _ls_features(v, ref, has_ref, xdim, nf, y, x, z)
@@ -1231,7 +1231,7 @@ def _ls_start(v, ref, has_ref, xdim, y0, row, col, ring, z, r):
     row[0] = y0 - 1
 
 
-@njit
+@njit(inline="always")   # a call per pixel passing arrays is slow in Numba
 def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg, fit, r):
     """Moves the window (radius r) to interior pixel k and, if fit, returns
     the least-squares primitives there, (LS, LS wide) (the decoder fits only
@@ -1241,43 +1241,53 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, 
     nt = m * (m + 1) // 2
     y = k // xdim
     x = k % xdim
+    # The sums are indexed with unsigned offsets: computed signed ones make
+    # Numba check each index for wraparound, about 3 times as slow.
     if y != row[0]:
         if y - 1 >= 1:
             _ls_products(v, ref, has_ref, xdim, nf, y - 1, xdim - 2, z, ring, r)
             for tx in range(1, xdim - 1):
-                c = tx * nt
-                sl = _ls_slot(y - 1, tx, xdim, nt, r)
+                c = np.uint64(tx * nt)
+                sl = np.uint64(_ls_slot(y - 1, tx, xdim, nt, r))
                 for t in range(nt):
-                    col[c + t] += ring[sl + t]
+                    ut = np.uint64(t)
+                    col[c + ut] += ring[sl + ut]
         if y - 1 - r >= 1:
             for tx in range(1, xdim - 1):
-                c = tx * nt
-                sl = _ls_slot(y - 1 - r, tx, xdim, nt, r)
+                c = np.uint64(tx * nt)
+                sl = np.uint64(_ls_slot(y - 1 - r, tx, xdim, nt, r))
                 for t in range(nt):
-                    col[c + t] -= ring[sl + t]
+                    ut = np.uint64(t)
+                    col[c + ut] -= ring[sl + ut]
         row[0] = y
         win[:] = 0
         cur[:] = 0
         for tx in range(1, min(xdim - 2, 1 + r) + 1):
+            c = np.uint64(tx * nt)
             for t in range(nt):
-                win[t] += col[tx * nt + t]
+                ut = np.uint64(t)
+                win[ut] += col[c + ut]
     else:
         if x + r <= xdim - 2:
-            c = (x + r) * nt
+            c = np.uint64((x + r) * nt)
             for t in range(nt):
-                win[t] += col[c + t]
+                ut = np.uint64(t)
+                win[ut] += col[c + ut]
         if x - r - 1 >= 1:
-            c = (x - r - 1) * nt
+            c = np.uint64((x - r - 1) * nt)
             for t in range(nt):
-                win[t] -= col[c + t]
+                ut = np.uint64(t)
+                win[ut] -= col[c + ut]
         _ls_products(v, ref, has_ref, xdim, nf, y, x - 1, z, ring, r)
-        sl = _ls_slot(y, x - 1, xdim, nt, r)
+        sl = np.uint64(_ls_slot(y, x - 1, xdim, nt, r))
         for t in range(nt):
-            cur[t] += ring[sl + t]
+            ut = np.uint64(t)
+            cur[ut] += ring[sl + ut]
         if x - 1 - r >= 1:
-            sl = _ls_slot(y, x - 1 - r, xdim, nt, r)
+            sl = np.uint64(_ls_slot(y, x - 1 - r, xdim, nt, r))
             for t in range(nt):
-                cur[t] -= ring[sl + t]
+                ut = np.uint64(t)
+                cur[ut] -= ring[sl + ut]
     if not fit:
         return 0, 0
 
@@ -1815,39 +1825,39 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
     bcount = np.zeros((4, 729), dtype=np.int64)
     prim = np.zeros(ALL_PRIMITIVES, dtype=np.int64)
     row, col, win, cur, ring, z, a, b, coef, dg = _ls_state(xdim, has_ref, LS_RADIUS)
-    if mixed:
-        _mix_decode_one(state, data, 0, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, opinions, 0)
-    dst[0] = init
-    for x in range(1, xdim):
-        if mixed:
-            _mix_decode_one(state, data, x, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, opinions, 0)
-        dst[x] = dst[x - 1] + delta[x]
-    for y in range(1, ydim):
-        k = y * xdim
-        if mixed:
-            _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, opinions, 0)
-        dst[k] = dst[k - xdim] + delta[k]
+    # One pixel at a time, with one call site of each helper (the per-pixel
+    # ones are inlined): the prediction (row 0 horizontal, column 0
+    # vertical, the last column horizontal, the interior the block's
+    # predictor), then the delta.
+    for y in range(ydim):
         mrow = head + (y - 1) // bht * bw
-        for x in range(1, xdim - 1):
-            k += 1
-            pid = ids[mp[mrow + (x - 1) // bwd]]
-            if use_ls:
-                corr[4, k], corr[5, k] = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg,
-                                                  first[pid] == LS_FIRST or second[pid] == LS_FIRST
-                                                  or first[pid] == LS_WIDE or second[pid] == LS_WIDE, LS_RADIUS)
-            _bias_prepare(dst, k, xdim, ctx, corr, bsum, bcount)
-            _all_primitives(dst, ref, has_ref, corr, k, xdim, prim)
-            i = first[pid]
-            j = second[pid]
-            p = prim[i] if i == j else (prim[i] + prim[j] + 1) >> 1
+        for x in range(xdim):
+            k = y * xdim + x
+            pred = 0                    # the second opinions' prediction (interior only)
+            interior = y > 0 and 0 < x < xdim - 1
+            if y == 0:
+                p = init if x == 0 else dst[k - 1]
+            elif x == 0:
+                p = dst[k - xdim]
+            elif x == xdim - 1:
+                p = dst[k - 1]
+            else:
+                pid = ids[mp[mrow + (x - 1) // bwd]]
+                if use_ls:
+                    corr[4, k], corr[5, k] = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg,
+                                                      first[pid] == LS_FIRST or second[pid] == LS_FIRST
+                                                      or first[pid] == LS_WIDE or second[pid] == LS_WIDE, LS_RADIUS)
+                _bias_prepare(dst, k, xdim, ctx, corr, bsum, bcount)
+                _all_primitives(dst, ref, has_ref, corr, k, xdim, prim)
+                i = first[pid]
+                j = second[pid]
+                p = prim[i] if i == j else (prim[i] + prim[j] + 1) >> 1
+                pred = p
             if mixed:
-                _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, opinions, p)
-            dst[k] = delta[k] + p
-            _bias_commit(dst, k, xdim, ctx, bsum, bcount, bias_base)
-        k += 1
-        if mixed:
-            _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, opinions, 0)
-        dst[k] = dst[k - 1] + delta[k]
+                _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, opinions, pred)
+            dst[k] = init if k == 0 else delta[k] + p
+            if interior:
+                _bias_commit(dst, k, xdim, ctx, bsum, bcount, bias_base)
     return dst
 
 
@@ -1931,25 +1941,24 @@ def _least_squares_rows(ref, has_ref, xdim, ydim, init, radius, data, value, pre
     row, col, win, cur, ring, z, a, b, coef, dg = ls
     if m == 3:
         _mix_earlier_rows(previous, xdim, ydim, MIX_CROSS_TABLE, cross, cb, fwd, c9b, earlier, y1)
+    # One pixel at a time, with one call site of each helper (they are
+    # inlined): the prediction (row 0 horizontal, column 0 vertical, the last
+    # column horizontal, the interior the fit's), then the delta.
     for y in range(y0, y1):
-        if y == 0:
-            _mix_decode_one(state, data, 0, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, 0)
-            dst[0] = init
-            for x in range(1, xdim):
-                _mix_decode_one(state, data, x, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, 0)
-                dst[x] = dst[x - 1] + delta[x]
-            continue
-        k = y * xdim
-        _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, 0)
-        dst[k] = dst[k - xdim] + delta[k]
-        for x in range(1, xdim - 1):
-            k += 1
-            p = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg, True, radius)[1]
-            _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, p)
-            dst[k] = delta[k] + p
-        k += 1
-        _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, 0)
-        dst[k] = dst[k - 1] + delta[k]
+        for x in range(xdim):
+            k = y * xdim + x
+            pred = 0                    # the second opinions' prediction (interior only)
+            if y == 0:
+                p = init if x == 0 else dst[k - 1]
+            elif x == 0:
+                p = dst[k - xdim]
+            elif x == xdim - 1:
+                p = dst[k - 1]
+            else:
+                p = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg, True, radius)[1]
+                pred = p
+            _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, pred)
+            dst[k] = init if k == 0 else delta[k] + p
 
 
 LS_DECODE_ROWS = 8   # the rows a channel decodes between looking at the channel before (get_values_from_least_squares_channels)
@@ -2633,7 +2642,7 @@ def _mix_earlier_rows(previous, xdim, ydim, cross_table, cross, cb, fwd, c9b, do
     done[1] = max(done[1], y1)
 
 
-@njit
+@njit(inline="always")   # a call per pixel passing arrays is slow in Numba
 def _mix_contexts(k, d, v, xdim, cb, fwd, c9b, m, act_table, ctx, opinions, pred):
     """The models' contexts at pixel k (d and v are read below k only); with
     opinions, split by the second opinions about pred, the block's prediction."""
@@ -2692,14 +2701,14 @@ def _mix_contexts_count(opinions):
 
 @njit
 def _mix_init(m, n_symbols, n_contexts):
-    f = np.ones((m, n_contexts, n_symbols), dtype=np.int64)
+    f = np.ones((m, n_contexts, n_symbols), dtype=np.int32)
     total = np.full((m, n_contexts), n_symbols, dtype=np.int64)
     w = np.full(m, (1 << MIX_W_BITS) // m, dtype=np.int64)
     w[0] += (1 << MIX_W_BITS) - w.sum()
     return f, total, w
 
 
-@njit
+@njit(inline="always")   # a call per pixel passing arrays is slow in Numba
 def _mix_update(f, total, w, ctx, m, s, n_symbols, q):
     """Moves the weights (q: each model's scaled count of s), then counts s."""
     qm = 0
@@ -2771,7 +2780,7 @@ def _mix_state(data, m, n_symbols, n_contexts):
             np.zeros(m, dtype=np.int64), np.zeros(m, dtype=np.int64), np.zeros(m, dtype=np.int64))
 
 
-@njit
+@njit(inline="always")   # a call per pixel passing arrays is slow in Numba
 def _mix_decode_one(state, data, k, d, v, value, xdim, cb, fwd, c9b, m, act_table, opinions, pred):
     """Decodes delta k into d[k] (d and v must be filled below k; pred: the
     block's prediction at k, used with opinions at interior pixels)."""
