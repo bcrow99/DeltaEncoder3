@@ -100,9 +100,9 @@ class SimpleDecoder:
             def resize(c):
                 bgr[c] = rm.resize2(bgr[c], w, self.xdim, self.ydim)
             vs.parallel(3, resize)
-        rgb = np.stack([np.clip(dm.shift(v, self.pixel_shift), 0, 255).reshape(self.ydim, self.xdim) for v in bgr], axis=2)
+        rgb = dm.pack_image(bgr, self.xdim, self.ydim, self.pixel_shift)
         print("Image rebuilt in " + timer.elapsed() + ".")
-        return rgb.astype(np.uint8)
+        return rgb
 
 
 class SimpleReader:

@@ -88,6 +88,27 @@ def get_candidate_channels(blue, green, red):
     return c, mins
 
 
+@njit
+def _pack_image(c0, c1, c2, amount, out):
+    """out[k] = each channel's value at k shifted by amount (shift) and
+    clamped to 0..255."""
+    for k in range(c0.shape[0]):
+        for c in range(3):
+            v = c0[k] if c == 0 else (c1[k] if c == 1 else c2[k])
+            v = v >> -amount if amount < 0 else v << amount
+            out[k, c] = 0 if v < 0 else (255 if v > 255 else v)
+
+
+def pack_image(channels, xdim, ydim, amount):
+    """The three channels shifted by amount (shift) and clamped to 0..255, as
+    an (ydim, xdim, 3) uint8 image, in one pass (np.stack of
+    np.clip(shift(...)) gives the same, several times as slowly)."""
+    c = [np.ascontiguousarray(v, dtype=np.int64) for v in channels]
+    out = np.zeros((xdim * ydim, 3), dtype=np.uint8)
+    _pack_image(c[0], c[1], c[2], amount, out)
+    return out.reshape(ydim, xdim, 3)
+
+
 def get_blue_green_red(set_id, c0, c1, c2):
     """Rebuilds the three colour channels from a set's channels (with the
     difference channels' minimums already added back)."""
@@ -1155,8 +1176,10 @@ def _bias_corrections(v, xdim, ydim, bias_base):
 # and the r pixels to the left (r = LS_RADIUS for the table's LS) -- from 8
 # neighbours and, after the first channel, the previous channel at the
 # pixel, to its left and above. The window's sums are exact integers, kept
-# as it slides (each pixel's products computed once, kept in a ring of r + 1
-# rows); the fit (ridge 1, solved by L D L^T) is done in the
+# as it slides: per column, the sums of the window's rows; each pixel's
+# products are kept only while it is in the current row's part of the
+# window, and computed again when its row joins the columns and when it
+# leaves them, so the memory moved through per row stays small; the fit (ridge 1, solved by L D L^T) is done in the
 # Java's order, so both get the same values.
 # _ls_next must be called for every interior pixel in raster order, from
 # row 1 or from a row given to _ls_start; because the sums are exact, the
@@ -1187,47 +1210,55 @@ def _ls_features(v, ref, has_ref, xdim, nf, y, x, z):
 
 
 @njit(inline="always")   # a call per pixel passing arrays is slow in Numba
-def _ls_slot(y, x, xdim, nt, r):
-    return ((y % (r + 1)) * xdim + x) * nt
+def _ls_slot(x, nt, r):
+    """Where the products of the current row's pixel x are kept in ring (by column modulo r + 1)."""
+    return (x % (r + 1)) * nt
 
 
 @njit(inline="always")   # a call per pixel passing arrays is slow in Numba
-def _ls_products(v, ref, has_ref, xdim, nf, y, x, z, ring, r):
-    """Pixel (y, x)'s products into its slot in ring (r: the window radius)."""
+def _ls_products(v, ref, has_ref, xdim, nf, y, x, z, out, at):
+    """Pixel (y, x)'s products into out from at."""
     _ls_features(v, ref, has_ref, xdim, nf, y, x, z)
     m = nf + 2
-    t = _ls_slot(y, x, xdim, m * (m + 1) // 2, r)
+    t = at
     for i in range(m):
         zi = z[i]
         for j in range(i, m):
-            ring[t] = zi * z[j]
+            out[t] = zi * z[j]
             t += 1
 
 
 @njit
 def _ls_state(xdim, has_ref, r):
+    """(row, col, win, cur, ring, z, a, b, coef, dg): the window's state
+    (DeltaMapper.LeastSquares). col holds per column the window rows' sums of
+    products (an int32 holds r rows of them for any radius up to 255); ring
+    the products of the current row's last r + 1 pixels, and after them room
+    for one pixel's products computed again (when its row joins or leaves
+    the columns)."""
     nf = 11 if has_ref else 8
     m = nf + 2
     nt = m * (m + 1) // 2
-    return (np.full(1, -1, dtype=np.int64), np.zeros(xdim * nt, dtype=np.int64), np.zeros(nt, dtype=np.int64),
-            np.zeros(nt, dtype=np.int64), np.zeros((r + 1) * xdim * nt, dtype=np.int32), np.zeros(m, dtype=np.int64),
+    return (np.full(1, -1, dtype=np.int64), np.zeros(xdim * nt, dtype=np.int32), np.zeros(nt, dtype=np.int64),
+            np.zeros(nt, dtype=np.int64), np.zeros((r + 2) * nt, dtype=np.int32), np.zeros(m, dtype=np.int64),
             np.zeros((nf + 1, nf + 1)), np.zeros(nf + 1), np.zeros(nf + 1), np.zeros(nf + 1))
 
 
 @njit
 def _ls_start(v, ref, has_ref, xdim, y0, row, col, ring, z, r):
-    """Sets the window up as if the rows before y0 had been gone through."""
+    """Sets the window up as if the rows before y0 had been gone through:
+    the columns hold rows y0 - 1 - r .. y0 - 2 (from 1); row y0 - 1 joins
+    them at the first _ls_next."""
     nf = 11 if has_ref else 8
     m = nf + 2
     nt = m * (m + 1) // 2
-    for ty in range(max(1, y0 - 1 - r), y0):
+    gone = (r + 1) * nt
+    for ty in range(max(1, y0 - 1 - r), y0 - 1):
         for tx in range(1, xdim - 1):
-            _ls_products(v, ref, has_ref, xdim, nf, ty, tx, z, ring, r)
-            if ty <= y0 - 2:
-                c = tx * nt
-                sl = _ls_slot(ty, tx, xdim, nt, r)
-                for t in range(nt):
-                    col[c + t] += ring[sl + t]
+            _ls_products(v, ref, has_ref, xdim, nf, ty, tx, z, ring, gone)
+            c = tx * nt
+            for t in range(nt):
+                col[c + t] += ring[gone + t]
     row[0] = y0 - 1
 
 
@@ -1244,21 +1275,25 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, 
     # The sums are indexed with unsigned offsets: computed signed ones make
     # Numba check each index for wraparound, about 3 times as slow.
     if y != row[0]:
+        # The window's rows become y - r .. y - 1 (from 1): add row y - 1,
+        # drop row y - 1 - r (the products of both computed again, into the
+        # room after the row's pixels in ring).
+        gone = (r + 1) * nt
+        ug = np.uint64(gone)
         if y - 1 >= 1:
-            _ls_products(v, ref, has_ref, xdim, nf, y - 1, xdim - 2, z, ring, r)
             for tx in range(1, xdim - 1):
+                _ls_products(v, ref, has_ref, xdim, nf, y - 1, tx, z, ring, gone)
                 c = np.uint64(tx * nt)
-                sl = np.uint64(_ls_slot(y - 1, tx, xdim, nt, r))
                 for t in range(nt):
                     ut = np.uint64(t)
-                    col[c + ut] += ring[sl + ut]
+                    col[c + ut] += ring[ug + ut]
         if y - 1 - r >= 1:
             for tx in range(1, xdim - 1):
+                _ls_products(v, ref, has_ref, xdim, nf, y - 1 - r, tx, z, ring, gone)
                 c = np.uint64(tx * nt)
-                sl = np.uint64(_ls_slot(y - 1 - r, tx, xdim, nt, r))
                 for t in range(nt):
                     ut = np.uint64(t)
-                    col[c + ut] -= ring[sl + ut]
+                    col[c + ut] -= ring[ug + ut]
         row[0] = y
         win[:] = 0
         cur[:] = 0
@@ -1278,13 +1313,13 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, 
             for t in range(nt):
                 ut = np.uint64(t)
                 win[ut] -= col[c + ut]
-        _ls_products(v, ref, has_ref, xdim, nf, y, x - 1, z, ring, r)
-        sl = np.uint64(_ls_slot(y, x - 1, xdim, nt, r))
+        _ls_products(v, ref, has_ref, xdim, nf, y, x - 1, z, ring, _ls_slot(x - 1, nt, r))
+        sl = np.uint64(_ls_slot(x - 1, nt, r))
         for t in range(nt):
             ut = np.uint64(t)
             cur[ut] += ring[sl + ut]
         if x - 1 - r >= 1:
-            sl = np.uint64(_ls_slot(y, x - 1 - r, xdim, nt, r))
+            sl = np.uint64(_ls_slot(x - 1 - r, nt, r))
             for t in range(nt):
                 ut = np.uint64(t)
                 cur[ut] -= ring[sl + ut]
@@ -1961,7 +1996,7 @@ def _least_squares_rows(ref, has_ref, xdim, ydim, init, radius, data, value, pre
             dst[k] = init if k == 0 else delta[k] + p
 
 
-LS_DECODE_ROWS = 8   # the rows a channel decodes between looking at the channel before (get_values_from_least_squares_channels)
+LS_DECODE_ROWS = 1   # the rows a channel decodes between looking at the channel before (get_values_from_least_squares_channels): as the Java, a row at a time
 
 
 def get_values_from_least_squares_channels(mixed, xdim, ydim, init, radius):
