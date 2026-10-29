@@ -203,10 +203,18 @@ class SimpleCoder2:
         return encode(self.value_list, self.channel_min, self.delta_xdim, self.image_xdim, self.image_ydim, self.pixel_shift, self.pixel_quant, self.bands_used())
 
     def save(self, filename="foo"):
-        """Codes the image (encode) and writes it. Returns the file size."""
-        start = time.perf_counter()
-        data = self.encode()
-        took = time.perf_counter() - start
+        """Codes the image (encode), twice, and writes it; prints both times
+        (the first includes compiling the code: Numba's, the first time it
+        runs, or loading it from the cache). Returns the file size."""
+        took = []
+        data = None
+        for _ in range(2):
+            start = time.perf_counter()
+            got = self.encode()
+            took.append(time.perf_counter() - start)
+            if data is not None and got != data:
+                print("WARNING: the second coding differs from the first.")
+            data = got
         with open(filename, "wb") as f:
             f.write(data)
         n = self.bands_used()
@@ -217,7 +225,9 @@ class SimpleCoder2:
             print("Saved %s: %s bytes (%s)" % (os.path.basename(filename), format(len(data), ","), describe_bands(n, rows)))
         else:
             print("Saved %s: %s bytes" % (os.path.basename(filename), format(len(data), ",")))
-        print("Coded in %s (%d x %d, %s pixels)" % (vs.format_duration(took), w, rows, format(w * rows, ",")))
+        print("Coded %d x %d (%s pixels)" % (w, rows, format(w * rows, ",")))
+        print("Run time plus compile time: " + vs.format_duration(took[0]))
+        print("Run time only:              " + vs.format_duration(took[1]))
         print("Original compression rate: %.4f" % (self.file_length / raw))
         print("Output  compression rate:  %.4f" % (len(data) / raw))
         print()

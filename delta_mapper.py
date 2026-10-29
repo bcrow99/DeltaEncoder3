@@ -1245,14 +1245,15 @@ def _ls_state(xdim, has_ref, r):
     r rows of them for any radius up to 255); win the window's sums (the
     columns' part and the current row's); ring the products of the current
     row's pixels so far, by column (kept so that when the row joins the
-    columns they needn't be computed again), and after them room for one
-    pixel's products computed again (when its row joins or leaves the
-    columns)."""
+    columns they needn't be computed again), after them room for one pixel's
+    products computed again (when its row joins the columns), and after that
+    a row's products computed again, by column (when it leaves the columns,
+    or joins them without its products kept)."""
     nf = 11 if has_ref else 8
     m = nf + 2
     nt = m * (m + 1) // 2
     return (np.full(4, -1, dtype=np.int64), np.zeros(xdim * nt, dtype=np.int32), np.zeros(nt, dtype=np.int64),
-            np.zeros((xdim + 1) * nt, dtype=np.int32), np.zeros(m, dtype=np.int64),
+            np.zeros((2 * xdim + 1) * nt, dtype=np.int32), np.zeros(m, dtype=np.int64),
             np.zeros((nf + 1, nf + 1)), np.zeros(nf + 1), np.zeros(nf + 1), np.zeros(nf + 1))
 
 
@@ -1293,28 +1294,35 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, ring, z, a, b, coef, dg, f
         # which no _ls_next adds to the current row, and unless the window
         # started at row y), drop row y - 1 - r (its products computed again,
         # into the room after the row's pixels in ring).
+        # Each as one loop over the row's columns (1 to xdim - 2): ring, the
+        # leaving row's products (after the row's pixels' and the gone
+        # pixel's room in ring) and col are laid out alike, and a long simple
+        # loop is one LLVM vectorises.
         gone = xdim * nt
         ug = np.uint64(gone)
+        lv = (xdim + 1) * nt
+        ulv = np.uint64(lv)
+        lo = np.uint64(nt)
+        hi = np.uint64((xdim - 1) * nt)
         if y - 1 >= 1:
-            kept = row[1] == y - 1
-            for tx in range(1, xdim - 1):
-                c = np.uint64(tx * nt)
-                if kept and tx != xdim - 2:
-                    for t in range(nt):
-                        ut = np.uint64(t)
-                        col[c + ut] += ring[c + ut]
-                else:
-                    _ls_products(v, ref, has_ref, xdim, nf, y - 1, tx, z, ring, gone, row)
-                    for t in range(nt):
-                        ut = np.uint64(t)
-                        col[c + ut] += ring[ug + ut]
-        if y - 1 - r >= 1:
-            for tx in range(1, xdim - 1):
-                _ls_products(v, ref, has_ref, xdim, nf, y - 1 - r, tx, z, ring, gone, row)
-                c = np.uint64(tx * nt)
+            if row[1] == y - 1:
+                last = np.uint64((xdim - 2) * nt)
+                for i in range(lo, last):
+                    col[i] += ring[i]
+                _ls_products(v, ref, has_ref, xdim, nf, y - 1, xdim - 2, z, ring, gone, row)
                 for t in range(nt):
                     ut = np.uint64(t)
-                    col[c + ut] -= ring[ug + ut]
+                    col[last + ut] += ring[ug + ut]
+            else:
+                for tx in range(1, xdim - 1):
+                    _ls_products(v, ref, has_ref, xdim, nf, y - 1, tx, z, ring, lv + tx * nt, row)
+                for i in range(lo, hi):
+                    col[i] += ring[ulv + i]
+        if y - 1 - r >= 1:
+            for tx in range(1, xdim - 1):
+                _ls_products(v, ref, has_ref, xdim, nf, y - 1 - r, tx, z, ring, lv + tx * nt, row)
+            for i in range(lo, hi):
+                col[i] -= ring[ulv + i]
         row[0] = y
         row[1] = y
         row[3] = 0
@@ -1325,26 +1333,38 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, ring, z, a, b, coef, dg, f
                 ut = np.uint64(t)
                 win[ut] += col[c + ut]
     else:
-        if x + r <= xdim - 2:
-            c = np.uint64((x + r) * nt)
-            for t in range(nt):
-                ut = np.uint64(t)
-                win[ut] += col[c + ut]
-        if x - r - 1 >= 1:
-            c = np.uint64((x - r - 1) * nt)
-            for t in range(nt):
-                ut = np.uint64(t)
-                win[ut] -= col[c + ut]
+        # The column joining the window and the one leaving it, and the
+        # current row's pixel joining and leaving, in one pass where all four
+        # apply (as the Java; exact either way here).
         _ls_products(v, ref, has_ref, xdim, nf, y, x - 1, z, ring, _ls_slot(x - 1, nt), row)
-        sl = np.uint64(_ls_slot(x - 1, nt))
-        for t in range(nt):
-            ut = np.uint64(t)
-            win[ut] += ring[sl + ut]
-        if x - 1 - r >= 1:
-            sl = np.uint64(_ls_slot(x - 1 - r, nt))
+        if x - r - 1 >= 1 and x + r <= xdim - 2:
+            ca = np.uint64((x + r) * nt)
+            cb = np.uint64((x - r - 1) * nt)
+            sa = np.uint64(_ls_slot(x - 1, nt))
+            sb = np.uint64(_ls_slot(x - 1 - r, nt))
             for t in range(nt):
                 ut = np.uint64(t)
-                win[ut] -= ring[sl + ut]
+                win[ut] += (col[ca + ut] - col[cb + ut]) + (ring[sa + ut] - ring[sb + ut])
+        else:
+            if x + r <= xdim - 2:
+                c = np.uint64((x + r) * nt)
+                for t in range(nt):
+                    ut = np.uint64(t)
+                    win[ut] += col[c + ut]
+            if x - r - 1 >= 1:
+                c = np.uint64((x - r - 1) * nt)
+                for t in range(nt):
+                    ut = np.uint64(t)
+                    win[ut] -= col[c + ut]
+            sl = np.uint64(_ls_slot(x - 1, nt))
+            for t in range(nt):
+                ut = np.uint64(t)
+                win[ut] += ring[sl + ut]
+            if x - 1 - r >= 1:
+                sl = np.uint64(_ls_slot(x - 1 - r, nt))
+                for t in range(nt):
+                    ut = np.uint64(t)
+                    win[ut] -= ring[sl + ut]
     if not fit:
         return 0, 0
 

@@ -18,6 +18,7 @@ The decoding (class SimpleDecoder2) is separate from the window:
 """
 
 import sys
+import time
 
 import numpy as np
 
@@ -75,8 +76,8 @@ class SimpleDecoder2:
         decoded at the same time (each band's channels at the same time too,
         each a few rows behind the one before: a channel's fit and contexts
         use the ones before it), then blue, green and red rebuilt from them,
-        resized and shifted."""
-        timer = vs.Timer()
+        resized and shifted. Its time (seconds) is left in took."""
+        start = time.perf_counter()
         w, h = self.size
         n = self.bands
         radius = [sw2.RADIUS] * 3
@@ -95,7 +96,7 @@ class SimpleDecoder2:
                 bgr[c] = rm.resize2(bgr[c], w, self.xdim, self.ydim)
             vs.parallel(3, resize)
         rgb = dm.pack_image(bgr, self.xdim, self.ydim, self.pixel_shift)
-        print("Image rebuilt in " + timer.elapsed() + ".")
+        self.took = time.perf_counter() - start
         return rgb
 
 
@@ -113,6 +114,10 @@ class SimpleReader2:
         self.view.make_view_menu()
         self.view.set_status("decoding…")
         self.view.show_window()
+        # Decoded twice, the times of both printed: the first includes
+        # compiling the code (Numba's, the first time it runs, or loading it
+        # from the cache), the second is the run time only. The image shows
+        # after the first.
         vs.run_in_background(d.decode, self.done)
 
     def done(self, rgb, error):
@@ -120,9 +125,22 @@ class SimpleReader2:
             self.view.set_status("decode failed")
             vs.show_error(self.view, "Can't decode %s: %r" % (self.decoder.filename, error))
             return
+        self.first, self.first_time = rgb, self.decoder.took
         self.view.set_image(rgb)
         self.view.set_status(None)
         self.view.fit_and_shrink()
+        vs.run_in_background(self.decoder.decode, self.done_again)
+
+    def done_again(self, rgb, error):
+        if error is not None:
+            print("Second decoding failed: %r" % error)
+            return
+        if not np.array_equal(rgb, self.first):
+            print("WARNING: the second decoding differs from the first.")
+        d = self.decoder
+        print("Image rebuilt (%d x %d)." % (d.xdim, d.ydim))
+        print("Run time plus compile time: " + vs.format_duration(self.first_time))
+        print("Run time only:              " + vs.format_duration(d.took))
 
 
 def main():
