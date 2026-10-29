@@ -43,7 +43,7 @@ FORMAT_VERSION = 1
 SET_ID = 7             # the channel set coded: green, blue-green, red-green (delta_mapper.get_channels)
 CHANNELS = tuple(dm.get_channels(SET_ID))   # its channels, in coding order (delta_mapper's channel ids)
 RADIUS = 10            # the least-squares window radius, for every channel
-EVERY = 2              # how often along a row the fit is solved: at every EVERY-th pixel, the pixels between using the last solution
+EVERY = 3              # how often along a row the fit is solved: at every EVERY-th pixel, the pixels between using the last solution
 MAX_BANDS = 16         # the most bands Save offers
 BAND_MIN_ROWS = 64     # the fewest rows (of the quantized image) a band may have
 
