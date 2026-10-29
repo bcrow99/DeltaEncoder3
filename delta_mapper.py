@@ -1176,10 +1176,10 @@ def _bias_corrections(v, xdim, ydim, bias_base):
 # and the r pixels to the left (r = LS_RADIUS for the table's LS) -- from 8
 # neighbours and, after the first channel, the previous channel at the
 # pixel, to its left and above. The window's sums are exact integers, kept
-# as it slides: per column, the sums of the window's rows; each pixel's
-# products are kept only while it is in the current row's part of the
-# window, and computed again when its row joins the columns and when it
-# leaves them, so the memory moved through per row stays small; the fit (ridge 1, solved by L D L^T) is done in the
+# as it slides: per column, the sums of the window's rows; the current
+# row's pixels' products are kept (one row of them) and added to the columns
+# when the row joins them, and computed again when the row leaves them, so
+# the memory moved through per row stays small; the fit (ridge 1, solved by L D L^T) is done in the
 # Java's order, so both get the same values.
 # _ls_next must be called for every interior pixel in raster order, from
 # row 1 or from a row given to _ls_start; because the sums are exact, the
@@ -1210,15 +1210,22 @@ def _ls_features(v, ref, has_ref, xdim, nf, y, x, z):
 
 
 @njit(inline="always")   # a call per pixel passing arrays is slow in Numba
-def _ls_slot(x, nt, r):
-    """Where the products of the current row's pixel x are kept in ring (by column modulo r + 1)."""
-    return (x % (r + 1)) * nt
+def _ls_slot(x, nt):
+    """Where the products of the current row's pixel x are kept in ring (by column)."""
+    return x * nt
 
 
 @njit(inline="always")   # a call per pixel passing arrays is slow in Numba
-def _ls_products(v, ref, has_ref, xdim, nf, y, x, z, out, at):
-    """Pixel (y, x)'s products into out from at."""
-    _ls_features(v, ref, has_ref, xdim, nf, y, x, z)
+def _ls_products(v, ref, has_ref, xdim, nf, y, x, z, out, at, row):
+    """Pixel (y, x)'s products into out from at. The fit at a pixel leaves
+    its features in z (row[2] is the pixel): only its value (unknown to a
+    decoder then) is needed for its products."""
+    k = y * xdim + x
+    if row[2] == k:
+        z[nf + 1] = v[k]
+    else:
+        _ls_features(v, ref, has_ref, xdim, nf, y, x, z)
+        row[2] = k
     m = nf + 2
     t = at
     for i in range(m):
@@ -1230,17 +1237,21 @@ def _ls_products(v, ref, has_ref, xdim, nf, y, x, z, out, at):
 
 @njit
 def _ls_state(xdim, has_ref, r):
-    """(row, col, win, cur, ring, z, a, b, coef, dg): the window's state
-    (DeltaMapper.LeastSquares). col holds per column the window rows' sums of
-    products (an int32 holds r rows of them for any radius up to 255); ring
-    the products of the current row's last r + 1 pixels, and after them room
-    for one pixel's products computed again (when its row joins or leaves
-    the columns)."""
+    """(row, col, win, ring, z, a, b, coef, dg): the window's state
+    (DeltaMapper.LeastSquares). row holds the row of the last pixel, the row
+    whose products ring holds and the pixel whose features z holds (-1 for
+    none); col per column the window rows' sums of products (an int32 holds
+    r rows of them for any radius up to 255); win the window's sums (the
+    columns' part and the current row's); ring the products of the current
+    row's pixels so far, by column (kept so that when the row joins the
+    columns they needn't be computed again), and after them room for one
+    pixel's products computed again (when its row joins or leaves the
+    columns)."""
     nf = 11 if has_ref else 8
     m = nf + 2
     nt = m * (m + 1) // 2
-    return (np.full(1, -1, dtype=np.int64), np.zeros(xdim * nt, dtype=np.int32), np.zeros(nt, dtype=np.int64),
-            np.zeros(nt, dtype=np.int64), np.zeros((r + 2) * nt, dtype=np.int32), np.zeros(m, dtype=np.int64),
+    return (np.full(3, -1, dtype=np.int64), np.zeros(xdim * nt, dtype=np.int32), np.zeros(nt, dtype=np.int64),
+            np.zeros((xdim + 1) * nt, dtype=np.int32), np.zeros(m, dtype=np.int64),
             np.zeros((nf + 1, nf + 1)), np.zeros(nf + 1), np.zeros(nf + 1), np.zeros(nf + 1))
 
 
@@ -1252,10 +1263,10 @@ def _ls_start(v, ref, has_ref, xdim, y0, row, col, ring, z, r):
     nf = 11 if has_ref else 8
     m = nf + 2
     nt = m * (m + 1) // 2
-    gone = (r + 1) * nt
+    gone = xdim * nt
     for ty in range(max(1, y0 - 1 - r), y0 - 1):
         for tx in range(1, xdim - 1):
-            _ls_products(v, ref, has_ref, xdim, nf, ty, tx, z, ring, gone)
+            _ls_products(v, ref, has_ref, xdim, nf, ty, tx, z, ring, gone, row)
             c = tx * nt
             for t in range(nt):
                 col[c + t] += ring[gone + t]
@@ -1263,7 +1274,7 @@ def _ls_start(v, ref, has_ref, xdim, y0, row, col, ring, z, r):
 
 
 @njit(inline="always")   # a call per pixel passing arrays is slow in Numba
-def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg, fit, r):
+def _ls_next(v, ref, has_ref, xdim, k, row, col, win, ring, z, a, b, coef, dg, fit, r):
     """Moves the window (radius r) to interior pixel k and, if fit, returns
     the least-squares primitives there, (LS, LS wide) (the decoder fits only
     where they are used)."""
@@ -1275,28 +1286,36 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, 
     # The sums are indexed with unsigned offsets: computed signed ones make
     # Numba check each index for wraparound, about 3 times as slow.
     if y != row[0]:
-        # The window's rows become y - r .. y - 1 (from 1): add row y - 1,
-        # drop row y - 1 - r (the products of both computed again, into the
-        # room after the row's pixels in ring).
-        gone = (r + 1) * nt
+        # The window's rows become y - r .. y - 1 (from 1): add row y - 1
+        # (its products kept in ring as it went by, but for its last pixel's,
+        # which no _ls_next adds to the current row, and unless the window
+        # started at row y), drop row y - 1 - r (its products computed again,
+        # into the room after the row's pixels in ring).
+        gone = xdim * nt
         ug = np.uint64(gone)
         if y - 1 >= 1:
+            kept = row[1] == y - 1
             for tx in range(1, xdim - 1):
-                _ls_products(v, ref, has_ref, xdim, nf, y - 1, tx, z, ring, gone)
                 c = np.uint64(tx * nt)
-                for t in range(nt):
-                    ut = np.uint64(t)
-                    col[c + ut] += ring[ug + ut]
+                if kept and tx != xdim - 2:
+                    for t in range(nt):
+                        ut = np.uint64(t)
+                        col[c + ut] += ring[c + ut]
+                else:
+                    _ls_products(v, ref, has_ref, xdim, nf, y - 1, tx, z, ring, gone, row)
+                    for t in range(nt):
+                        ut = np.uint64(t)
+                        col[c + ut] += ring[ug + ut]
         if y - 1 - r >= 1:
             for tx in range(1, xdim - 1):
-                _ls_products(v, ref, has_ref, xdim, nf, y - 1 - r, tx, z, ring, gone)
+                _ls_products(v, ref, has_ref, xdim, nf, y - 1 - r, tx, z, ring, gone, row)
                 c = np.uint64(tx * nt)
                 for t in range(nt):
                     ut = np.uint64(t)
                     col[c + ut] -= ring[ug + ut]
         row[0] = y
+        row[1] = y
         win[:] = 0
-        cur[:] = 0
         for tx in range(1, min(xdim - 2, 1 + r) + 1):
             c = np.uint64(tx * nt)
             for t in range(nt):
@@ -1313,31 +1332,31 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, 
             for t in range(nt):
                 ut = np.uint64(t)
                 win[ut] -= col[c + ut]
-        _ls_products(v, ref, has_ref, xdim, nf, y, x - 1, z, ring, _ls_slot(x - 1, nt, r))
-        sl = np.uint64(_ls_slot(x - 1, nt, r))
+        _ls_products(v, ref, has_ref, xdim, nf, y, x - 1, z, ring, _ls_slot(x - 1, nt), row)
+        sl = np.uint64(_ls_slot(x - 1, nt))
         for t in range(nt):
             ut = np.uint64(t)
-            cur[ut] += ring[sl + ut]
+            win[ut] += ring[sl + ut]
         if x - 1 - r >= 1:
-            sl = np.uint64(_ls_slot(x - 1 - r, nt, r))
+            sl = np.uint64(_ls_slot(x - 1 - r, nt))
             for t in range(nt):
                 ut = np.uint64(t)
-                cur[ut] -= ring[sl + ut]
+                win[ut] -= ring[sl + ut]
     if not fit:
         return 0, 0
 
     n = nf + 1
     pa = _ls_at(v, y, x - 1, xdim); pb = _ls_at(v, y - 1, x, xdim)
     pc = _ls_at(v, y - 1, x - 1, xdim); pd = _ls_at(v, y - 1, x + 1, xdim)
-    cnt = win[nf * m - nf * (nf - 1) // 2] + cur[nf * m - nf * (nf - 1) // 2]
+    cnt = win[nf * m - nf * (nf - 1) // 2]
     if cnt < 2 * n:
         return pa, pa
     # The normal equations' lower triangle (ridge 1), then L D L^T as in the Java.
     for i in range(n):
         base = i * m - i * (i - 1) // 2
         for j in range(i, n):
-            a[j, i] = float(win[base + j - i] + cur[base + j - i])
-        b[i] = float(win[base + m - 1 - i] + cur[base + m - 1 - i])
+            a[j, i] = float(win[base + j - i])
+        b[i] = float(win[base + m - 1 - i])
         a[i, i] += 1.0
     for j in range(n):
         sv = a[j, j]
@@ -1364,6 +1383,7 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, 
             sv -= a[q, i] * coef[q]
         coef[i] = sv
     _ls_features(v, ref, has_ref, xdim, nf, y, x, z)
+    row[2] = k
     p = 0.0
     for i in range(n):
         p += coef[i] * z[i]
@@ -1384,12 +1404,12 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, 
 
 @njit
 def _ls_band(v, ref, has_ref, xdim, y0, y1, out, wide, r):
-    row, col, win, cur, ring, z, a, b, coef, dg = _ls_state(xdim, has_ref, r)
+    row, col, win, ring, z, a, b, coef, dg = _ls_state(xdim, has_ref, r)
     _ls_start(v, ref, has_ref, xdim, y0, row, col, ring, z, r)
     for y in range(y0, y1):
         for x in range(1, xdim - 1):
             k = y * xdim + x
-            out[k], wide[k] = _ls_next(v, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg, True, r)
+            out[k], wide[k] = _ls_next(v, ref, has_ref, xdim, k, row, col, win, ring, z, a, b, coef, dg, True, r)
 
 
 _LS_CACHE = []        # recently computed planes: (xdim, radius, channel copy, previous channel copy or None, (LS, LS wide))
@@ -1859,7 +1879,7 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
     bsum = np.zeros((4, 729), dtype=np.int64)
     bcount = np.zeros((4, 729), dtype=np.int64)
     prim = np.zeros(ALL_PRIMITIVES, dtype=np.int64)
-    row, col, win, cur, ring, z, a, b, coef, dg = _ls_state(xdim, has_ref, LS_RADIUS)
+    row, col, win, ring, z, a, b, coef, dg = _ls_state(xdim, has_ref, LS_RADIUS)
     # One pixel at a time, with one call site of each helper (the per-pixel
     # ones are inlined): the prediction (row 0 horizontal, column 0
     # vertical, the last column horizontal, the interior the block's
@@ -1879,7 +1899,7 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
             else:
                 pid = ids[mp[mrow + (x - 1) // bwd]]
                 if use_ls:
-                    corr[4, k], corr[5, k] = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg,
+                    corr[4, k], corr[5, k] = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, ring, z, a, b, coef, dg,
                                                       first[pid] == LS_FIRST or second[pid] == LS_FIRST
                                                       or first[pid] == LS_WIDE or second[pid] == LS_WIDE, LS_RADIUS)
                 _bias_prepare(dst, k, xdim, ctx, corr, bsum, bcount)
@@ -1988,7 +2008,7 @@ def _least_squares_rows(ref, has_ref, xdim, ydim, init, radius, data, value, pre
     fit's (_ls_state); cross, cb, fwd, c9b and earlier hold the earlier
     channels' terms, filled here as far as row y1 (_mix_earlier_rows; the
     earlier channels must be decoded to row y1)."""
-    row, col, win, cur, ring, z, a, b, coef, dg = ls
+    row, col, win, ring, z, a, b, coef, dg = ls
     if m == 3:
         _mix_earlier_rows(previous, xdim, ydim, MIX_CROSS_TABLE, cross, cb, fwd, c9b, earlier, y1)
     # One pixel at a time, with one call site of each helper (they are
@@ -2005,7 +2025,7 @@ def _least_squares_rows(ref, has_ref, xdim, ydim, init, radius, data, value, pre
             elif x == xdim - 1:
                 p = dst[k - 1]
             else:
-                p = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, cur, ring, z, a, b, coef, dg, True, radius)[1]
+                p = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, ring, z, a, b, coef, dg, True, radius)[1]
                 pred = p
             _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, pred)
             dst[k] = init if k == 0 else delta[k] + p
