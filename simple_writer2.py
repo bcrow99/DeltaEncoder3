@@ -4,9 +4,10 @@ simple_writer2.py version 1.0 -- SimpleWriter2.java for Python (PySide6).
 
 simple_writer.py without the analysis, for speed: one channel set, green,
 blue-green and red-green (SET_ID; the set the analysis picks most often, and
-within about 1% of its choice on the test images), every interior pixel predicted by the least-squares fit (the wide
-clamp) with one window radius, RADIUS, for every channel and image, and the
-deltas mixed-context coded with the second opinions
+within about 1% of its choice on the test images), every interior pixel
+predicted by the least-squares fit (the wide clamp) with one window radius,
+RADIUS, for every channel and image, solved at every EVERY-th pixel along a
+row, and the deltas mixed-context coded with the second opinions
 (delta_mapper.pack_mixed_deltas). As in simple_writer.py, a channel's fit
 uses the channel before it and its contexts the deltas of the channels
 before it. Nothing is fitted or coded until Save. Pixel Resolution resizes
@@ -42,6 +43,7 @@ FORMAT_VERSION = 1
 SET_ID = 7             # the channel set coded: green, blue-green, red-green (delta_mapper.get_channels)
 CHANNELS = tuple(dm.get_channels(SET_ID))   # its channels, in coding order (delta_mapper's channel ids)
 RADIUS = 10            # the least-squares window radius, for every channel
+EVERY = 2              # how often along a row the fit is solved: at every EVERY-th pixel, the pixels between using the last solution
 MAX_BANDS = 16         # the most bands Save offers
 BAND_MIN_ROWS = 64     # the fewest rows (of the quantized image) a band may have
 
@@ -52,11 +54,12 @@ def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, 
     (SimpleWriter2.encode). Format 1. Header: FORMAT_ID, FORMAT_VERSION,
     width, height (unsigned shorts), pixel_shift, pixel_quant; per channel
     (coding order) int min; the number of bands n (an unsigned byte), n int
-    lengths, and the n bands. Band b is rows band_start(b) to band_start(b + 1) of the
-    quantized image, coded as an image of its own (the fit and the contexts
-    start again at its top): per channel (green, blue-green, red-green), int init, then
-    the least-squares deltas (radius RADIUS) mixed-context coded with the
-    second opinions (pack_mixed_deltas). Channels 1 and 2 use the ones before
+    lengths, and the n bands. Band b is rows band_start(b) to
+    band_start(b + 1) of the quantized image, coded as an image of its own
+    (the fit and the contexts start again at its top): per channel (green,
+    blue-green, red-green), int init, then the least-squares deltas (radius
+    RADIUS, solved at every EVERY-th pixel along a row) mixed-context coded
+    with the second opinions (pack_mixed_deltas). Channels 1 and 2 use the ones before
     them (their values in the fit, their deltas as context), so a band's
     channels are decoded in order, each a few rows behind the one before; the
     bands can be decoded at the same time.
@@ -87,10 +90,10 @@ def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, 
         try:
             for i in range(3):
                 ref = value[i - 1] if i > 0 else None
-                whole = dm.get_least_squares_deltas(value[i], ref, xdim, rows, RADIUS)
+                whole = dm.get_least_squares_deltas(value[i], ref, xdim, rows, RADIUS, EVERY)
                 for b in range(n):
                     y0, y1 = band_start(b, n, rows), band_start(b + 1, n, rows)
-                    d[b][i] = whole if n == 1 else dm.get_least_squares_band_deltas(whole, value[i], ref, xdim, y0, y1, RADIUS)
+                    d[b][i] = whole if n == 1 else dm.get_least_squares_band_deltas(whole, value[i], ref, xdim, y0, y1, RADIUS, EVERY)
                 jobs += [coder.submit(code, b, i) for b in range(n)]
         finally:
             for j in jobs:

@@ -1239,8 +1239,9 @@ def _ls_products(v, ref, has_ref, xdim, nf, y, x, z, out, at, row):
 def _ls_state(xdim, has_ref, r):
     """(row, col, win, ring, z, a, b, coef, dg): the window's state
     (DeltaMapper.LeastSquares). row holds the row of the last pixel, the row
-    whose products ring holds and the pixel whose features z holds (-1 for
-    none); col per column the window rows' sums of products (an int32 holds
+    whose products ring holds, the pixel whose features z holds (-1 for
+    none) and whether coef holds a solution from this row (for _ls_next's
+    every > 1); col per column the window rows' sums of products (an int32 holds
     r rows of them for any radius up to 255); win the window's sums (the
     columns' part and the current row's); ring the products of the current
     row's pixels so far, by column (kept so that when the row joins the
@@ -1250,7 +1251,7 @@ def _ls_state(xdim, has_ref, r):
     nf = 11 if has_ref else 8
     m = nf + 2
     nt = m * (m + 1) // 2
-    return (np.full(3, -1, dtype=np.int64), np.zeros(xdim * nt, dtype=np.int32), np.zeros(nt, dtype=np.int64),
+    return (np.full(4, -1, dtype=np.int64), np.zeros(xdim * nt, dtype=np.int32), np.zeros(nt, dtype=np.int64),
             np.zeros((xdim + 1) * nt, dtype=np.int32), np.zeros(m, dtype=np.int64),
             np.zeros((nf + 1, nf + 1)), np.zeros(nf + 1), np.zeros(nf + 1), np.zeros(nf + 1))
 
@@ -1274,10 +1275,11 @@ def _ls_start(v, ref, has_ref, xdim, y0, row, col, ring, z, r):
 
 
 @njit(inline="always")   # a call per pixel passing arrays is slow in Numba
-def _ls_next(v, ref, has_ref, xdim, k, row, col, win, ring, z, a, b, coef, dg, fit, r):
+def _ls_next(v, ref, has_ref, xdim, k, row, col, win, ring, z, a, b, coef, dg, fit, r, every):
     """Moves the window (radius r) to interior pixel k and, if fit, returns
     the least-squares primitives there, (LS, LS wide) (the decoder fits only
-    where they are used)."""
+    where they are used), solving the fit at every every-th pixel along a
+    row (1: at every pixel)."""
     nf = 11 if has_ref else 8
     m = nf + 2
     nt = m * (m + 1) // 2
@@ -1315,6 +1317,7 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, ring, z, a, b, coef, dg, f
                     col[c + ut] -= ring[ug + ut]
         row[0] = y
         row[1] = y
+        row[3] = 0
         win[:] = 0
         for tx in range(1, min(xdim - 2, 1 + r) + 1):
             c = np.uint64(tx * nt)
@@ -1348,40 +1351,46 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, ring, z, a, b, coef, dg, f
     n = nf + 1
     pa = _ls_at(v, y, x - 1, xdim); pb = _ls_at(v, y - 1, x, xdim)
     pc = _ls_at(v, y - 1, x - 1, xdim); pd = _ls_at(v, y - 1, x + 1, xdim)
-    cnt = win[nf * m - nf * (nf - 1) // 2]
-    if cnt < 2 * n:
-        return pa, pa
-    # The normal equations' lower triangle (ridge 1), then L D L^T as in the Java.
-    for i in range(n):
-        base = i * m - i * (i - 1) // 2
-        for j in range(i, n):
-            a[j, i] = float(win[base + j - i])
-        b[i] = float(win[base + m - 1 - i])
-        a[i, i] += 1.0
-    for j in range(n):
-        sv = a[j, j]
-        for q in range(j):
-            sv -= a[j, q] * a[j, q] * dg[q]
-        if sv < 1e-9:
+    # The fit is solved at every every-th pixel along a row (row[3]: coef
+    # holds a solution from this row), the pixels between using the last.
+    if row[3] != 1 or (x - 1) % every == 0:
+        row[3] = 0
+        cnt = win[nf * m - nf * (nf - 1) // 2]
+        if cnt < 2 * n:
             return pa, pa
-        dg[j] = sv
-        for i in range(j + 1, n):
-            t_ = a[i, j]
+        # The normal equations' lower triangle (ridge 1), then L D L^T as in the Java.
+        for i in range(n):
+            base = i * m - i * (i - 1) // 2
+            for j in range(i, n):
+                a[j, i] = float(win[base + j - i])
+            b[i] = float(win[base + m - 1 - i])
+            a[i, i] += 1.0
+        for j in range(n):
+            sv = a[j, j]
             for q in range(j):
-                t_ -= a[i, q] * a[j, q] * dg[q]
-            a[i, j] = t_ / sv
-    for i in range(n):
-        sv = b[i]
-        for q in range(i):
-            sv -= a[i, q] * coef[q]
-        coef[i] = sv
-    for i in range(n):
-        coef[i] /= dg[i]
-    for i in range(n - 1, -1, -1):
-        sv = coef[i]
-        for q in range(i + 1, n):
-            sv -= a[q, i] * coef[q]
-        coef[i] = sv
+                sv -= a[j, q] * a[j, q] * dg[q]
+            if sv < 1e-9:
+                return pa, pa
+            dg[j] = sv
+            for i in range(j + 1, n):
+                t_ = a[i, j]
+                for q in range(j):
+                    t_ -= a[i, q] * a[j, q] * dg[q]
+                a[i, j] = t_ / sv
+        for i in range(n):
+            sv = b[i]
+            for q in range(i):
+                sv -= a[i, q] * coef[q]
+            coef[i] = sv
+        for i in range(n):
+            coef[i] /= dg[i]
+        for i in range(n - 1, -1, -1):
+            sv = coef[i]
+            for q in range(i + 1, n):
+                sv -= a[q, i] * coef[q]
+            coef[i] = sv
+        if every > 1:
+            row[3] = 1
     _ls_features(v, ref, has_ref, xdim, nf, y, x, z)
     row[2] = k
     p = 0.0
@@ -1403,13 +1412,13 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, ring, z, a, b, coef, dg, f
 
 
 @njit
-def _ls_band(v, ref, has_ref, xdim, y0, y1, out, wide, r):
+def _ls_band(v, ref, has_ref, xdim, y0, y1, out, wide, r, every):
     row, col, win, ring, z, a, b, coef, dg = _ls_state(xdim, has_ref, r)
     _ls_start(v, ref, has_ref, xdim, y0, row, col, ring, z, r)
     for y in range(y0, y1):
         for x in range(1, xdim - 1):
             k = y * xdim + x
-            out[k], wide[k] = _ls_next(v, ref, has_ref, xdim, k, row, col, win, ring, z, a, b, coef, dg, True, r)
+            out[k], wide[k] = _ls_next(v, ref, has_ref, xdim, k, row, col, win, ring, z, a, b, coef, dg, True, r, every)
 
 
 _LS_CACHE = []        # recently computed planes: (xdim, radius, channel copy, previous channel copy or None, (LS, LS wide))
@@ -1418,13 +1427,13 @@ _LS_CACHE_LOCK = threading.Lock()
 _LS_POOL = ThreadPoolExecutor(_CPUS)   # its own: PixelSources are made in _ROW_POOL's threads
 
 
-def _ls_planes(v, ref, has_ref, xdim, ydim, radius):
+def _ls_planes(v, ref, has_ref, xdim, ydim, radius, every=1):
     """(LS, LS wide) for the whole channel with the window of the given
     radius, in bands of rows computed in parallel (DeltaMapper.LeastSquares.plane)."""
     out = np.zeros(v.shape[0], dtype=np.int16)
     wide = np.zeros(v.shape[0], dtype=np.int16)
     band = max(4 * (radius + 1), (ydim - 1 + _CPUS - 1) // _CPUS)
-    for f in [_LS_POOL.submit(_ls_band, v, ref, has_ref, xdim, y0, min(ydim, y0 + band), out, wide, radius) for y0 in range(1, ydim, band)]:
+    for f in [_LS_POOL.submit(_ls_band, v, ref, has_ref, xdim, y0, min(ydim, y0 + band), out, wide, radius, every) for y0 in range(1, ydim, band)]:
         f.result()
     return out, wide
 
@@ -1901,7 +1910,7 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
                 if use_ls:
                     corr[4, k], corr[5, k] = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, ring, z, a, b, coef, dg,
                                                       first[pid] == LS_FIRST or second[pid] == LS_FIRST
-                                                      or first[pid] == LS_WIDE or second[pid] == LS_WIDE, LS_RADIUS)
+                                                      or first[pid] == LS_WIDE or second[pid] == LS_WIDE, LS_RADIUS, 1)
                 _bias_prepare(dst, k, xdim, ctx, corr, bsum, bcount)
                 _all_primitives(dst, ref, has_ref, corr, k, xdim, prim)
                 i = first[pid]
@@ -1970,13 +1979,13 @@ def get_values_from_mixed_deltas(value, coded, previous, xdim, ydim, init, mp, r
 WINDOW_RADII = [4, 8, 16]   # the radii survey_windows tries, smallest first
 
 
-def get_least_squares_deltas(v, ref, xdim, ydim, radius):
+def get_least_squares_deltas(v, ref, xdim, ydim, radius, every=1):
     """A channel's deltas from the least-squares fit alone (the wide clamp),
     with the window of the given radius (DeltaMapper.getLeastSquaresDeltas)."""
     v = np.asarray(v, dtype=np.int64)
     has_ref = ref is not None
     r = np.asarray(ref, dtype=np.int64) if has_ref else np.zeros(1, dtype=np.int64)
-    p = _ls_planes(v, r, has_ref, xdim, ydim, radius)[1]
+    p = _ls_planes(v, r, has_ref, xdim, ydim, radius, every)[1]
     d = np.zeros(v.shape[0], dtype=np.int64)
     _edges(v, d, xdim, ydim)
     if ydim > 1 and xdim > 2:
@@ -1984,7 +1993,7 @@ def get_least_squares_deltas(v, ref, xdim, ydim, radius):
     return d
 
 
-def get_least_squares_band_deltas(whole, v, ref, xdim, y0, y1, radius):
+def get_least_squares_band_deltas(whole, v, ref, xdim, y0, y1, radius, every=1):
     """A band's least-squares deltas -- what get_least_squares_deltas gives for
     rows y0 to y1 - 1 alone, coded as an image of their own -- from the whole
     channel's (DeltaMapper.getLeastSquaresBandDeltas). They differ only in
@@ -1995,12 +2004,12 @@ def get_least_squares_band_deltas(whole, v, ref, xdim, y0, y1, radius):
     k = min(h, radius + 2)
     v = np.asarray(v, dtype=np.int64)
     top = get_least_squares_deltas(v[y0 * xdim:(y0 + k) * xdim],
-                                   None if ref is None else np.asarray(ref, dtype=np.int64)[y0 * xdim:(y0 + k) * xdim], xdim, k, radius)
+                                   None if ref is None else np.asarray(ref, dtype=np.int64)[y0 * xdim:(y0 + k) * xdim], xdim, k, radius, every)
     return np.concatenate([top, np.asarray(whole, dtype=np.int64)[(y0 + k) * xdim:y1 * xdim]])
 
 
 @njit
-def _least_squares_rows(ref, has_ref, xdim, ydim, init, radius, data, value, previous, cross, cb, fwd, c9b, earlier, m,
+def _least_squares_rows(ref, has_ref, xdim, ydim, init, radius, every, data, value, previous, cross, cb, fwd, c9b, earlier, m,
                         act_table, state, ls, delta, dst, y0, y1):
     """Decodes rows y0..y1-1 of a channel's least-squares deltas (into delta,
     each just before it is used) and rebuilds them (into dst), continuing
@@ -2025,7 +2034,7 @@ def _least_squares_rows(ref, has_ref, xdim, ydim, init, radius, data, value, pre
             elif x == xdim - 1:
                 p = dst[k - 1]
             else:
-                p = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, ring, z, a, b, coef, dg, True, radius)[1]
+                p = _ls_next(dst, ref, has_ref, xdim, k, row, col, win, ring, z, a, b, coef, dg, True, radius, every)[1]
                 pred = p
             _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, pred)
             dst[k] = init if k == 0 else delta[k] + p
@@ -2034,7 +2043,7 @@ def _least_squares_rows(ref, has_ref, xdim, ydim, init, radius, data, value, pre
 LS_DECODE_ROWS = 1   # the rows a channel decodes between looking at the channel before (get_values_from_least_squares_channels): as the Java, a row at a time
 
 
-def get_values_from_least_squares_channels(mixed, xdim, ydim, init, radius):
+def get_values_from_least_squares_channels(mixed, xdim, ydim, init, radius, every=1):
     """Decodes channels pack_mixed_deltas coded (with the second opinions;
     mixed: each channel's (value, coded) from read_mixed_deltas, in coding
     order) from their least-squares deltas, rebuilding them as it goes
@@ -2069,7 +2078,7 @@ def get_values_from_least_squares_channels(mixed, xdim, ydim, init, radius):
                             cond.wait()
                         if failed:
                             return
-                _least_squares_rows(ref, i > 0, xdim, ydim, int(init[i]), radius[i], coded, table, delta[:i], terms[0], terms[1], terms[2], terms[3],
+                _least_squares_rows(ref, i > 0, xdim, ydim, int(init[i]), radius[i], every, coded, table, delta[:i], terms[0], terms[1], terms[2], terms[3],
                                     earlier, m, MIX_ACTIVITY_TABLE, state, ls, delta[i], value[i], y0, y1)
                 with cond:
                     done[i] = y1
