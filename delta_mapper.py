@@ -2379,8 +2379,10 @@ def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every):
     its fits are solved in tasks run at the same time (_rf_advance,
     _rf_solve), so decoding a row is left with the predictions and the delta
     decoder. mixed[i] may be a Future, for channels still being read: the
-    channel's thread starts once it is done (init[i] set before it). Returns
-    (deltas, values), each per channel."""
+    channel's thread starts once it is done (init[i] set before it); and its
+    coded bytes may be an Arriving (read_arriving_mixed_deltas), still being
+    read: then before each row the channel waits until the most the row can
+    read has arrived. Returns (deltas, values), each per channel."""
     nch, n = len(mixed), xdim * ydim
     delta = np.zeros((nch, n), dtype=np.int64)     # rows of one array: a channel's previous is delta[:i], no copy
     value = np.zeros((nch, n), dtype=np.int64)
@@ -2391,6 +2393,13 @@ def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every):
     def run(i):
         try:
             table, coded = mixed[i].result() if hasattr(mixed[i], "result") else mixed[i]
+            arriving = coded if isinstance(coded, Arriving) else None
+            if arriving is not None:
+                # Still arriving: before each row, wait for as many bytes as
+                # the row can read at most (mix_bytes_per_delta per pixel).
+                coded = arriving.data
+                per_row = mix_bytes_per_delta(len(table)) * xdim
+                arriving.wait_for(6)       # the decoder's first reads: the cache byte and 5 code bytes
             m = 3 if i > 0 else 2
             has_ref = i > 0
             nf = 11 if has_ref else 8
@@ -2432,8 +2441,12 @@ def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every):
                     solve(0)
                     for j in jobs:
                         j.result()
+                if arriving is not None:
+                    have = arriving.wait_for(int(state[0][0]) + per_row)
                 _row_fit_row(ref, has_ref, xdim, ydim, int(init[i]), every, coded, table, delta[:i], terms[0], terms[1], terms[2], terms[3],
                              earlier, m, MIX_ACTIVITY_TABLE, state, coef, valid, z, delta[i], dst, y)
+                if arriving is not None and have < coded.shape[0] and state[0][0] > have:
+                    raise RuntimeError("row %d of channel %d read coded bytes that hadn't arrived" % (y, i))
                 with cond:
                     done[i] = y + 1
                     cond.notify_all()
@@ -3294,6 +3307,75 @@ def pack_mixed_deltas(delta, values, previous, xdim, opinions=False):
     out = DataOutput()
     out.write_int(lo); write_table(out, rank); out.write_int(len(coded)); out.write(coded.tobytes())
     return out.to_bytes()
+
+
+class Arriving:
+    """Coded bytes still arriving (ArithmeticMapper.Arriving): a buffer of a
+    known length (data) that one thread fills in order, saying how much has
+    arrived (arrived), while a decoder reads it, waiting when it would get
+    ahead (wait_for)."""
+
+    def __init__(self, n):
+        self.data = np.zeros(n, dtype=np.uint8)
+        self.count = 0
+        self.failed = None
+        self.cond = threading.Condition()
+
+    def arrived(self, count):
+        """Says that the first count bytes have arrived."""
+        with self.cond:
+            self.count = count
+            self.cond.notify_all()
+
+    def fail(self, e):
+        """Says that the rest won't arrive."""
+        with self.cond:
+            if self.failed is None:
+                self.failed = e
+            self.cond.notify_all()
+
+    def wait_for(self, n):
+        """Waits until the first n bytes (or all of them, if fewer) have
+        arrived; returns how many have."""
+        n = min(n, self.data.shape[0])
+        with self.cond:
+            while self.count < n and self.failed is None:
+                self.cond.wait()
+            if self.count < n:
+                raise RuntimeError("the coded bytes didn't all arrive") from self.failed
+            return self.count
+
+
+def read_arriving_mixed_deltas(inp):
+    """Reads the start of what pack_mixed_deltas wrote -- the rank table and
+    the coded bytes' length -- but not the coded bytes: the caller reads them
+    into the Arriving's data (in order) and says how many have arrived as it
+    goes, and a decoder can start on them meanwhile
+    (DeltaMapper.readArrivingMixedDeltas). Returns (the value of each rank,
+    an Arriving for the coded bytes)."""
+    lo = inp.read_int()
+    rank = read_table(inp)
+    n = inp.read_int()
+    if n < 0:
+        raise IOError("a coded length of %d." % n)
+    value = np.zeros(len(rank), dtype=np.int64)
+    value[rank] = np.arange(len(rank)) + lo
+    return value, Arriving(n)
+
+
+def mix_bytes_per_delta(n_symbols):
+    """At most how many coded bytes decoding one delta reads, for n_symbols
+    symbols: the range is at least RANGE_BOTTOM before a symbol, and the
+    symbol's share of it at least range // total (every symbol counts at
+    least 1 of the total, 2^MIX_R_BITS + n_symbols), so this many byte
+    shifts bring it back to RANGE_BOTTOM. (The Python decoder can't wait in
+    the middle of a row, so a reader waits, before each row, for this many
+    bytes per pixel beyond where the decoder is.)"""
+    r = am.RANGE_BOTTOM // ((1 << MIX_R_BITS) + n_symbols)
+    k = 0
+    while (r << (8 * k)) < am.RANGE_BOTTOM:
+        k += 1
+    return k
 
 
 def read_mixed_deltas(inp):

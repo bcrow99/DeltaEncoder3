@@ -7,11 +7,13 @@ SimpleWriter2.java: the channels green, blue-green and red-green
 (simple_writer2.SET_ID), every interior pixel predicted by the least-squares
 fit from the rows above (the wide clamp, window radius simple_writer2.RADIUS,
 solved at every simple_writer2.EVERY-th pixel along a row; a row's fits are
-solved at the same time, before the row is decoded), the deltas mixed-context coded
-with the second opinions, in bands of rows decoded at the same time, resized back with
-resize_mapper.resize2 (centred). The file is read in stages: each band's
-channels start decoding as soon as they have been read, while the rest of
-the file is read. See simple_writer2.encode for the layout.
+solved at the same time, before the row is decoded), the deltas
+mixed-context coded with the second opinions, in bands of rows decoded at
+the same time, resized back with resize_mapper.resize2 (centred). The file
+is read in stages: each band's channels start decoding as soon as the start
+of them has been read, and decode their coded bytes as they arrive (a row at
+a time, once the most the row can read has arrived), while the rest of the
+file is read. See simple_writer2.encode for the layout.
 
     python3 simple_reader2.py file
 
@@ -36,6 +38,7 @@ from java_io import DataInput
 
 FORMAT_ID = ord('F')
 FORMAT_VERSION = 1
+CHUNK = 1 << 16   # how many coded bytes are read at a time, saying each time that they have arrived (SimpleReader2.CHUNK)
 
 
 class SimpleDecoder2:
@@ -77,7 +80,9 @@ class SimpleDecoder2:
         decoding at once, each in its own thread (each band's channels in
         threads of their own, each a few rows behind the one before: a
         channel's fit and contexts use the ones before it), and each channel
-        starts as soon as this thread has read it, while the rest are read.
+        starts as soon as this thread has read the start of it (its rank
+        table), decoding its coded bytes as they arrive, a chunk at a time,
+        while the rest are read (delta_mapper.Arriving).
         Then blue, green and red are rebuilt, resized and shifted. Its time
         (seconds) is left in took, and the reading's in read_time."""
         start = time.perf_counter()
@@ -102,20 +107,35 @@ class SimpleDecoder2:
         for t in threads:
             t.start()
         read = time.perf_counter()
+        arriving = []
         try:
             with open(self.filename, "rb") as f:
                 inp = DataInput(f)
                 self._read_header(inp)
                 for b in range(n):
-                    bi = DataInput(inp.read_fully(self.length[b]))
+                    end = f.tell() + self.length[b]
                     for i in range(3):
-                        init[b][i] = bi.read_int()
-                        coded[b][i].set_result(dm.read_mixed_deltas(bi))
+                        init[b][i] = inp.read_int()
+                        value, arr = dm.read_arriving_mixed_deltas(inp)
+                        arriving.append(arr)
+                        coded[b][i].set_result((value, arr))
+                        buf = memoryview(arr.data)
+                        got = 0
+                        while got < len(buf):
+                            k = f.readinto(buf[got:got + min(CHUNK, len(buf) - got)])
+                            if not k:
+                                raise EOFError("%s ends in band %d, channel %d." % (self.filename, b, i))
+                            got += k
+                            arr.arrived(got)
+                    if f.tell() != end:
+                        raise IOError("%s: band %d is not the length its header says." % (self.filename, b))
         except BaseException as e:
             for row in coded:
                 for c in row:
                     if not c.done():
                         c.set_exception(e)
+            for arr in arriving:
+                arr.fail(e)
             for t in threads:
                 t.join()
             raise
