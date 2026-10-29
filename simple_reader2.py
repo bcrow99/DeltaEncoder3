@@ -5,8 +5,9 @@ simple_reader2.py version 1.0 -- SimpleReader2.java for Python (PySide6).
 Reads Simple 2 format 'F' version 1, from simple_writer2.py or
 SimpleWriter2.java: the channels green, blue-green and red-green
 (simple_writer2.SET_ID), every interior pixel predicted by the least-squares
-fit (the wide clamp, window radius simple_writer2.RADIUS, solved at every
-simple_writer2.EVERY-th pixel along a row), the deltas mixed-context coded
+fit from the rows above (the wide clamp, window radius simple_writer2.RADIUS,
+solved at every simple_writer2.EVERY-th pixel along a row; a row's fits are
+solved at the same time, before the row is decoded), the deltas mixed-context coded
 with the second opinions, in bands of rows decoded at the same time, resized back with
 resize_mapper.resize2 (centred). See simple_writer2.encode for the layout.
 
@@ -85,7 +86,7 @@ class SimpleDecoder2:
 
         def one(b):
             y0, y1 = sw.band_start(b, n, h), sw.band_start(b + 1, n, h)
-            v = dm.get_values_from_least_squares_channels(self.band_delta[b], w, y1 - y0, self.band_init[b], radius, sw2.EVERY)[1]
+            v = dm.get_values_from_row_fit_channels(self.band_delta[b], w, y1 - y0, self.band_init[b], radius, sw2.EVERY)[1]
             for i in range(3):
                 raw[i][y0 * w:y1 * w] = v[i]
         vs.parallel(n, one)

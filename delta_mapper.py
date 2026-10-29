@@ -2098,6 +2098,358 @@ def get_values_from_least_squares_channels(mixed, xdim, ydim, init, radius, ever
     return list(delta), list(value)
 
 
+# ---- Least squares from the rows above (the Simple 2 format) -----------------
+#
+# DeltaMapper.RowFit: the least-squares primitive with a window of the r rows
+# above only (r columns either side; no pixels of the pixel's own row), so a
+# row's fits depend only on the rows before it and are solved, in parallel,
+# before the row is decoded. Solved at every every-th pixel along a row, from
+# column 1 (the pixels up to the next use its solution); where a fit can't be
+# solved, those pixels are predicted by a (the pixel to the left). The wide
+# clamp. The column sums are exact integers, and the solution is in the
+# Java's order, so both get the same values.
+
+@njit(inline="always")   # a call per pixel passing arrays is slow in Numba
+def _rf_products(v, ref, has_ref, xdim, nf, y, x, z, out):
+    """Pixel (y, x)'s products into out."""
+    _ls_features(v, ref, has_ref, xdim, nf, y, x, z)
+    m = nf + 2
+    t = 0
+    for i in range(m):
+        zi = z[i]
+        for j in range(i, m):
+            out[t] = zi * z[j]
+            t += 1
+
+
+@njit
+def _rf_start(v, ref, has_ref, xdim, y0, r, col, z, p):
+    """Sets the columns to row y0's window (rows y0 - r .. y0 - 1, from 1)
+    (RowFit.start)."""
+    nf = 11 if has_ref else 8
+    m = nf + 2
+    nt = m * (m + 1) // 2
+    col[:] = 0
+    for ty in range(max(1, y0 - r), y0):
+        for tx in range(1, xdim - 1):
+            _rf_products(v, ref, has_ref, xdim, nf, ty, tx, z, p)
+            c = np.uint64(tx * nt)
+            for t in range(nt):
+                ut = np.uint64(t)
+                col[c + ut] += p[ut]
+
+
+@njit
+def _rf_advance(v, ref, has_ref, xdim, y, r, col, c0, c1, z, p):
+    """Columns c0..c1-1 from row y - 1's window to row y's: adds row y - 1,
+    drops row y - 1 - r (RowFit.moveTo; y - 1 >= 1)."""
+    nf = 11 if has_ref else 8
+    m = nf + 2
+    nt = m * (m + 1) // 2
+    drop = y - 1 - r
+    for tx in range(c0, c1):
+        c = np.uint64(tx * nt)
+        _rf_products(v, ref, has_ref, xdim, nf, y - 1, tx, z, p)
+        for t in range(nt):
+            ut = np.uint64(t)
+            col[c + ut] += p[ut]
+        if drop >= 1:
+            _rf_products(v, ref, has_ref, xdim, nf, drop, tx, z, p)
+            for t in range(nt):
+                ut = np.uint64(t)
+                col[c + ut] -= p[ut]
+
+
+@njit
+def _rf_solve(col, xdim, r, nf, every, p0, p1, coef, valid, win, a, b, dg):
+    """Solves solved pixels p0..p1-1 of a row (column 1 + every * p) from the
+    columns (RowFit.solveRow and solve): each one's window sums, slid from
+    the one before, then L D L^T as in the Java."""
+    m = nf + 2
+    nt = m * (m + 1) // 2
+    n = nf + 1
+    lo = 0
+    hi = -1
+    for p in range(p0, p1):
+        x = 1 + p * every
+        nlo = max(1, x - r)
+        nhi = min(xdim - 2, x + r)
+        if p == p0:
+            win[:] = 0
+            for c in range(nlo, nhi + 1):
+                o = np.uint64(c * nt)
+                for s in range(nt):
+                    us = np.uint64(s)
+                    win[us] += col[o + us]
+        else:
+            for c in range(lo, nlo):
+                o = np.uint64(c * nt)
+                for s in range(nt):
+                    us = np.uint64(s)
+                    win[us] -= col[o + us]
+            for c in range(hi + 1, nhi + 1):
+                o = np.uint64(c * nt)
+                for s in range(nt):
+                    us = np.uint64(s)
+                    win[us] += col[o + us]
+        lo = nlo
+        hi = nhi
+        valid[p] = False
+        if win[nf * m - nf * (nf - 1) // 2] < 2 * n:
+            continue
+        for i in range(n):
+            base = i * m - i * (i - 1) // 2
+            for j in range(i, n):
+                a[j, i] = float(win[base + j - i])
+            b[i] = float(win[base + m - 1 - i])
+            a[i, i] += 1.0
+        ok = True
+        for j in range(n):
+            sv = a[j, j]
+            for q in range(j):
+                sv -= a[j, q] * a[j, q] * dg[q]
+            if sv < 1e-9:
+                ok = False
+                break
+            dg[j] = sv
+            for i in range(j + 1, n):
+                t_ = a[i, j]
+                for q in range(j):
+                    t_ -= a[i, q] * a[j, q] * dg[q]
+                a[i, j] = t_ / sv
+        if not ok:
+            continue
+        o = p * n
+        for i in range(n):
+            sv = b[i]
+            for q in range(i):
+                sv -= a[i, q] * coef[o + q]
+            coef[o + i] = sv
+        for i in range(n):
+            coef[o + i] /= dg[i]
+        for i in range(n - 1, -1, -1):
+            sv = coef[o + i]
+            for q in range(i + 1, n):
+                sv -= a[q, i] * coef[o + q]
+            coef[o + i] = sv
+        valid[p] = True
+
+
+@njit(inline="always")   # a call per pixel passing arrays is slow in Numba
+def _rf_predict(v, ref, has_ref, xdim, nf, y, x, every, coef, valid, z):
+    """The prediction at interior pixel (y, x), with the wide clamp, from the
+    row's solved fits (RowFit.predict)."""
+    n = nf + 1
+    p = (x - 1) // every
+    pa = _ls_at(v, y, x - 1, xdim); pb = _ls_at(v, y - 1, x, xdim)
+    pc = _ls_at(v, y - 1, x - 1, xdim); pd = _ls_at(v, y - 1, x + 1, xdim)
+    if not valid[p]:
+        return pa
+    _ls_features(v, ref, has_ref, xdim, nf, y, x, z)
+    s = 0.0
+    o = p * n
+    for i in range(n):
+        s += coef[o + i] * z[i]
+    lo = min(min(pa, pb), min(pc, pd))
+    hi = max(max(pa, pb), max(pc, pd))
+    for i in range(4, 8):
+        lo = min(lo, z[i])
+        hi = max(hi, z[i])
+    w = max(lo - 2, min(hi + 2, s))
+    return int(np.floor(w + 0.5))
+
+
+def _rf_state(xdim, has_ref, every):
+    """(col, coef, valid, z, p, win, a, b, dg, points): a RowFit's columns
+    and a row's solutions, and one task's working arrays (_rf_work)."""
+    nf = 11 if has_ref else 8
+    m = nf + 2
+    nt = m * (m + 1) // 2
+    n = nf + 1
+    points = max(0, (xdim - 2 + every - 1) // every)
+    return (np.zeros(xdim * nt, dtype=np.int32), np.zeros(max(1, points) * n), np.zeros(max(1, points), dtype=np.bool_)) + _rf_work(nf) + (points,)
+
+
+def _rf_work(nf):
+    """One task's working arrays: (z, products, window sums, a, b, dg)."""
+    m = nf + 2
+    nt = m * (m + 1) // 2
+    n = nf + 1
+    return (np.zeros(m, dtype=np.int64), np.zeros(nt, dtype=np.int32), np.zeros(nt, dtype=np.int64),
+            np.zeros((n, n)), np.zeros(n), np.zeros(n))
+
+
+@njit
+def _rf_band(v, ref, has_ref, xdim, y0, y1, out, r, every, col, coef, valid, z, p, win, a, b, dg, points):
+    """The encoder's predictions for rows y0..y1-1, the window started at
+    y0 on its own (RowFit.plane's bands)."""
+    nf = 11 if has_ref else 8
+    _rf_start(v, ref, has_ref, xdim, y0, r, col, z, p)
+    for y in range(y0, y1):
+        if y > y0 and y - 1 >= 1:
+            _rf_advance(v, ref, has_ref, xdim, y, r, col, 1, xdim - 1, z, p)
+        _rf_solve(col, xdim, r, nf, every, 0, points, coef, valid, win, a, b, dg)
+        for x in range(1, xdim - 1):
+            out[y * xdim + x] = _rf_predict(v, ref, has_ref, xdim, nf, y, x, every, coef, valid, z)
+
+
+def _rf_planes(v, ref, has_ref, xdim, ydim, radius, every):
+    """The encoder's predictions for the whole channel, in bands of rows
+    computed in parallel (RowFit.plane)."""
+    out = np.zeros(v.shape[0], dtype=np.int16)
+    band = max(4 * (radius + 1), (ydim - 1 + _CPUS - 1) // _CPUS)
+
+    def one(y0):
+        _rf_band(v, ref, has_ref, xdim, y0, min(ydim, y0 + band), out, radius, every, *_rf_state(xdim, has_ref, every))
+    for f in [_LS_POOL.submit(one, y0) for y0 in range(1, ydim, band)]:
+        f.result()
+    return out
+
+
+def get_row_fit_deltas(v, ref, xdim, ydim, radius, every):
+    """A channel's deltas from the least-squares fit from the rows above
+    (the wide clamp) (DeltaMapper.getRowFitDeltas)."""
+    v = np.asarray(v, dtype=np.int64)
+    has_ref = ref is not None
+    r = np.asarray(ref, dtype=np.int64) if has_ref else np.zeros(1, dtype=np.int64)
+    p = _rf_planes(v, r, has_ref, xdim, ydim, radius, every)
+    d = np.zeros(v.shape[0], dtype=np.int64)
+    _edges(v, d, xdim, ydim)
+    if ydim > 1 and xdim > 2:
+        d.reshape(ydim, xdim)[1:, 1:-1] = v.reshape(ydim, xdim)[1:, 1:-1] - p.reshape(ydim, xdim)[1:, 1:-1]
+    return d
+
+
+def get_row_fit_band_deltas(whole, v, ref, xdim, y0, y1, radius, every):
+    """A band's RowFit deltas -- what get_row_fit_deltas gives for rows y0 to
+    y1 - 1 alone -- from the whole channel's: they differ only in the band's
+    first radius + 2 rows, so only those are fitted again
+    (DeltaMapper.getRowFitBandDeltas)."""
+    h = y1 - y0
+    k = min(h, radius + 2)
+    v = np.asarray(v, dtype=np.int64)
+    top = get_row_fit_deltas(v[y0 * xdim:(y0 + k) * xdim],
+                             None if ref is None else np.asarray(ref, dtype=np.int64)[y0 * xdim:(y0 + k) * xdim], xdim, k, radius, every)
+    return np.concatenate([top, np.asarray(whole, dtype=np.int64)[(y0 + k) * xdim:y1 * xdim]])
+
+
+@njit
+def _row_fit_row(ref, has_ref, xdim, ydim, init, every, data, value, previous, cross, cb, fwd, c9b, earlier, m,
+                 act_table, state, coef, valid, z, delta, dst, y):
+    """Decodes row y of a channel's RowFit deltas (into delta, each just
+    before it is used) and rebuilds it (into dst), the row's fits solved
+    (coef, valid); state is the delta decoder's (_mix_state); cross, cb, fwd,
+    c9b and earlier hold the earlier channels' terms, filled here as far as
+    row y + 1 (the earlier channels must be decoded to row y + 1)."""
+    nf = 11 if has_ref else 8
+    if m == 3:
+        _mix_earlier_rows(previous, xdim, ydim, MIX_CROSS_TABLE, cross, cb, fwd, c9b, earlier, min(ydim, y + 1))
+    for x in range(xdim):
+        k = y * xdim + x
+        pred = 0                    # the second opinions' prediction (interior only)
+        if y == 0:
+            p = init if x == 0 else dst[k - 1]
+        elif x == 0:
+            p = dst[k - xdim]
+        elif x == xdim - 1:
+            p = dst[k - 1]
+        else:
+            p = _rf_predict(dst, ref, has_ref, xdim, nf, y, x, every, coef, valid, z)
+            pred = p
+        _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, pred)
+        dst[k] = init if k == 0 else delta[k] + p
+
+
+_RF_POOL = ThreadPoolExecutor(_CPUS)   # RowFit's decoder tasks (they never wait, so the pool can't block)
+RF_TASKS = 4                           # the most tasks a row's RowFit work is split into in the decoder (each is a Python call)
+
+
+def _rf_split(items, least):
+    """How many tasks to split items into: at most RF_TASKS, with at least
+    least items each."""
+    return max(1, min(RF_TASKS, items // least))
+
+
+def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every):
+    """Decodes channels pack_mixed_deltas coded (with the second opinions)
+    from their RowFit deltas, rebuilding them as it goes
+    (DeltaMapper.getValuesFromRowFitChannels): as
+    get_values_from_least_squares_channels, a thread per channel, a row at a
+    time once the channel before has decoded a row further; before each row
+    its fits are solved in tasks run at the same time (_rf_advance,
+    _rf_solve), so decoding a row is left with the predictions and the delta
+    decoder. Returns (deltas, values), each per channel."""
+    nch, n = len(mixed), xdim * ydim
+    delta = np.zeros((nch, n), dtype=np.int64)     # rows of one array: a channel's previous is delta[:i], no copy
+    value = np.zeros((nch, n), dtype=np.int64)
+    done = [0] * nch
+    cond = threading.Condition()
+    failed = []
+
+    def run(i):
+        try:
+            table, coded = mixed[i]
+            m = 3 if i > 0 else 2
+            has_ref = i > 0
+            nf = 11 if has_ref else 8
+            r = radius[i]
+            state = _mix_state(coded, m, len(table), _mix_contexts_count(True))
+            col, coef, valid, z, _, _, _, _, _, points = _rf_state(xdim, has_ref, every)
+            ref = value[i - 1] if i > 0 else np.zeros(1, dtype=np.int64)
+            dst = value[i]
+            terms = [np.zeros(n, dtype=np.int64) for _ in range(4)]   # cross, cb, fwd, c9b (zero for the first channel)
+            earlier = np.zeros(2, dtype=np.int64)
+            ca = _rf_split(max(0, xdim - 2), 128)
+            cs = _rf_split(points, 32)
+            work = [_rf_work(nf) for _ in range(max(ca, cs))]
+
+            def advance(t, y):
+                c0, c1 = 1 + t * (xdim - 2) // ca, 1 + (t + 1) * (xdim - 2) // ca
+                _rf_advance(dst, ref, has_ref, xdim, y, r, col, c0, c1, work[t][0], work[t][1])
+
+            def solve(t):
+                p0, p1 = t * points // cs, (t + 1) * points // cs
+                w = work[t]
+                _rf_solve(col, xdim, r, nf, every, p0, p1, coef, valid, w[2], w[3], w[4], w[5])
+
+            for y in range(ydim):
+                if i > 0:
+                    need = min(ydim, y + 2)
+                    with cond:
+                        while done[i - 1] < need and not failed:
+                            cond.wait()
+                        if failed:
+                            return
+                if y >= 1:
+                    if y >= 2:
+                        jobs = [_RF_POOL.submit(advance, t, y) for t in range(1, ca)]
+                        advance(0, y)
+                        for j in jobs:
+                            j.result()
+                    jobs = [_RF_POOL.submit(solve, t) for t in range(1, cs)]
+                    solve(0)
+                    for j in jobs:
+                        j.result()
+                _row_fit_row(ref, has_ref, xdim, ydim, int(init[i]), every, coded, table, delta[:i], terms[0], terms[1], terms[2], terms[3],
+                             earlier, m, MIX_ACTIVITY_TABLE, state, coef, valid, z, delta[i], dst, y)
+                with cond:
+                    done[i] = y + 1
+                    cond.notify_all()
+        except BaseException as e:
+            with cond:
+                failed.append(e)
+                cond.notify_all()
+
+    threads = [threading.Thread(target=run, args=(i,), daemon=True) for i in range(nch)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if failed:
+        raise failed[0]
+    return list(delta), list(value)
+
+
 class WindowSurvey:
     """What survey_windows chose for each channel, and what it measured
     (DeltaMapper.WindowSurvey): radius, deltas, coded (pack_mixed_deltas with
