@@ -9,7 +9,9 @@ fit from the rows above (the wide clamp, window radius simple_writer2.RADIUS,
 solved at every simple_writer2.EVERY-th pixel along a row; a row's fits are
 solved at the same time, before the row is decoded), the deltas mixed-context coded
 with the second opinions, in bands of rows decoded at the same time, resized back with
-resize_mapper.resize2 (centred). See simple_writer2.encode for the layout.
+resize_mapper.resize2 (centred). The file is read in stages: each band's
+channels start decoding as soon as they have been read, while the rest of
+the file is read. See simple_writer2.encode for the layout.
 
     python3 simple_reader2.py file
 
@@ -19,7 +21,9 @@ The decoding (class SimpleDecoder2) is separate from the window:
 """
 
 import sys
+import threading
 import time
+from concurrent.futures import Future
 
 import numpy as np
 
@@ -35,14 +39,22 @@ FORMAT_VERSION = 1
 
 
 class SimpleDecoder2:
+    """Reads a Simple 2 file's header; decode() reads the rest and decodes
+    it, in stages (SimpleReader2.decodeFile)."""
+
     def __init__(self, filename):
         self.filename = filename
-        timer = vs.Timer()
         with open(filename, "rb") as f:
-            self._read(DataInput(f))
-        print("File read in " + timer.elapsed() + ".")
+            self._read_header(DataInput(f))
+        w, h = self.size
+        print("Image:        %d x %d" % (self.xdim, self.ydim))
+        if self.bands > 1:
+            print(sw.describe_bands(self.bands, h))
+        print()
 
-    def _read(self, inp):
+    def _read_header(self, inp):
+        """The image's size, the quantization, the channels' minimums, the
+        number of bands and their lengths (SimpleReader2.readHeader)."""
         ident, version = inp.read_unsigned_byte(), inp.read_unsigned_byte()
         if ident != FORMAT_ID:
             raise IOError(self.filename + " is not a Simple Writer 2 file.")
@@ -57,39 +69,61 @@ class SimpleDecoder2:
         n = self.bands = inp.read_unsigned_byte()
         if n < 1 or h // n < 2:
             raise IOError("%s: %d bands of a %d-row image." % (self.filename, n, h))
-        length = [inp.read_int() for _ in range(n)]
-        self.band_init, self.band_delta = [], []
-        for b in range(n):
-            bi = DataInput(inp.read_fully(length[b]))
-            init, deltas = [], []
-            for i in range(3):
-                init.append(bi.read_int())
-                deltas.append(dm.read_mixed_deltas(bi))
-            self.band_init.append(init)
-            self.band_delta.append(deltas)
-        print("Image:        %d x %d" % (self.xdim, self.ydim))
-        if n > 1:
-            print(sw.describe_bands(n, h))
-        print()
+        self.length = [inp.read_int() for _ in range(n)]
 
     def decode(self):
-        """The image as an (ydim, xdim, 3) uint8 array, R, G, B: the bands
-        decoded at the same time (each band's channels at the same time too,
-        each a few rows behind the one before: a channel's fit and contexts
-        use the ones before it), then blue, green and red rebuilt from them,
-        resized and shifted. Its time (seconds) is left in took."""
+        """The image as an (ydim, xdim, 3) uint8 array, R, G, B, read and
+        decoded in stages (SimpleReader2.decodeFile): the bands start
+        decoding at once, each in its own thread (each band's channels in
+        threads of their own, each a few rows behind the one before: a
+        channel's fit and contexts use the ones before it), and each channel
+        starts as soon as this thread has read it, while the rest are read.
+        Then blue, green and red are rebuilt, resized and shifted. Its time
+        (seconds) is left in took, and the reading's in read_time."""
         start = time.perf_counter()
         w, h = self.size
         n = self.bands
         radius = [sw2.RADIUS] * 3
         raw = [np.zeros(w * h, dtype=np.int64) for _ in range(3)]
+        init = [[0] * 3 for _ in range(n)]
+        coded = [[Future() for _ in range(3)] for _ in range(n)]
+        failed = []
 
         def one(b):
-            y0, y1 = sw.band_start(b, n, h), sw.band_start(b + 1, n, h)
-            v = dm.get_values_from_row_fit_channels(self.band_delta[b], w, y1 - y0, self.band_init[b], radius, sw2.EVERY)[1]
-            for i in range(3):
-                raw[i][y0 * w:y1 * w] = v[i]
-        vs.parallel(n, one)
+            try:
+                y0, y1 = sw.band_start(b, n, h), sw.band_start(b + 1, n, h)
+                v = dm.get_values_from_row_fit_channels(coded[b], w, y1 - y0, init[b], radius, sw2.EVERY)[1]
+                for i in range(3):
+                    raw[i][y0 * w:y1 * w] = v[i]
+            except BaseException as e:
+                failed.append(e)
+
+        threads = [threading.Thread(target=one, args=(b,), daemon=True) for b in range(n)]
+        for t in threads:
+            t.start()
+        read = time.perf_counter()
+        try:
+            with open(self.filename, "rb") as f:
+                inp = DataInput(f)
+                self._read_header(inp)
+                for b in range(n):
+                    bi = DataInput(inp.read_fully(self.length[b]))
+                    for i in range(3):
+                        init[b][i] = bi.read_int()
+                        coded[b][i].set_result(dm.read_mixed_deltas(bi))
+        except BaseException as e:
+            for row in coded:
+                for c in row:
+                    if not c.done():
+                        c.set_exception(e)
+            for t in threads:
+                t.join()
+            raise
+        self.read_time = time.perf_counter() - read
+        for t in threads:
+            t.join()
+        if failed:
+            raise failed[0]
         channel = [raw[i] + self.min[i] if sw2.CHANNELS[i] > 2 else raw[i] for i in range(3)]
         bgr = dm.get_blue_green_red(sw2.SET_ID, *channel)
         if self.pixel_quant != 0:
@@ -126,7 +160,7 @@ class SimpleReader2:
             self.view.set_status("decode failed")
             vs.show_error(self.view, "Can't decode %s: %r" % (self.decoder.filename, error))
             return
-        self.first, self.first_time = rgb, self.decoder.took
+        self.first, self.first_time, self.first_read = rgb, self.decoder.took, self.decoder.read_time
         self.view.set_image(rgb)
         self.view.set_status(None)
         self.view.fit_and_shrink()
@@ -139,7 +173,8 @@ class SimpleReader2:
         if not np.array_equal(rgb, self.first):
             print("WARNING: the second decoding differs from the first.")
         d = self.decoder
-        print("Image rebuilt (%d x %d)." % (d.xdim, d.ydim))
+        print("Image rebuilt (%d x %d); the file read in %s, then %s, while decoding." % (
+            d.xdim, d.ydim, vs.format_duration(self.first_read), vs.format_duration(d.read_time)))
         print("Run time plus compile time: " + vs.format_duration(self.first_time))
         print("Run time only:              " + vs.format_duration(d.took))
 

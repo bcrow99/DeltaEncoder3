@@ -2378,7 +2378,9 @@ def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every):
     time once the channel before has decoded a row further; before each row
     its fits are solved in tasks run at the same time (_rf_advance,
     _rf_solve), so decoding a row is left with the predictions and the delta
-    decoder. Returns (deltas, values), each per channel."""
+    decoder. mixed[i] may be a Future, for channels still being read: the
+    channel's thread starts once it is done (init[i] set before it). Returns
+    (deltas, values), each per channel."""
     nch, n = len(mixed), xdim * ydim
     delta = np.zeros((nch, n), dtype=np.int64)     # rows of one array: a channel's previous is delta[:i], no copy
     value = np.zeros((nch, n), dtype=np.int64)
@@ -2388,7 +2390,7 @@ def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every):
 
     def run(i):
         try:
-            table, coded = mixed[i]
+            table, coded = mixed[i].result() if hasattr(mixed[i], "result") else mixed[i]
             m = 3 if i > 0 else 2
             has_ref = i > 0
             nf = 11 if has_ref else 8
