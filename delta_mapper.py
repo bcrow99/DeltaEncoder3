@@ -2139,25 +2139,54 @@ def _rf_start(v, ref, has_ref, xdim, y0, r, col, z, p):
                 col[c + ut] += p[ut]
 
 
+@njit(inline="always")   # a call per pixel passing arrays is slow in Numba
+def _rf_features(v, ref, has_ref, xdim, nf, y, x, z):
+    """As _ls_features, with the neighbours read directly where none needs
+    clamping to the image (RowFit.features(int, int, int[]))."""
+    k = y * xdim + x
+    if y >= 2 and x >= 2 and x <= xdim - 3:
+        up = k - xdim
+        up2 = up - xdim
+        z[0] = v[k - 1]; z[1] = v[up]; z[2] = v[up - 1]; z[3] = v[up + 1]
+        z[4] = v[k - 2]; z[5] = v[up2]; z[6] = v[up + 2]; z[7] = v[up2 + 1]
+    else:
+        z[0] = _ls_at(v, y, x - 1, xdim); z[1] = _ls_at(v, y - 1, x, xdim)
+        z[2] = _ls_at(v, y - 1, x - 1, xdim); z[3] = _ls_at(v, y - 1, x + 1, xdim)
+        z[4] = _ls_at(v, y, x - 2, xdim); z[5] = _ls_at(v, y - 2, x, xdim)
+        z[6] = _ls_at(v, y - 1, x + 2, xdim); z[7] = _ls_at(v, y - 2, x + 1, xdim)
+    if has_ref:
+        z[8] = ref[k]; z[9] = ref[k - 1]; z[10] = ref[k - xdim]
+    z[nf] = 1
+    z[nf + 1] = v[k]
+
+
 @njit
-def _rf_advance(v, ref, has_ref, xdim, y, r, col, c0, c1, z, p):
+def _rf_advance(v, ref, has_ref, xdim, y, r, col, c0, c1, za, zd):
     """Columns c0..c1-1 from row y - 1's window to row y's: adds row y - 1,
-    drops row y - 1 - r (RowFit.moveTo; y - 1 >= 1)."""
+    drops row y - 1 - r (RowFit.addColumns; y - 1 >= 1): each column gains
+    the added pixel's products and loses the dropped one's, in one pass (the
+    sums are ints, so the same in any order). za, zd: two vectors of nf + 2."""
     nf = 11 if has_ref else 8
     m = nf + 2
     nt = m * (m + 1) // 2
     drop = y - 1 - r
     for tx in range(c0, c1):
-        c = np.uint64(tx * nt)
-        _rf_products(v, ref, has_ref, xdim, nf, y - 1, tx, z, p)
-        for t in range(nt):
-            ut = np.uint64(t)
-            col[c + ut] += p[ut]
+        t = tx * nt
+        _rf_features(v, ref, has_ref, xdim, nf, y - 1, tx, za)
         if drop >= 1:
-            _rf_products(v, ref, has_ref, xdim, nf, drop, tx, z, p)
-            for t in range(nt):
-                ut = np.uint64(t)
-                col[c + ut] -= p[ut]
+            _rf_features(v, ref, has_ref, xdim, nf, drop, tx, zd)
+            for i in range(m):
+                ai = za[i]
+                di = zd[i]
+                for j in range(i, m):
+                    col[t] += ai * za[j] - di * zd[j]
+                    t += 1
+        else:
+            for i in range(m):
+                ai = za[i]
+                for j in range(i, m):
+                    col[t] += ai * za[j]
+                    t += 1
 
 
 @njit
@@ -2260,8 +2289,8 @@ def _rf_predict(v, ref, has_ref, xdim, nf, y, x, every, coef, valid, z):
 
 
 def _rf_state(xdim, has_ref, every):
-    """(col, coef, valid, z, p, win, a, b, dg, points): a RowFit's columns
-    and a row's solutions, and one task's working arrays (_rf_work)."""
+    """(col, coef, valid, z, p, win, a, b, dg, za, zd, points): a RowFit's
+    columns and a row's solutions, and one task's working arrays (_rf_work)."""
     nf = 11 if has_ref else 8
     m = nf + 2
     nt = m * (m + 1) // 2
@@ -2271,23 +2300,24 @@ def _rf_state(xdim, has_ref, every):
 
 
 def _rf_work(nf):
-    """One task's working arrays: (z, products, window sums, a, b, dg)."""
+    """One task's working arrays: (z, products, window sums, a, b, dg, and
+    _rf_advance's two vectors)."""
     m = nf + 2
     nt = m * (m + 1) // 2
     n = nf + 1
     return (np.zeros(m, dtype=np.int64), np.zeros(nt, dtype=np.int32), np.zeros(nt, dtype=np.int64),
-            np.zeros((n, n)), np.zeros(n), np.zeros(n))
+            np.zeros((n, n)), np.zeros(n), np.zeros(n), np.zeros(m, dtype=np.int64), np.zeros(m, dtype=np.int64))
 
 
 @njit
-def _rf_band(v, ref, has_ref, xdim, y0, y1, out, r, every, col, coef, valid, z, p, win, a, b, dg, points):
+def _rf_band(v, ref, has_ref, xdim, y0, y1, out, r, every, col, coef, valid, z, p, win, a, b, dg, za, zd, points):
     """The encoder's predictions for rows y0..y1-1, the window started at
     y0 on its own (RowFit.plane's bands)."""
     nf = 11 if has_ref else 8
     _rf_start(v, ref, has_ref, xdim, y0, r, col, z, p)
     for y in range(y0, y1):
         if y > y0 and y - 1 >= 1:
-            _rf_advance(v, ref, has_ref, xdim, y, r, col, 1, xdim - 1, z, p)
+            _rf_advance(v, ref, has_ref, xdim, y, r, col, 1, xdim - 1, za, zd)
         _rf_solve(col, xdim, r, nf, every, 0, points, coef, valid, win, a, b, dg)
         for x in range(1, xdim - 1):
             out[y * xdim + x] = _rf_predict(v, ref, has_ref, xdim, nf, y, x, every, coef, valid, z)
@@ -2378,11 +2408,15 @@ def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every):
     time once the channel before has decoded a row further; before each row
     its fits are solved in tasks run at the same time (_rf_advance,
     _rf_solve), so decoding a row is left with the predictions and the delta
-    decoder. mixed[i] may be a Future, for channels still being read: the
-    channel's thread starts once it is done (init[i] set before it); and its
-    coded bytes may be an Arriving (read_arriving_mixed_deltas), still being
-    read: then before each row the channel waits until the most the row can
-    read has arrived. Returns (deltas, values), each per channel."""
+    decoder. (The Java solves the next row's fits while it decodes this one,
+    following the decoder along the row: DeltaMapper.RowWave. Here that was
+    slower but for large images in one band: each of its tasks is a Python
+    call, and the threads queue for the interpreter lock. The predictions are
+    the same either way.) mixed[i] may be a Future, for channels still being
+    read: the channel's thread starts once it is done (init[i] set before it);
+    and its coded bytes may be an Arriving (read_arriving_mixed_deltas), still
+    being read: then before each row the channel waits until the most the row
+    can read has arrived. Returns (deltas, values), each per channel."""
     nch, n = len(mixed), xdim * ydim
     delta = np.zeros((nch, n), dtype=np.int64)     # rows of one array: a channel's previous is delta[:i], no copy
     value = np.zeros((nch, n), dtype=np.int64)
@@ -2405,7 +2439,7 @@ def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every):
             nf = 11 if has_ref else 8
             r = radius[i]
             state = _mix_state(coded, m, len(table), _mix_contexts_count(True))
-            col, coef, valid, z, _, _, _, _, _, points = _rf_state(xdim, has_ref, every)
+            col, coef, valid, z, _, _, _, _, _, _, _, points = _rf_state(xdim, has_ref, every)
             ref = value[i - 1] if i > 0 else np.zeros(1, dtype=np.int64)
             dst = value[i]
             terms = [np.zeros(n, dtype=np.int64) for _ in range(4)]   # cross, cb, fwd, c9b (zero for the first channel)
@@ -2416,7 +2450,7 @@ def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every):
 
             def advance(t, y):
                 c0, c1 = 1 + t * (xdim - 2) // ca, 1 + (t + 1) * (xdim - 2) // ca
-                _rf_advance(dst, ref, has_ref, xdim, y, r, col, c0, c1, work[t][0], work[t][1])
+                _rf_advance(dst, ref, has_ref, xdim, y, r, col, c0, c1, work[t][6], work[t][7])
 
             def solve(t):
                 p0, p1 = t * points // cs, (t + 1) * points // cs
