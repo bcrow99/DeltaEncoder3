@@ -3251,6 +3251,12 @@ def _mix_decode_one(state, data, k, d, v, value, xdim, cb, fwd, c9b, m, act_tabl
         C1[j] = 0
     s = 0
     lo = 0
+    # The symbol is the first whose interval's top is above t, found a
+    # symbol at a time. The Java (MixedModels.decode), while the symbols have
+    # been large, first passes over whole blocks of them using block sums;
+    # either way finds the same symbol. Here that was no faster: the search
+    # is a smaller part of the time, and the extra code, even untaken, slowed
+    # Numba's code for the rest.
     while True:
         a = 0
         for j in range(m):
