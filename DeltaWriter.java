@@ -1,0 +1,754 @@
+import java.awt.*;
+import java.awt.event.*;
+import java.awt.image.*;
+import java.io.*;
+import java.util.*;
+import java.util.zip.*;
+import javax.swing.*;
+
+// DeltaWriter version 2.3 (the block map's predictors come from the survey, from the 225-entry table)
+public class DeltaWriter
+{
+	// File format: every file starts with FORMAT_ID ('D' = Delta format) and
+	// FORMAT_VERSION. Bump FORMAT_VERSION in the writer and reader together
+	// whenever the file layout or a coder's output changes.
+	static final char FORMAT_ID      = 'D';
+	static final int  FORMAT_VERSION = 5;   // 3: one predictor table (DeltaMapper.PREDICTOR_TABLE_256) and cross-channel block maps; 4: block maps with a block size per channel; 5: the 225-entry predictor table (DeltaMapper.PREDICTOR_TABLE)
+	/**
+	 * The version written for delta types other than the block map (13), whose
+	 * files are as they were.
+	 */
+	static final int  NO_BLOCK_MAP_VERSION = 3;
+
+	// ---- Image state --------------------------------------------------------
+	ViewerSupport view;
+	BufferedImage original_image;
+	BufferedImage working_image;
+	String        filename;
+	int           image_xdim, image_ydim;
+	int[][]       source;   // blue, green, red of the original
+
+	// ---- Compression parameters ---------------------------------------------
+	int pixel_quant   = 4;
+	int pixel_shift   = 3;
+	int pixel_segment = 10;  // Arithmetic blocks: 10 = one block per channel (default); lower = blocks of 500+500*pixel_segment bytes
+	int correction    = 0;
+	int min_set_id    = 0;
+	int delta_type    = 5;
+	int compress_type = 1;   // 0=Integer, 1=String, 2=String*
+	int entropy_type  = 0;
+	int smooth_level  = 0;
+	int smooth2_level = 0;
+	byte scanline5_variant = 0;
+
+	JSlider smooth_slider, smooth2_slider, pquant_slider, pshift_slider, corr_slider, segment_slider;
+	JRadioButtonMenuItem[] delta_button, entropy_button;
+	JRadioButton[] compress_button, int_radio_btns;
+	JMenu          datatype_menu;   // greyed out for Context, which codes the deltas directly
+
+	// ---- Results of the last Apply (read by Save) ---------------------------
+	int[]  set_sum = new int[10], channel_sum = new int[6];
+	int[]  channel_init = new int[6], channel_min = new int[6], channel_delta_min = new int[6];
+	int[]  channel_length = new int[6], channel_compressed_length = new int[6];
+	byte[] channel_iterations = new byte[3];
+	int[][]       table    = new int[3][];       // string tables (compress_type > 0)
+	byte[][]      payload  = new byte[3][];      // delta bytes (Integer) or unary strings
+	int[][]       delta_list = new int[3][];     // the deltas themselves, for the Context type
+	int           delta_xdim;                    // their row width
+	byte[][]      map      = new byte[3][];      // delta-type maps (types 6-13)
+
+	long    file_length;
+	boolean applied = false;   // the last Apply finished; Save needs it
+
+	static final String[] ENTROPY_NAMES = {"LZ77", "Huffman", "Arithmetic", "Adaptive", "Context"};
+
+	public static void main(String[] args)
+	{
+		ViewerSupport.applyHiDpiFontScaleIfNeeded();
+		if(args.length == 1) { new DeltaWriter(args[0]); return; }
+		FileDialog fd = new FileDialog((java.awt.Frame) null, "Open Image", FileDialog.LOAD);
+		fd.setVisible(true);
+		if(fd.getFile() != null) new DeltaWriter(new File(fd.getDirectory(), fd.getFile()).getPath());
+		else System.exit(0);
+	}
+
+	// Startup survey: picks the channel set, ranks the 14 delta types by
+	// the compressed size of their deltas plus their map, then picks String
+	// or String* for the selected type.
+	public void init()
+	{
+		int[]   size = DeltaMapper.getQuantizedSize(image_xdim, image_ydim, pixel_quant);
+		int     new_xdim = size[0], new_ydim = size[1];
+		int[][] qc = quantizedChannels(size, false);
+		ViewerSupport.parallel(6, i -> channel_sum[i] = (int) Math.floor(CodeMapper.getShannonLimit(DeltaMapper.getIdealFrequency2(qc[i], new_xdim, new_ydim))));
+		computeSetSums();
+		printChannelSetRanking();
+		int[] channel_id = DeltaMapper.getChannels(min_set_id);
+
+		// The block map's deltas and maps come from the survey (all three
+		// channels at once); the other types' from getDeltas, below.
+		DeltaMapper.BlockSurvey survey = DeltaMapper.surveyedBlockMaps(new int[][] {qc[channel_id[0]], qc[channel_id[1]], qc[channel_id[2]]}, new_xdim, new_ydim);
+
+		// The 3 channels in parallel, each writing only its own row.
+		int[][]     per_channel_delta_bits       = new int[3][DeltaMapper.DELTA_TYPES];
+		int[][]     per_channel_map_bits         = new int[3][DeltaMapper.DELTA_TYPES];
+		boolean[][] per_channel_delta_compressed = new boolean[3][DeltaMapper.DELTA_TYPES];
+		boolean[][] per_channel_map_compressed   = new boolean[3][DeltaMapper.DELTA_TYPES];
+		byte[][][]  maps                         = new byte[3][DeltaMapper.DELTA_TYPES][];
+		ViewerSupport.parallel(3, i ->
+		{
+			for(int t = 0; t < DeltaMapper.DELTA_TYPES; t++)
+			{
+				ArrayList result = blockOrDeltas(survey, i, qc[channel_id[i]], new_xdim, new_ydim, t);
+				byte[] delta_bytes = packAndCompress((int[]) result.get(1));
+				per_channel_delta_bits[i][t]       = StringMapper.getBitlength(delta_bytes);
+				per_channel_delta_compressed[i][t] = (StringMapper.getIterations(delta_bytes) & 15) > 0;
+				if(DeltaMapper.hasMap(t))
+				{
+					maps[i][t] = (byte[]) result.get(2);
+				}
+			}
+		});
+
+		// Maps are ranked on what Save writes (DeltaMapper.writeMap), whose
+		// context form uses the previous channel's map, so they are sized
+		// once all three channels' maps exist.
+		ViewerSupport.parallel(DeltaMapper.DELTA_TYPES, t ->
+		{
+			if(!DeltaMapper.hasMap(t)) return;
+			for(int i = 0; i < 3; i++)
+			{
+				try
+				{
+					ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+					DeltaMapper.writeMap(new DataOutputStream(bytes), t, maps[i][t], (i > 0) ? maps[i - 1][t] : null, new_xdim);
+					per_channel_map_bits[i][t] = 8 * bytes.size();
+				}
+				catch(IOException e) { per_channel_map_bits[i][t] = Integer.MAX_VALUE / 8; }
+			}
+		});
+
+		int[]     delta_bits       = new int[DeltaMapper.DELTA_TYPES];
+		int[]     map_bits         = new int[DeltaMapper.DELTA_TYPES];
+		boolean[] delta_compressed = new boolean[DeltaMapper.DELTA_TYPES];
+		boolean[] map_compressed   = new boolean[DeltaMapper.DELTA_TYPES];
+		int[]     total            = new int[DeltaMapper.DELTA_TYPES];
+		for(int t = 0; t < DeltaMapper.DELTA_TYPES; t++)
+		{
+			for(int i = 0; i < 3; i++)
+			{
+				delta_bits[t]       += per_channel_delta_bits[i][t];
+				map_bits[t]         += per_channel_map_bits[i][t];
+				delta_compressed[t] |= per_channel_delta_compressed[i][t];
+				map_compressed[t]   |= per_channel_map_compressed[i][t];
+			}
+			total[t] = delta_bits[t] + map_bits[t];
+		}
+		int best = 0;
+		for(int t = 1; t < DeltaMapper.DELTA_TYPES; t++) if(total[t] < total[best]) best = t;
+		delta_type = best;
+		printDeltaTypeRanking(delta_bits, map_bits, delta_compressed, map_compressed, total);
+
+		// String or String*, whichever is smaller for the selected type.
+		int[] str_bits = new int[3], str_star_bits = new int[3];
+		ViewerSupport.parallel(3, i ->
+		{
+			int[] delta = (int[]) blockOrDeltas(survey, i, qc[channel_id[i]], new_xdim, new_ydim, delta_type).get(1);
+			str_bits[i]      = StringMapper.getBitlength((byte[]) StringMapper.getStringList(delta.clone(), false).get(3));
+			str_star_bits[i] = StringMapper.getBitlength((byte[]) StringMapper.getStringList(delta.clone(), true).get(3));
+		});
+		compress_type = (str_star_bits[0] + str_star_bits[1] + str_star_bits[2] < str_bits[0] + str_bits[1] + str_bits[2]) ? 2 : 1;
+		if(delta_type == 13) printBlockMaps(survey, new_xdim);
+	}
+
+	// ---- Block map (delta type 13) -------------------------------------------
+
+	/**
+	 * A channel's deltas for a delta type: the survey's for the block map (13),
+	 * DeltaMapper.getDeltas' for the others.
+	 *
+	 * @param survey     the block map survey of the three channels
+	 *                   (DeltaMapper.surveyedBlockMaps), or null if not type 13
+	 * @param i          the channel, in coding order
+	 * @param c          its values
+	 * @param xdim       the width
+	 * @param ydim       the height
+	 * @param delta_type the delta type
+	 * @return [sum, deltas, map, first value] (no map for types 0-5)
+	 */
+	private ArrayList blockOrDeltas(DeltaMapper.BlockSurvey survey, int i, int[] c, int xdim, int ydim, int delta_type)
+	{
+		if(delta_type != 13) return DeltaMapper.getDeltas(c, xdim, ydim, delta_type, scanline5_variant);
+		return DeltaMapper.surveyedDeltas(survey, i, c[0]);
+	}
+
+	/**
+	 * Prints the channel set, then each channel's block size, number of blocks
+	 * and predictors.
+	 *
+	 * @param survey the block map survey
+	 * @param xdim   the width
+	 */
+	private void printBlockMaps(DeltaMapper.BlockSurvey survey, int xdim)
+	{
+		System.out.print(DeltaMapper.describeBlockMaps(min_set_id, survey.maps, xdim));
+		System.out.println();
+	}
+
+	/**
+	 * The three channels the block map codes, in coding order, for the current
+	 * settings (with their own minimum and first-value arrays, so it can run in
+	 * the background).
+	 *
+	 * @param size the quantized size
+	 * @return the channels
+	 */
+	private int[][] blockChannels(int[] size)
+	{
+		int[][] qc  = quantizedChannels(size, true, new int[6], new int[6]);
+		int[] id = DeltaMapper.getChannels(DeltaMapper.bestChannelSet(qc, size[0], size[1]));
+		return new int[][] {qc[id[0]], qc[id[1]], qc[id[2]]};
+	}
+
+	/**
+	 * After a change to the settings: with the block map, surveys first (in the
+	 * background, with the other menus disabled) unless the survey for these
+	 * channels is kept, then applies.
+	 */
+	private void update()
+	{
+		if(delta_type != 13) { apply(); return; }
+		view.setMenusEnabled(false);
+		view.setStatus("surveying\u2026");
+		new SwingWorker<Void,Void>()
+		{
+			@Override protected Void doInBackground()
+			{
+				int[] size = DeltaMapper.getQuantizedSize(image_xdim, image_ydim, pixel_quant);
+				DeltaMapper.BlockSurvey survey = DeltaMapper.surveyedBlockMaps(blockChannels(size), size[0], size[1]);
+				printBlockMaps(survey, size[0]);
+				return null;
+			}
+			@Override protected void done()
+			{
+				try { get(); } catch(Exception e) { System.out.println("Survey: " + e); }
+				view.setMenusEnabled(true);
+				datatype_menu.setEnabled(entropy_type != 4);
+				view.setStatus(null);
+				apply();
+			}
+		}.execute();
+	}
+
+	// The six candidate channels after smoothing (if asked), resizing and
+	// quantizing (see DeltaMapper.getCandidateChannels); sets channel_min
+	// and channel_init.
+	private int[][] quantizedChannels(int[] size, boolean smooth)
+	{
+		return quantizedChannels(size, smooth, channel_min, channel_init);
+	}
+
+	/**
+	 * As quantizedChannels(size, smooth), filling min and init.
+	 *
+	 * @param size   the quantized size
+	 * @param smooth whether to smooth first
+	 * @param min    set to each candidate's minimum
+	 * @param init   set to each candidate's first value
+	 * @return the six candidate channels
+	 */
+	private int[][] quantizedChannels(int[] size, boolean smooth, int[] min, int[] init)
+	{
+		int[][] q = new int[3][];
+		ViewerSupport.parallel(3, i ->
+		{
+			int[] ch = source[i];
+			if(smooth && smooth_level > 0)  ch = DeltaMapper.bilateralSmooth(ch, image_xdim, image_ydim, smooth_level);
+			if(smooth && smooth2_level > 0) ch = DeltaMapper.anisotropicSmooth(ch, image_xdim, image_ydim, smooth2_level);
+			if(pixel_quant != 0) ch = ResizeMapper.resize(ch, image_xdim, size[0], size[1]);
+			q[i] = DeltaMapper.quantizeChannel(ch, pixel_shift);
+		});
+		int[][] qc = DeltaMapper.getCandidateChannels(q[0], q[1], q[2], min);
+		for(int i = 0; i < 6; i++) init[i] = qc[i][0];
+		return qc;
+	}
+
+	public DeltaWriter(String _filename)
+	{
+		filename = _filename;
+		try
+		{
+			file_length    = new File(filename).length();
+			original_image = ViewerSupport.readImage(filename);
+		}
+		catch(IOException e)
+		{
+			ViewerSupport.showError(null, e.getMessage());
+			ViewerSupport.exitIfNoWindows();
+			return;
+		}
+		image_xdim = original_image.getWidth();
+		image_ydim = original_image.getHeight();
+
+		int[] pixel = original_image.getRGB(0, 0, image_xdim, image_ydim, null, 0, image_xdim);
+		source = new int[3][pixel.length];
+		for(int i = 0; i < pixel.length; i++)
+		{
+			source[0][i] = (pixel[i] >> 16) & 0xff; source[1][i] = (pixel[i] >> 8) & 0xff; source[2][i] = pixel[i] & 0xff;
+		}
+		working_image = new BufferedImage(image_xdim, image_ydim, BufferedImage.TYPE_INT_RGB);
+		working_image.setRGB(0, 0, image_xdim, image_ydim, pixel, 0, image_xdim);
+
+		view = new ViewerSupport("Delta Writer  " + filename, image_xdim, image_ydim);
+		JFrame   frame    = view.frame;
+		JMenuBar menu_bar = frame.getJMenuBar();
+
+		JMenu file_menu = new JMenu("File");
+		JMenuItem open_item = new JMenuItem("Open...");
+		open_item.setAccelerator(KeyStroke.getKeyStroke(KeyEvent.VK_O, InputEvent.CTRL_DOWN_MASK));
+		open_item.addActionListener(e -> { FileDialog fd = new FileDialog(frame, "Open Image", FileDialog.LOAD); fd.setVisible(true); if(fd.getFile() != null) new DeltaWriter(fd.getDirectory() + fd.getFile()); });
+		file_menu.add(open_item); file_menu.addSeparator();
+		JMenuItem reset_item = new JMenuItem("Reset");
+		reset_item.addActionListener(e ->
+		{
+			smooth_level = 0; smooth2_level = 0; pixel_quant = 0; pixel_shift = 0; correction = 0;
+			smooth_slider.setValue(0); smooth2_slider.setValue(0); pquant_slider.setValue(0); pshift_slider.setValue(0); corr_slider.setValue(0);
+			update();
+		});
+		file_menu.add(reset_item);
+		JMenuItem save_item = new JMenuItem("Save"); save_item.addActionListener(new SaveHandler()); file_menu.add(save_item);
+
+		JMenu quant_menu = new JMenu("Quantization");
+		JSlider[] ss = new JSlider[1];
+		quant_menu.add(ViewerSupport.makeSliderDialog(frame, "Smooth", 0, 10, smooth_level, v -> { smooth_level = v; update(); }, ss)); smooth_slider = ss[0];
+		quant_menu.add(ViewerSupport.makeSliderDialog(frame, "Smooth2", 0, 10, smooth2_level, v -> { smooth2_level = v; update(); }, ss)); smooth2_slider = ss[0];
+		quant_menu.add(ViewerSupport.makeSliderDialog(frame, "Pixel Resolution", 0, 10, pixel_quant, v -> { pixel_quant = v; update(); }, ss)); pquant_slider = ss[0];
+		quant_menu.add(ViewerSupport.makeSliderDialog(frame, "Color Resolution", 0, 7, pixel_shift, v -> { pixel_shift = v; update(); }, ss)); pshift_slider = ss[0];
+		// Error Correction (below a separator) is not a quantizing step: it blends
+		// the preview back toward the original by correction/10. Preview only;
+		// the saved file is unaffected.
+		quant_menu.addSeparator();
+		quant_menu.add(ViewerSupport.makeSliderDialog(frame, "Error Correction", 0, 10, correction, v -> { correction = v; apply(); }, ss)); corr_slider = ss[0];
+
+		// Two dialogs, each with an Integer and a String button (all four in
+		// one group). Integer is disabled when a channel's range is too large.
+		datatype_menu = new JMenu("Datatype");
+		ButtonGroup cg = new ButtonGroup();
+		JRadioButton int_a = new JRadioButton("Integer"), str_a = new JRadioButton("String");
+		JRadioButton int_b = new JRadioButton("Integer"), str_b = new JRadioButton("String");
+		cg.add(int_a); cg.add(str_a); cg.add(int_b); cg.add(str_b);
+		compress_button = new JRadioButton[] {int_a, str_a};
+		int_radio_btns  = new JRadioButton[] {int_a, int_b};
+		(compress_type == 0 ? int_a : str_a).setSelected(true);
+		for(JRadioButton b : int_radio_btns) b.addActionListener(e -> { if(compress_type != 0) { compress_type = 0; apply(); } });
+		for(JRadioButton b : new JRadioButton[] {str_a, str_b}) b.addActionListener(e -> { if(compress_type == 0) { compress_type = 1; apply(); } });
+		datatype_menu.add(makeButtonDialog(frame, "Integer", new JPanel(new GridLayout(2, 1, 4, 4)), int_a, str_a));
+		datatype_menu.add(makeButtonDialog(frame, "String", new JPanel(), int_b, str_b));
+
+		JMenu delta_menu = new JMenu("Delta");
+		String[] dnames = {"H","V","Average","Med","Directional","Adaptive","Scanline 1","Scanline 2","Scanline 3","Scanline 4","Scanline 5","Map 1","Map 2","Block Map"};
+		delta_button = new JRadioButtonMenuItem[DeltaMapper.DELTA_TYPES]; ButtonGroup dg = new ButtonGroup();
+		for(int i = 0; i < DeltaMapper.DELTA_TYPES; i++)
+		{
+			final int dt = i;
+			delta_button[i] = new JRadioButtonMenuItem(dnames[i]); dg.add(delta_button[i]); delta_menu.add(delta_button[i]);
+			delta_button[i].addActionListener(e ->
+			{
+				if(delta_type == dt) return;
+				delta_type = dt;
+				update();
+			});
+		}
+		delta_button[delta_type].setSelected(true);
+
+		// The block map (delta type 13) has no settings: the survey chooses each
+		// channel's block size and predictor set (see update).
+
+		// entropy_type equals the button index: 0 LZ77, 1 Huffman, 2 Arithmetic,
+		// 3 Adaptive, 4 Context.
+		JMenu entropy_menu = new JMenu("Entropy");
+		entropy_button = new JRadioButtonMenuItem[DeltaWriter.ENTROPY_NAMES.length]; ButtonGroup eg = new ButtonGroup();
+		for(int i = 0; i < DeltaWriter.ENTROPY_NAMES.length; i++)
+		{
+			final int et = i;
+			entropy_button[i] = new JRadioButtonMenuItem(ENTROPY_NAMES[i]); eg.add(entropy_button[i]); entropy_menu.add(entropy_button[i]);
+			entropy_button[i].setSelected(entropy_type == i);
+			entropy_button[i].addActionListener(e -> { entropy_type = et; datatype_menu.setEnabled(et != 4); });
+		}
+		// Segment size for Arithmetic (see pixel_segment). Doesn't call
+		// apply(): segmentation only happens at Save time.
+		entropy_menu.addSeparator();
+		entropy_menu.add(ViewerSupport.makeSliderDialog(frame, "Segment Size", 0, 10, pixel_segment, v -> pixel_segment = v, ss)); segment_slider = ss[0];
+
+		menu_bar.add(file_menu); menu_bar.add(view.makeViewMenu()); menu_bar.add(quant_menu);
+		menu_bar.add(delta_menu); menu_bar.add(datatype_menu); menu_bar.add(entropy_menu);
+
+		view.setImage(original_image);
+		view.show();
+		SwingUtilities.invokeLater(() -> showInitialImage());
+	}
+
+	// A menu item opening a small dialog that holds two buttons.
+	private static JMenuItem makeButtonDialog(JFrame parent, String title, JPanel panel, JRadioButton a, JRadioButton b)
+	{
+		JDialog dialog = new JDialog(parent, title);
+		panel.add(a); panel.add(b); dialog.add(panel);
+		JMenuItem item = new JMenuItem(title);
+		item.addActionListener(e -> { Point p = parent.getLocation(); dialog.setLocation(p.x, p.y - 80); dialog.pack(); dialog.setVisible(true); });
+		return item;
+	}
+
+	// Applies the default quantization, then runs init() in the background
+	// with the other menus disabled so Apply and Save can't overlap it.
+	private void showInitialImage()
+	{
+		apply();
+		view.setMenusEnabled(false);
+		new SwingWorker<Void,Void>()
+		{
+			@Override protected Void doInBackground() { init(); return null; }
+			@Override protected void done()
+			{
+				try { get(); } catch(Exception e) { System.out.println("init: " + e); }
+				view.setMenusEnabled(true);
+				datatype_menu.setEnabled(entropy_type != 4);
+				delta_button[delta_type].setSelected(true);
+				compress_button[compress_type == 0 ? 0 : 1].setSelected(true);
+				apply();
+			}
+		}.execute();
+	}
+
+	// Packs and compresses an int[] (deltas, or a widened map) into a
+	// StringMapper bit string. Callers read both the bitlength and, via
+	// getIterations, whether it really compressed.
+	static byte[] packAndCompress(int[] values)
+	{
+		return StringMapper.compressStrings((byte[]) StringMapper.getStringList(values, false).get(3));
+	}
+
+	static int[] widen(byte[] b)
+	{
+		int[] v = new int[b.length];
+		for(int k = 0; k < b.length; k++) v[k] = b[k] & 0xFF;
+		return v;
+	}
+
+	private void computeSetSums()
+	{
+		for(int s = 0; s < 10; s++)
+		{
+			int[] c = DeltaMapper.getChannels(s);
+			set_sum[s] = channel_sum[c[0]] + channel_sum[c[1]] + channel_sum[c[2]];
+		}
+		min_set_id = 0;
+		for(int s = 1; s < 10; s++) if(set_sum[s] < set_sum[min_set_id]) min_set_id = s;
+	}
+
+	// Prints the ranked channel-set table (rank, channel composition, per-
+	// channel entropy estimate, total), marking the selected set.
+	private void printChannelSetRanking()
+	{
+		Integer[] order = new Integer[10];
+		for(int i = 0; i < 10; i++) order[i] = i;
+		Arrays.sort(order, (a, b) -> set_sum[a] - set_sum[b]);
+		System.out.println("Channel sets, smallest first: estimated bytes for each channel's deltas");
+		System.out.println("(entropy estimate, before real coding), and the set's total. <= marks the set used.");
+		System.out.println(String.format("      %-32s %10s %10s %10s %12s", "channel set", "1st", "2nd", "3rd", "total"));
+		for(int r = 0; r < 10; r++)
+		{
+			int idx = order[r];
+			int[] c = DeltaMapper.getChannels(idx);
+			System.out.println(String.format("  %2d. %-32s %10d %10d %10d %12d%s", r + 1, DeltaMapper.SET_NAMES[idx],
+				channel_sum[c[0]] / 8, channel_sum[c[1]] / 8, channel_sum[c[2]] / 8, set_sum[idx] / 8, (idx == min_set_id) ? "  <=" : ""));
+		}
+		System.out.println();
+	}
+
+	// Prints the ranked delta-type table in bytes: deltas, map (types with
+	// a map only) and total, marking the selected type.
+	private void printDeltaTypeRanking(int[] delta_bits, int[] map_bits, boolean[] delta_compressed, boolean[] map_compressed, int[] total)
+	{
+		Integer[] order = new Integer[DeltaMapper.DELTA_TYPES];
+		for(int i = 0; i < DeltaMapper.DELTA_TYPES; i++) order[i] = i;
+		Arrays.sort(order, (a, b) -> total[a] - total[b]);
+		System.out.println("Delta types, smallest first: bytes for the deltas and, for types that have one, the");
+		System.out.println("predictor map, all 3 channels. <= marks the type chosen.");
+		System.out.println(String.format("      %-16s %12s %12s %12s", "delta type", "deltas", "map", "total"));
+		for(int r = 0; r < DeltaMapper.DELTA_TYPES; r++)
+		{
+			int idx = order[r];
+			System.out.println(String.format("  %2d. %-16s %12d %12s %12d%s",
+				r + 1, DeltaMapper.DELTA_TYPE_NAMES[idx], delta_bits[idx] / 8,
+				DeltaMapper.hasMap(idx) ? String.valueOf(map_bits[idx] / 8) : "", total[idx] / 8, (idx == delta_type) ? "  <=" : ""));
+		}
+		System.out.println();
+	}
+
+	// ---- Apply --------------------------------------------------------------
+
+	// Quantizes, picks the channel set, codes the deltas (what Save writes),
+	// then decodes them the way DeltaReader does for the preview.
+	void apply()
+	{
+		applied = false;
+		try { applyImpl(); applied = true; }
+		catch(Exception e) { System.out.println("Apply: " + e); e.printStackTrace(); }
+	}
+
+	private void applyImpl()
+	{
+		int[]   size = DeltaMapper.getQuantizedSize(image_xdim, image_ydim, pixel_quant);
+		int     new_xdim = size[0], new_ydim = size[1];
+		int[][] qc = quantizedChannels(size, true);
+		ViewerSupport.parallel(6, i -> channel_sum[i] = (int) Math.floor(CodeMapper.getShannonLimit(DeltaMapper.getIdealFrequency2(qc[i], new_xdim, new_ydim))));
+		computeSetSums();
+		int[] channel_id = DeltaMapper.getChannels(min_set_id);
+
+		// Integer needs every delta - delta_min to fit in a byte.
+		boolean int_allowed = true;
+		for(int i = 0; i < 3 && int_allowed; i++)
+		{
+			int[] c = qc[channel_id[i]];
+			int cmin = c[0], cmax = c[0];
+			for(int v : c) { if(v < cmin) cmin = v; if(v > cmax) cmax = v; }
+			if((cmax - cmin) * 2 > 255) int_allowed = false;
+		}
+		if(!int_allowed && compress_type == 0) { compress_type = 1; SwingUtilities.invokeLater(() -> compress_button[1].setSelected(true)); }
+		final boolean enable_int = int_allowed;
+		SwingUtilities.invokeLater(() -> { for(JRadioButton b : int_radio_btns) b.setEnabled(enable_int); });
+
+		// The 3 chosen channels in parallel: deltas, encode, then decode
+		// back. Each writes only its own slot.
+		int[][]  new_table   = new int[3][];
+		byte[][] new_payload = new byte[3][];
+		byte[][] new_map     = new byte[3][];
+		int[][]  new_delta   = new int[3][];
+		int[][]  dc          = new int[3][];
+		int[][]  raw         = new int[3][];   // decoded, before the minimum: the next channel's reference
+		// The block map: the survey's deltas and maps (kept from update or the
+		// analysis, or surveyed now).
+		final DeltaMapper.BlockSurvey survey = (delta_type == 13)
+			? DeltaMapper.surveyedBlockMaps(new int[][] {qc[channel_id[0]], qc[channel_id[1]], qc[channel_id[2]]}, new_xdim, new_ydim)
+			: null;
+		ViewerSupport.channels(delta_type == 13, 3, i ->
+		{
+			int   j = channel_id[i];
+			int[] c = qc[j];
+			ArrayList result = blockOrDeltas(survey, i, c, new_xdim, new_ydim, delta_type);
+			int[] delta = (int[]) result.get(1);
+			new_delta[i] = delta.clone();
+			if(DeltaMapper.hasMap(delta_type)) new_map[i] = (byte[]) result.get(2);
+
+			// Integer: one byte per delta, delta - delta_min. The bit length,
+			// string length and iterations aren't used and keep their last
+			// values.
+			if(compress_type == 0)
+			{
+				channel_delta_min[j] = (int) StringMapper.getHistogram(delta).get(0);
+				byte[] b = new byte[delta.length];
+				for(int k = 1; k < delta.length; k++) b[k] = (byte)(delta[k] - channel_delta_min[j]);
+				new_payload[i] = b;
+			}
+			else
+			{
+				ArrayList dsl = StringMapper.getStringList(delta, compress_type == 2);
+				channel_delta_min[j] = (int) dsl.get(0); channel_length[j] = (int) dsl.get(1);
+				new_table[i] = (int[]) dsl.get(2); new_payload[i] = (byte[]) dsl.get(3);
+				channel_compressed_length[j] = StringMapper.getBitlength(new_payload[i]);
+				channel_iterations[i] = StringMapper.getIterations(new_payload[i]);
+			}
+
+			// Decode back, as DeltaReader does.
+			int[] d2;
+			if(compress_type == 0)
+			{
+				d2 = new int[new_xdim * new_ydim];
+				for(int k = 1; k < d2.length; k++) d2[k] = (new_payload[i][k] & 0xFF) + channel_delta_min[j];
+			}
+			else
+			{
+				byte[] str = StringMapper.decompressStrings(new_payload[i]);
+				d2 = StringMapper.unpackStrings(str, new_table[i], new_xdim * new_ydim, channel_length[j]);
+				d2[0] = 0; for(int k = 1; k < d2.length; k++) d2[k] += channel_delta_min[j];
+			}
+			int[] ch = DeltaMapper.getValuesFromDeltas(d2, new_xdim, new_ydim, channel_init[j], delta_type, new_map[i], scanline5_variant, (i > 0) ? raw[i - 1] : null);
+			raw[i] = ch.clone();
+			if(j > 2) for(int k = 0; k < ch.length; k++) ch[k] += channel_min[j];
+			dc[i] = ch;
+		});
+		table = new_table; payload = new_payload; map = new_map;
+		delta_list = new_delta; delta_xdim = new_xdim;
+
+		// Like DeltaReader: recombine the channels first, then resize, then
+		// shift. Resizing each channel before recombining gives different
+		// results (ResizeMapper rounds down).
+		int[][] bgr = DeltaMapper.getBlueGreenRed(min_set_id, dc[0], dc[1], dc[2]);
+		ViewerSupport.parallel(3, c ->
+		{
+			if(pixel_quant != 0) bgr[c] = ResizeMapper.resize(bgr[c], new_xdim, image_xdim, image_ydim);
+			if(pixel_shift != 0) bgr[c] = DeltaMapper.shift(bgr[c], pixel_shift);
+		});
+
+		int[] rgb = new int[image_xdim * image_ydim];
+		double f = correction / 10.0;
+		for(int i = 0; i < rgb.length; i++)
+		{
+			int b = bgr[0][i], g = bgr[1][i], r = bgr[2][i];
+			if(correction != 0) { b += (int)((source[0][i] - b) * f); g += (int)((source[1][i] - g) * f); r += (int)((source[2][i] - r) * f); }
+			rgb[i] = (b << 16) + (g << 8) + r;
+		}
+		working_image.setRGB(0, 0, image_xdim, image_ydim, rgb, 0, image_xdim);
+		view.setImage(working_image);
+	}
+
+	// ---- Save ---------------------------------------------------------------
+
+	class SaveHandler implements ActionListener
+	{
+		public void actionPerformed(ActionEvent event)
+		{
+			if(!applied) apply();
+			if(!applied) { ViewerSupport.showError(view.frame, "Nothing saved: the last Apply failed."); return; }
+			File file = new File("foo");
+			try(DataOutputStream out = new DataOutputStream(new BufferedOutputStream(new FileOutputStream(file))))
+			{
+				save(out);
+			}
+			catch(Exception e)
+			{
+				file.delete();
+				ViewerSupport.showError(view.frame, "Save failed: " + e);
+				e.printStackTrace();
+				return;
+			}
+			int raw = image_xdim * image_ydim * 3;
+			System.out.println("Original compression rate: " + String.format("%.4f", (double) file_length / raw));
+			System.out.println("Output  compression rate:  " + String.format("%.4f", (double) file.length() / raw));
+		}
+
+		// Header, then per channel: min, init, delta min, bit lengths,
+		// iterations, map (types 6-13), string table (String and String*, not
+		// Context), then the entropy-coded payload.
+		private void save(DataOutputStream out) throws IOException
+		{
+			int[] channel_id = DeltaMapper.getChannels(min_set_id);
+			out.writeByte(FORMAT_ID); out.writeByte((delta_type == 13) ? FORMAT_VERSION : NO_BLOCK_MAP_VERSION);
+			out.writeShort(image_xdim); out.writeShort(image_ydim); out.writeByte(pixel_shift); out.writeByte(pixel_quant);
+			out.writeByte(min_set_id); out.writeByte(delta_type); out.writeByte(compress_type); out.writeByte(entropy_type); out.writeByte(scanline5_variant);
+			out.writeByte(0); out.writeByte(0);   // pixel pyramid levels and saddle: no longer used
+
+			long t0 = System.nanoTime();
+			byte[][] coded = (entropy_type == 4) ? contextCode(delta_list, delta_xdim) : entropyCode(payload, entropy_type, pixel_segment);
+			System.out.println("Entropy coding [" + ENTROPY_NAMES[entropy_type] + "] took " + ViewerSupport.formatDuration(System.nanoTime() - t0));
+
+			for(int i = 0; i < 3; i++)
+			{
+				int j = channel_id[i];
+				out.writeInt(channel_min[j]); out.writeInt(channel_init[j]); out.writeInt(channel_delta_min[j]);
+				out.writeInt(channel_length[j]); out.writeInt(channel_compressed_length[j]); out.writeByte(channel_iterations[i]);
+				if(DeltaMapper.hasMap(delta_type)) DeltaMapper.writeMap(out, delta_type, map[i], (i > 0) ? map[i - 1] : null, delta_xdim);
+				if(compress_type > 0 && entropy_type != 4) DeltaMapper.writeTable(out, table[i]);
+				out.write(coded[i]);
+			}
+		}
+	}
+
+	// Context entropy type (DeltaWriter2 uses it too): each channel's deltas
+	// context-coded directly (DeltaMapper.packContextDeltas), with channel
+	// i's contexts using channels 0..i-1, so the reader decodes in order.
+	// Checks that each channel decodes back.
+	static byte[][] contextCode(int[][] delta, int xdim)
+	{
+		byte[][] coded = new byte[3][];
+		ViewerSupport.parallel(3, i ->
+		{
+			try
+			{
+				int[][] previous = Arrays.copyOf(delta, i);
+				coded[i] = DeltaMapper.packContextDeltas(delta[i], previous, xdim);
+				int[] back = DeltaMapper.readContextDeltas(new DataInputStream(new ByteArrayInputStream(coded[i])), delta[i].length, previous, xdim);
+				if(!Arrays.equals(back, delta[i])) System.out.println("WARNING: channel " + i + " context-coded deltas do not decode back.");
+			}
+			catch(IOException e) { throw new UncheckedIOException(e); }
+		});
+		return coded;
+	}
+
+	// Entropy-codes the 3 channel payloads (DeltaWriter2 uses it too). Each
+	// result is what follows the channel's table in the file:
+	//   LZ77:       int payload length, int Deflated length, Deflated payload;
+	//   Huffman:    int length + the 256 code lengths (Deflated), int length + the code;
+	//   Arithmetic: the frequency tables (ArithmeticMapper.packFrequencies),
+	//               then each block's int length and coded bytes;
+	//   Adaptive:   int length + the coded bytes.
+	static byte[][] entropyCode(byte[][] payload, int entropy_type, int pixel_segment)
+	{
+		byte[][] coded = new byte[3][];
+		if(entropy_type == 0)
+		{
+			ViewerSupport.parallel(3, i ->
+			{
+				byte[] zipped = CodeMapper.deflate(payload[i], Deflater.BEST_COMPRESSION);
+				coded[i] = java.nio.ByteBuffer.allocate(8 + zipped.length).putInt(payload[i].length).putInt(zipped.length).put(zipped).array();
+			});
+		}
+		else if(entropy_type == 1)
+		{
+			ViewerSupport.parallel(3, i ->
+			{
+				byte[] lengths = CodeMapper.getRegularHuffmanLength(ArithmeticMapper.getFrequency(payload[i]));
+				byte[] code    = CodeMapper.packRegularCode(payload[i], lengths);
+				if(!Arrays.equals(payload[i], CodeMapper.unpackRegularCode(code, lengths, payload[i].length)))
+					System.out.println("WARNING: channel " + i + " Huffman payload does not decode back.");
+				byte[] tables = CodeMapper.packRegularTables(new byte[][] {lengths}, Deflater.BEST_COMPRESSION);
+				coded[i] = java.nio.ByteBuffer.allocate(8 + tables.length + code.length).putInt(tables.length).put(tables).putInt(code.length).put(code).array();
+			});
+		}
+		else if(entropy_type == 2)
+		{
+			// All blocks of all 3 channels are coded on the shared pool.
+			byte[][][] blocks = new byte[3][][];
+			int[][][]  freqs  = new int[3][][];
+			byte[][][] enc    = new byte[3][][];
+			for(int i = 0; i < 3; i++)
+			{
+				int n = (pixel_segment >= 10) ? 1 : Math.max(1, payload[i].length / (500 + pixel_segment * 500));
+				blocks[i] = ArithmeticMapper.getBlocks(payload[i], n);
+				freqs[i]  = new int[n][];
+				enc[i]    = new byte[n][];
+				for(int m = 0; m < n; m++) freqs[i][m] = ArithmeticMapper.getFrequency(blocks[i][m]);
+			}
+			int n0 = blocks[0].length, n1 = blocks[1].length;
+			ViewerSupport.parallel(n0 + n1 + blocks[2].length, b ->
+			{
+				int i = (b < n0) ? 0 : (b < n0 + n1) ? 1 : 2;
+				int m = b - ((i == 0) ? 0 : (i == 1) ? n0 : n0 + n1);
+				enc[i][m] = ArithmeticMapper.getIntervalValueFastFenwick(blocks[i][m], freqs[i][m]);
+			});
+			ViewerSupport.parallel(3, i ->
+			{
+				ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+				DataOutputStream d = new DataOutputStream(bytes);
+				try
+				{
+					d.write(ArithmeticMapper.packFrequencies(freqs[i], Deflater.BEST_COMPRESSION));
+					for(byte[] e : enc[i]) { d.writeInt(e.length); d.write(e); }
+				}
+				catch(IOException e) { throw new UncheckedIOException(e); }
+				coded[i] = bytes.toByteArray();
+			});
+		}
+		else
+		{
+			ViewerSupport.parallel(3, i ->
+			{
+				byte[] code = ArithmeticMapper.getIntervalValueAdaptive(payload[i]);
+				if(!Arrays.equals(payload[i], ArithmeticMapper.getArithmeticValuesAdaptive(code, payload[i].length)))
+					System.out.println("WARNING: channel " + i + " adaptive payload does not decode back.");
+				coded[i] = java.nio.ByteBuffer.allocate(4 + code.length).putInt(code.length).put(code).array();
+			});
+		}
+		return coded;
+	}
+}
