@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-simple_writer2.py version 1.0 -- SimpleWriter2.java for Python (PySide6).
+simple_writer2.py version 1.1 -- SimpleWriter2.java for Python (PySide6).
 
 simple_writer.py without the analysis, for speed: one channel set, green,
 blue-green and red-green (SET_ID; the set the analysis picks most often, and
@@ -17,7 +17,7 @@ before it. Nothing is fitted or coded until Save. Pixel Resolution resizes
 with resize_mapper.resize2 (centred). The Bands menu splits the image into up
 to MAX_BANDS bands of rows that a reader can decode at the same time, for a
 small cost per band boundary. Saves (to the file "foo", as the Java version
-does) in Simple 2 format 'F' version 1, read by simple_reader2.py and
+does) in Simple 2 format 'F' version 2, read by simple_reader2.py and
 SimpleReader2.java.
 
     python3 simple_writer2.py [image]
@@ -42,11 +42,11 @@ from java_io import DataOutput
 from simple_writer import band_start, describe_bands
 
 FORMAT_ID = ord('F')
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2     # 2: the fit from 6 neighbours, solved at every 4th pixel (1: 8 neighbours, every 3rd; version 1.0 wrote it)
 SET_ID = 7             # the channel set coded: green, blue-green, red-green (delta_mapper.get_channels)
 CHANNELS = tuple(dm.get_channels(SET_ID))   # its channels, in coding order (delta_mapper's channel ids)
 RADIUS = 10            # the least-squares window radius, for every channel
-EVERY = 3              # how often along a row the fit is solved: at every EVERY-th pixel, the pixels between using the last solution
+EVERY = 4              # how often along a row the fit is solved: at every EVERY-th pixel, the pixels between using the last solution
 MAX_BANDS = 16         # the most bands Save offers
 BAND_MIN_ROWS = 64     # the fewest rows (of the quantized image) a band may have
 
@@ -54,7 +54,7 @@ BAND_MIN_ROWS = 64     # the fewest rows (of the quantized image) a band may hav
 def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, n):
     """Codes the channels (as quantized, in coding order, difference
     channels less their minimums mins) and returns (the file's bytes, the
-    seconds the decode check took) (SimpleWriter2.encode). Format 1. Header: FORMAT_ID, FORMAT_VERSION,
+    seconds the decode check took) (SimpleWriter2.encode). Format 2. Header: FORMAT_ID, FORMAT_VERSION,
     width, height (unsigned shorts), pixel_shift, pixel_quant; per channel
     (coding order) int min; the number of bands n (an unsigned byte), n int
     lengths, and the n bands. Band b is rows band_start(b) to

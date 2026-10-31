@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-simple_reader2.py version 1.0 -- SimpleReader2.java for Python (PySide6).
+simple_reader2.py version 1.1 -- SimpleReader2.java for Python (PySide6).
 
-Reads Simple 2 format 'F' version 1, from simple_writer2.py or
+Reads Simple 2 format 'F' version 2 only, from simple_writer2.py or
 SimpleWriter2.java: the channels green, blue-green and red-green
 (simple_writer2.SET_ID), every interior pixel predicted by the least-squares
 fit from the rows above (the wide clamp, window radius simple_writer2.RADIUS,
@@ -38,7 +38,7 @@ import viewer_support as vs
 from java_io import DataInput
 
 FORMAT_ID = ord('F')
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2   # 2: the fit from 6 neighbours, solved at every 4th pixel (1: 8 neighbours, every 3rd)
 CHUNK = 1 << 16   # how many coded bytes are read at a time, saying each time that they have arrived (SimpleReader2.CHUNK)
 SPLIT_FITS = None  # whether each row's fits are split into tasks (delta_mapper.get_values_from_row_fit_channels): None splits them only with half the cores left free by the bands' channel threads (3 a band) and rows at least SPLIT_MIN_WIDTH wide
 SPLIT_MIN_WIDTH = 2048   # the narrowest rows whose fits are split into tasks (narrower ones gain less than the tasks cost)

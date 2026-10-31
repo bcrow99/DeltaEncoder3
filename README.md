@@ -17,7 +17,7 @@ formats as their Java versions, and also save to "foo":
 python3 delta_writer2.py [image]     # Delta format, read by delta_reader.py
 python3 simple_writer.py [image]     # Simple format 'S' version 8
 python3 simple_reader.py foo
-python3 simple_writer2.py [image]    # Simple 2 format 'F' version 1
+python3 simple_writer2.py [image]    # Simple 2 format 'F' version 2
 python3 simple_reader2.py foo
 python3 block_writer.py [image]      # Block format 'B'
 python3 block_reader.py foo

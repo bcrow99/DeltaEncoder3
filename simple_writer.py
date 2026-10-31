@@ -46,13 +46,18 @@ FORMAT_ID = ord('S')
 FORMAT_VERSION = 8   # 3 to 5: unary strings or block maps with a choice of delta type and entropy coder (no longer read); 6: least squares alone, a window radius and clamp per channel, in bands; 7: 6 with centred resizing (resize_mapper.resize2); 8: 7 with the wide clamp only (no clamp byte)
 MAX_BANDS = 16       # the most bands Save offers
 BAND_MIN_ROWS = 64   # the fewest rows (of the quantized image) a band may have
+TIE_SET = 7          # the channel set best_set picks when it ties for the smallest estimate: green, blue-green, red-green
 
 QUANT_SETTLE_MS = 400   # how long a quantization slider must rest before the analysis runs again
 
 
 def best_set(channel_sum):
-    """The channel set with the smallest summed estimate (first on a tie)."""
-    best, best_sum = 0, 2147483647
+    """The channel set with the smallest summed estimate: on a tie, TIE_SET
+    if it is one of those tied (on an image where the estimates can't tell
+    the sets apart, such as a gray one, its difference channels code
+    smaller), otherwise the first (SimpleWriter.bestSet)."""
+    c = dm.get_channels(TIE_SET)
+    best, best_sum = TIE_SET, channel_sum[c[0]] + channel_sum[c[1]] + channel_sum[c[2]]
     for s in range(10):
         c = dm.get_channels(s)
         t = channel_sum[c[0]] + channel_sum[c[1]] + channel_sum[c[2]]

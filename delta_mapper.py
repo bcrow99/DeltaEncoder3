@@ -2121,14 +2121,18 @@ def get_values_from_least_squares_channels(mixed, xdim, ydim, init, radius, ever
 # row's fits depend only on the rows before it and are solved, in parallel,
 # before the row is decoded. Solved at every every-th pixel along a row, from
 # column 1 (the pixels up to the next use its solution); where a fit can't be
-# solved, those pixels are predicted by a (the pixel to the left). The wide
-# clamp. The column sums are exact integers, and the solution is in the
-# Java's order, so both get the same values.
+# solved, those pixels are predicted by a (the pixel to the left). The fit is
+# from 6 of the 8 neighbours (W, N, NW, NE, WW, NNE: not NN and NEE, which cost
+# a quarter of the run time for about a quarter of a percent of the file); the
+# wide clamp is still over all 8. The column sums are exact integers, and the
+# solution is in the Java's order, so both get the same values.
+
+RF_SPATIAL = 6   # the neighbours fitted (RowFit.SPATIAL), features 0 to 5
 
 @njit(inline="always")   # a call per pixel passing arrays is slow in Numba
 def _rf_products(v, ref, has_ref, xdim, nf, y, x, z, out):
     """Pixel (y, x)'s products into out."""
-    _ls_features(v, ref, has_ref, xdim, nf, y, x, z)
+    _rf_features(v, ref, has_ref, xdim, nf, y, x, z)
     m = nf + 2
     t = 0
     for i in range(m):
@@ -2142,7 +2146,7 @@ def _rf_products(v, ref, has_ref, xdim, nf, y, x, z, out):
 def _rf_start(v, ref, has_ref, xdim, y0, r, col, z, p):
     """Sets the columns to row y0's window (rows y0 - r .. y0 - 1, from 1)
     (RowFit.start)."""
-    nf = 11 if has_ref else 8
+    nf = RF_SPATIAL + 3 if has_ref else RF_SPATIAL
     m = nf + 2
     nt = m * (m + 1) // 2
     col[:] = 0
@@ -2157,21 +2161,29 @@ def _rf_start(v, ref, has_ref, xdim, y0, r, col, z, p):
 
 @njit(inline="always")   # a call per pixel passing arrays is slow in Numba
 def _rf_features(v, ref, has_ref, xdim, nf, y, x, z):
-    """As _ls_features, with the neighbours read directly where none needs
-    clamping to the image (RowFit.features(int, int, int[]))."""
+    """Sets z to the features of pixel (y, x) (W, N, NW, NE, WW, NNE and,
+    after the first channel, the previous channel at the pixel, to its left
+    and above), 1, and its value, the neighbours read directly where none
+    needs clamping to the image (RowFit.features)."""
     k = y * xdim + x
     if y >= 2 and x >= 2 and x <= xdim - 3:
         up = k - xdim
         up2 = up - xdim
-        z[0] = v[k - 1]; z[1] = v[up]; z[2] = v[up - 1]; z[3] = v[up + 1]
-        z[4] = v[k - 2]; z[5] = v[up2]; z[6] = v[up + 2]; z[7] = v[up2 + 1]
+        z[0] = v[k - 1]      # W
+        z[1] = v[up]         # N
+        z[2] = v[up - 1]     # NW
+        z[3] = v[up + 1]     # NE
+        z[4] = v[k - 2]      # WW
+        z[5] = v[up2 + 1]    # NNE
     else:
-        z[0] = _ls_at(v, y, x - 1, xdim); z[1] = _ls_at(v, y - 1, x, xdim)
-        z[2] = _ls_at(v, y - 1, x - 1, xdim); z[3] = _ls_at(v, y - 1, x + 1, xdim)
-        z[4] = _ls_at(v, y, x - 2, xdim); z[5] = _ls_at(v, y - 2, x, xdim)
-        z[6] = _ls_at(v, y - 1, x + 2, xdim); z[7] = _ls_at(v, y - 2, x + 1, xdim)
+        z[0] = _ls_at(v, y, x - 1, xdim)
+        z[1] = _ls_at(v, y - 1, x, xdim)
+        z[2] = _ls_at(v, y - 1, x - 1, xdim)
+        z[3] = _ls_at(v, y - 1, x + 1, xdim)
+        z[4] = _ls_at(v, y, x - 2, xdim)
+        z[5] = _ls_at(v, y - 2, x + 1, xdim)
     if has_ref:
-        z[8] = ref[k]; z[9] = ref[k - 1]; z[10] = ref[k - xdim]
+        z[6] = ref[k]; z[7] = ref[k - 1]; z[8] = ref[k - xdim]
     z[nf] = 1
     z[nf + 1] = v[k]
 
@@ -2182,7 +2194,7 @@ def _rf_advance(v, ref, has_ref, xdim, y, r, col, c0, c1, za, zd):
     drops row y - 1 - r (RowFit.addColumns; y - 1 >= 1): each column gains
     the added pixel's products and loses the dropped one's, in one pass (the
     sums are ints, so the same in any order). za, zd: two vectors of nf + 2."""
-    nf = 11 if has_ref else 8
+    nf = RF_SPATIAL + 3 if has_ref else RF_SPATIAL
     m = nf + 2
     nt = m * (m + 1) // 2
     drop = y - 1 - r
@@ -2290,16 +2302,17 @@ def _rf_predict(v, ref, has_ref, xdim, nf, y, x, every, coef, valid, z):
     pc = _ls_at(v, y - 1, x - 1, xdim); pd = _ls_at(v, y - 1, x + 1, xdim)
     if not valid[p]:
         return pa
-    _ls_features(v, ref, has_ref, xdim, nf, y, x, z)
+    _rf_features(v, ref, has_ref, xdim, nf, y, x, z)
     s = 0.0
     o = p * n
     for i in range(n):
         s += coef[o + i] * z[i]
+    # The clamp is over all 8 neighbours, the two not fitted (NN, NEE) too.
+    ww = z[4]; nne = z[5]; nn = _ls_at(v, y - 2, x, xdim); nee = _ls_at(v, y - 1, x + 2, xdim)
     lo = min(min(pa, pb), min(pc, pd))
     hi = max(max(pa, pb), max(pc, pd))
-    for i in range(4, 8):
-        lo = min(lo, z[i])
-        hi = max(hi, z[i])
+    lo = min(min(lo, ww), min(min(nne, nn), nee))
+    hi = max(max(hi, ww), max(max(nne, nn), nee))
     w = max(lo - 2, min(hi + 2, s))
     return int(np.floor(w + 0.5))
 
@@ -2307,7 +2320,7 @@ def _rf_predict(v, ref, has_ref, xdim, nf, y, x, every, coef, valid, z):
 def _rf_state(xdim, has_ref, every):
     """(col, coef, valid, z, p, win, a, b, dg, za, zd, points): a RowFit's
     columns and a row's solutions, and one task's working arrays (_rf_work)."""
-    nf = 11 if has_ref else 8
+    nf = RF_SPATIAL + 3 if has_ref else RF_SPATIAL
     m = nf + 2
     nt = m * (m + 1) // 2
     n = nf + 1
@@ -2329,7 +2342,7 @@ def _rf_work(nf):
 def _rf_band(v, ref, has_ref, xdim, y0, y1, out, r, every, col, coef, valid, z, p, win, a, b, dg, za, zd, points):
     """The encoder's predictions for rows y0..y1-1, the window started at
     y0 on its own (RowFit.plane's bands)."""
-    nf = 11 if has_ref else 8
+    nf = RF_SPATIAL + 3 if has_ref else RF_SPATIAL
     _rf_start(v, ref, has_ref, xdim, y0, r, col, z, p)
     for y in range(y0, y1):
         if y > y0 and y - 1 >= 1:
@@ -2387,7 +2400,7 @@ def _row_fit_row(ref, has_ref, xdim, ydim, init, every, data, value, previous, c
     (coef, valid); state is the delta decoder's (_mix_state); cross, cb, fwd,
     c9b and earlier hold the earlier channels' terms, filled here as far as
     row y + 1 (the earlier channels must be decoded to row y + 1)."""
-    nf = 11 if has_ref else 8
+    nf = RF_SPATIAL + 3 if has_ref else RF_SPATIAL
     if m == 3:
         _mix_earlier_rows(previous, xdim, ydim, MIX_CROSS_TABLE, cross, cb, fwd, c9b, earlier, min(ydim, y + 1))
     for x in range(xdim):
@@ -2414,7 +2427,7 @@ def _row_fit_row_inline(ref, has_ref, xdim, ydim, init, every, data, value, prev
     already fill the cores (get_values_from_row_fit_channels), so that each
     row is a single call."""
     if y >= 1:
-        nf = 11 if has_ref else 8
+        nf = RF_SPATIAL + 3 if has_ref else RF_SPATIAL
         if y >= 2:
             _rf_advance(dst, ref, has_ref, xdim, y, r, col, 1, xdim - 1, za, zd)
         _rf_solve(col, xdim, r, nf, every, 0, points, coef, valid, win, a, b, dg)
@@ -2473,7 +2486,7 @@ def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every, spl
                 arriving.wait_for(6)       # the decoder's first reads: the cache byte and 5 code bytes
             m = 3 if i > 0 else 2
             has_ref = i > 0
-            nf = 11 if has_ref else 8
+            nf = RF_SPATIAL + 3 if has_ref else RF_SPATIAL
             r = radius[i]
             state = _mix_state(coded, m, len(table), _mix_contexts_count(True))
             col, coef, valid, z, _, _, _, _, _, _, _, points = _rf_state(xdim, has_ref, every)
