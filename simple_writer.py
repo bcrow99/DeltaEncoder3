@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-simple_writer.py version 3.2 -- SimpleWriter.java for Python (PySide6).
+simple_writer.py version 3.3 -- SimpleWriter.java for Python (PySide6).
 
 A writer with one predictor and one entropy coder: every interior pixel is
 predicted by the least-squares fit (at each pixel, the linear predictor that
@@ -16,9 +16,10 @@ resizes with resize_mapper.resize2 (centred). The Bands menu splits the image
 into up to MAX_BANDS bands of rows that a reader can decode at the same time,
 for a small cost per band boundary (the fit and the contexts start again at
 each band's top); the reader also decodes a band's three channels at the same
-time. Saves
-(to the file "foo", as the Java version does) in Simple format 'S' version
-8, read by simple_reader.py and SimpleReader.java.
+time. Save analyses and codes the image twice (encode), printing both
+times (the first includes compiling the code) and the decode check's
+apart. Saves (to the file "foo", as the Java version does) in Simple format
+'S' version 8, read by simple_reader.py and SimpleReader.java.
 
     python3 simple_writer.py [image]
 
@@ -241,86 +242,125 @@ class SimpleCoder:
         self.applied = True
         return rgb
 
+    def encode(self):
+        """(The file's bytes, the seconds the decode check took): the
+        analysis and the coding at the current quantization (encode)."""
+        size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
+        qc, mins, _ = self.quantized_channels(size)
+        return encode(qc, mins, size[0], self.image_xdim, self.image_ydim, self.pixel_shift, self.pixel_quant, self.bands_used())
+
     def save(self, filename="foo"):
-        """Codes the image (encode) and writes it. Returns the file size."""
-        data = self.encode()
+        """Analyses and codes the image (encode), twice, and writes it;
+        prints both times (the first includes compiling the code: Numba's,
+        the first time it runs, or loading it from the cache), without the
+        decode check, and the check's time (SimpleWriter.SaveHandler).
+        Returns the file size."""
+        took, check = [], []
+        data = None
+        for _ in range(2):
+            start = time.perf_counter()
+            got, c = self.encode()
+            took.append(time.perf_counter() - start - c)
+            check.append(c)
+            if data is not None and got != data:
+                print("WARNING: the second coding differs from the first.")
+            data = got
         with open(filename, "wb") as f:
             f.write(data)
         n = self.bands_used()
         raw = self.image_xdim * self.image_ydim * 3
+        w, rows = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
         if n > 1:
-            print("Saved %s: %s bytes (%s)" % (os.path.basename(filename), format(len(data), ","),
-                                               describe_bands(n, len(self.value_list[0]) // self.delta_xdim)))
+            print("Saved %s: %s bytes (%s)" % (os.path.basename(filename), format(len(data), ","), describe_bands(n, rows)))
         else:
             print("Saved %s: %s bytes" % (os.path.basename(filename), format(len(data), ",")))
+        print("Coded %d x %d (%s pixels)" % (w, rows, format(w * rows, ",")))
+        print("Run time plus compile time: " + vs.format_duration(took[0]))
+        print("Run time only:              " + vs.format_duration(took[1]))
+        print("Decode check:               " + vs.format_duration(check[1]))
         print("Original compression rate: %.4f" % (self.file_length / raw))
         print("Output  compression rate:  %.4f" % (len(data) / raw))
         print()
         return len(data)
 
-    def encode(self):
-        """Format 8. Header: FORMAT_ID, FORMAT_VERSION, width, height
-        (unsigned shorts), pixel_shift, pixel_quant, channel set; per channel
-        (coding order) int min and the window radius (an unsigned byte); the
-        number of bands n (an unsigned byte), n int lengths, and the n bands.
-        Band b is rows band_start(b) to band_start(b + 1) of the quantized
-        image, coded as an image of its own (the fit and the contexts start
-        again at its top): per channel, int init, then the least-squares
-        deltas mixed-context coded with the second opinions
-        (pack_mixed_deltas). Channels 1 and 2 use the ones before them (their
-        values in the fit, their deltas as context), so a band's channels are
-        decoded in order, each a few rows behind the one before; the bands
-        can be decoded at the same time. One band is what the analysis
-        already coded; more bands reuse the analysis's deltas past each band's
-        first rows (delta_mapper.get_least_squares_band_deltas) and are coded
-        at the same time. Returns the bytes."""
-        n = self.bands_used()
-        xdim = self.delta_xdim
-        rows = len(self.value_list[0]) // xdim
-        s = self.survey
 
-        def one_band(b):
-            y0, y1 = band_start(b, n, rows), band_start(b + 1, n, rows)
-            ch = [np.asarray(v[y0 * xdim:y1 * xdim], dtype=np.int64) for v in self.value_list]
-            d = [s.deltas[i] if n == 1 else dm.get_least_squares_band_deltas(s.deltas[i], self.value_list[i], self.value_list[i - 1] if i > 0 else None,
-                                                                           xdim, y0, y1, s.radius[i])
-                 for i in range(3)]
-            coded = [None] * 3
+def encode(qc, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, n):
+    """Analyses and codes the image and returns (the file's bytes, the
+    seconds the decode check took) (SimpleWriter.encode); qc: the six
+    candidate channels, quantized (get_candidate_channels), mins their
+    minimums. Format 8. Header: FORMAT_ID, FORMAT_VERSION, width, height
+    (unsigned shorts), pixel_shift, pixel_quant, channel set; per channel
+    (coding order) int min and the window radius (an unsigned byte); the
+    number of bands n (an unsigned byte), n int lengths, and the n bands.
+    Band b is rows band_start(b) to band_start(b + 1) of the quantized image,
+    coded as an image of its own (the fit and the contexts start again at
+    its top): per channel, int init, then the least-squares deltas
+    mixed-context coded with the second opinions (pack_mixed_deltas).
+    Channels 1 and 2 use the ones before them (their values in the fit,
+    their deltas as context), so a band's channels are decoded in order,
+    each a few rows behind the one before; the bands can be decoded at the
+    same time.
 
-            def one(i):
-                coded[i] = s.coded[i] if n == 1 else dm.pack_mixed_deltas(d[i], ch[i], d[:i], xdim, True)
-                back = dm.unpack_mixed_deltas(coded[i], ch[i], d[:i], xdim, ch[i] - np.asarray(d[i], dtype=np.int64))
-                if not np.array_equal(back, d[i]):
-                    print("WARNING: band %d channel %d deltas do not decode back." % (b, i))
-            vs.parallel(3, one)
-            bo = DataOutput()
-            for i in range(3):
-                bo.write_int(int(ch[i][0]))
-                bo.write(coded[i])
-            return bo.to_bytes()
+    The analysis as the preview's: the channel set with the smallest
+    estimate (best_set), then each channel's window radius by the real coded
+    size (delta_mapper.survey_windows). One band is what the survey already
+    coded; more bands reuse its deltas past each band's first rows
+    (delta_mapper.get_least_squares_band_deltas) and are coded at the same
+    time. Once everything is coded, each band's channels are checked by
+    decoding them back, at the same time; the time that took is returned, so
+    the coding can be timed without it."""
+    rows = len(qc[0]) // xdim
+    set_id = best_set(SimpleCoder.channel_sums(qc, (xdim, rows)))
+    ids = dm.get_channels(set_id)
+    value = [np.asarray(qc[j], dtype=np.int64) for j in ids]
+    s = dm.survey_windows(value, xdim, rows, dm.WINDOW_RADII)
+    ch = [[None] * 3 for _ in range(n)]      # [band][channel]
+    d = [[None] * 3 for _ in range(n)]
+    coded = [[None] * 3 for _ in range(n)]
 
-        if n == 1:
-            band = [one_band(0)]
-        else:
-            # The bands in a pool of their own: each waits for its channels,
-            # which run in the shared one.
-            with ThreadPoolExecutor(min(n, os.cpu_count() or 1)) as pool:
-                band = list(pool.map(one_band, range(n)))
+    def code(b, i):
+        coded[b][i] = s.coded[i] if n == 1 else dm.pack_mixed_deltas(d[b][i], ch[b][i], d[b][:i], xdim, True)
 
-        ids = dm.get_channels(self.min_set_id)
-        out = DataOutput()
-        out.write_byte(FORMAT_ID); out.write_byte(FORMAT_VERSION)
-        out.write_short(self.image_xdim); out.write_short(self.image_ydim)
-        out.write_byte(self.pixel_shift); out.write_byte(self.pixel_quant); out.write_byte(self.min_set_id)
+    def check(b, i):
+        back = dm.unpack_mixed_deltas(coded[b][i], ch[b][i], d[b][:i], xdim, ch[b][i] - np.asarray(d[b][i], dtype=np.int64))
+        if not np.array_equal(back, d[b][i]):
+            print("WARNING: band %d channel %d deltas do not decode back." % (b, i))
+
+    for b in range(n):
+        y0, y1 = band_start(b, n, rows), band_start(b + 1, n, rows)
         for i in range(3):
-            out.write_int(self.channel_min[ids[i]])
-            out.write_byte(s.radius[i])
-        out.write_byte(n)
-        for bb in band:
-            out.write_int(len(bb))
-        for bb in band:
-            out.write(bb)
-        return out.to_bytes()
+            ch[b][i] = value[i][y0 * xdim:y1 * xdim]
+            d[b][i] = s.deltas[i] if n == 1 else dm.get_least_squares_band_deltas(s.deltas[i], value[i], value[i - 1] if i > 0 else None,
+                                                                                  xdim, y0, y1, s.radius[i])
+    with ThreadPoolExecutor(max(1, min(3 * n, os.cpu_count() or 1))) as pool:
+        for j in [pool.submit(code, b, i) for b in range(n) for i in range(3)]:
+            j.result()
+        # The check, once everything is coded (so its time can be told apart).
+        start = time.perf_counter()
+        for j in [pool.submit(check, b, i) for b in range(n) for i in range(3)]:
+            j.result()
+        check_time = time.perf_counter() - start
+
+    out = DataOutput()
+    out.write_byte(FORMAT_ID); out.write_byte(FORMAT_VERSION)
+    out.write_short(image_xdim); out.write_short(image_ydim)
+    out.write_byte(pixel_shift); out.write_byte(pixel_quant); out.write_byte(set_id)
+    for i in range(3):
+        out.write_int(int(mins[ids[i]]))
+        out.write_byte(s.radius[i])
+    out.write_byte(n)
+    band = []
+    for b in range(n):
+        bo = DataOutput()
+        for i in range(3):
+            bo.write_int(int(ch[b][i][0]))
+            bo.write(coded[b][i])
+        band.append(bo.to_bytes())
+    for bb in band:
+        out.write_int(len(bb))
+    for bb in band:
+        out.write(bb)
+    return out.to_bytes(), check_time
 
 
 # =============================================================================

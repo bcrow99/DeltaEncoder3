@@ -22,6 +22,7 @@ The decoding (class SimpleDecoder2) is separate from the window:
     rgb = SimpleDecoder2("foo").decode()      # (ydim, xdim, 3) uint8, R, G, B
 """
 
+import os
 import sys
 import threading
 import time
@@ -39,6 +40,8 @@ from java_io import DataInput
 FORMAT_ID = ord('F')
 FORMAT_VERSION = 1
 CHUNK = 1 << 16   # how many coded bytes are read at a time, saying each time that they have arrived (SimpleReader2.CHUNK)
+SPLIT_FITS = None  # whether each row's fits are split into tasks (delta_mapper.get_values_from_row_fit_channels): None splits them only with half the cores left free by the bands' channel threads (3 a band) and rows at least SPLIT_MIN_WIDTH wide
+SPLIT_MIN_WIDTH = 2048   # the narrowest rows whose fits are split into tasks (narrower ones gain less than the tasks cost)
 
 
 class SimpleDecoder2:
@@ -93,11 +96,17 @@ class SimpleDecoder2:
         init = [[0] * 3 for _ in range(n)]
         coded = [[Future() for _ in range(3)] for _ in range(n)]
         failed = []
+        # Each row's fits split into tasks only where that pays (SPLIT_FITS:
+        # None to choose so, or True or False): with half the cores or more
+        # left free by the bands' channel threads (3 a band) and wide rows.
+        # Otherwise each row is one compiled call (each task is a Python
+        # call, and the threads queue for the interpreter lock).
+        split = (6 * n <= (os.cpu_count() or 1) and w >= SPLIT_MIN_WIDTH) if SPLIT_FITS is None else SPLIT_FITS
 
         def one(b):
             try:
                 y0, y1 = sw.band_start(b, n, h), sw.band_start(b + 1, n, h)
-                v = dm.get_values_from_row_fit_channels(coded[b], w, y1 - y0, init[b], radius, sw2.EVERY)[1]
+                v = dm.get_values_from_row_fit_channels(coded[b], w, y1 - y0, init[b], radius, sw2.EVERY, split)[1]
                 for i in range(3):
                     raw[i][y0 * w:y1 * w] = v[i]
             except BaseException as e:
