@@ -1,24 +1,26 @@
 #!/usr/bin/env python3
 """
-pixel_writer.py version 1.4 -- PixelWriter.java for Python (PySide6).
+pixel_writer.py version 1.5 -- PixelWriter.java for Python (PySide6).
 
-Codes the red, green and blue channels block by block with context-adaptive
-arithmetic coding (see pixel_mapper.py) and saves (to the file "foo", as the
-Java version does) in Pixel format 'X' version 4: the same file layout as
+Codes the image's channels block by block with context-adaptive arithmetic
+coding (see pixel_mapper.py) and saves (to the file "foo", as the Java
+version does) in Pixel format 'X' version 5: the same file layout as
 PixelWriter.java, so either program's files open in either reader.
 
     python3 pixel_writer.py [image]
 
-Menus: File, View, Quantization (Pixel Resolution and Color Resolution) and
-Block (Block Size; Coding: the pixel values with an exact prediction or with
-brightness bands as context, or the prediction errors; Channels: red, green
-and blue, or green and the differences red - green and blue - green).
+Menus: File, View, Quantization (Pixel Resolution, resized centred with
+resize_mapper.resize2, and Color Resolution) and Block (Block Size; Coding:
+the pixel values with an exact prediction or with brightness bands as
+context, or the prediction errors; Channels: green and the differences
+blue - green and red - green, or red, green and blue; Prediction: the median
+edge predictor or least squares).
 Quantization > Average shrinks the red, green and blue channels by averaging
 2 x 2 squares (1 or 2 levels) and codes only the smallest level, plus one
 sign bit per pixel per level to restore detail when expanding (the averaging
 pyramid in pixel_mapper.py). At start-up the block size that codes the image
 smallest is found (up to one block for the whole frame); changing the
-coding, the channels or the averaging finds it again.
+coding, the channels, the prediction or the averaging finds it again.
 
 The coding (class PixelCoder) is separate from the window:
 
@@ -39,7 +41,7 @@ import viewer_support as vs
 from java_io import DataOutput
 
 FORMAT_ID = ord('X')   # it was 'P' until that turned out to be the Packet format's id too
-FORMAT_VERSION = 4      # 2 added the coding byte, 3 the channels byte, 4 the averaging pyramid
+FORMAT_VERSION = 5      # 2 added the coding byte, 3 the channels byte, 4 the averaging pyramid, 5 the prediction, each coded channel's offset and largest value, and centred resizing
 
 
 class PixelCoder:
@@ -55,7 +57,8 @@ class PixelCoder:
         self.pixel_shift = 3
         self.block_size = 64            # replaced by survey()
         self.coding = px.VALUES
-        self.channels = px.PRIMARY
+        self.channels = px.GREEN_DIFFERENCES
+        self.prediction = px.MED
         self.pixel_pyramid = 0          # Average: levels of 2 x 2 averaging (0..pixel_mapper.PYRAMID_MAX)
         self.use_saddle = False         # expand with the cross-derivative term too
         self.coded = None
@@ -63,15 +66,15 @@ class PixelCoder:
         self.quantize()
 
     def quantize(self):
-        """The channels resized (Pixel Resolution) and shifted (Color
+        """The channels resized (Pixel Resolution, centred) and shifted (Color
         Resolution); with Average, each shrunk to the top level (top, txdim x
         tydim: what is coded), with its sign bits, and expanded back as the
-        reader will (shown)."""
+        reader will (shown); and top prepared for coding (prepared)."""
         size = dm.get_quantized_size(self.image_xdim, self.image_ydim, self.pixel_quant)
         q = []
         for ch in self.source:
             if self.pixel_quant != 0:
-                ch = px.clamp(rm.resize(ch, self.image_xdim, size[0], size[1]))
+                ch = px.clamp(rm.resize2(ch, self.image_xdim, size[0], size[1]))
             q.append(np.asarray(dm.quantize_channel(ch, self.pixel_shift), dtype=np.int64))
         self.quantized, (self.qxdim, self.qydim) = q, size
 
@@ -79,18 +82,19 @@ class PixelCoder:
         self.txdim, self.tydim = px.pyramid_size(self.qxdim, self.qydim, self.pixel_pyramid)
         if self.pixel_pyramid == 0:
             self.top, self.sign_bits, self.shown = q, [None] * 3, q
-            return
-        top, bits, shown = [None] * 3, [None] * 3, [None] * 3
+        else:
+            top, bits, shown = [None] * 3, [None] * 3, [None] * 3
 
-        def one(i):
-            top[i], bits[i] = px.shrink_pyramid(q[i], self.qxdim, self.qydim, self.pixel_pyramid)
-            shown[i] = px.expand_pyramid(top[i], self.qxdim, self.qydim, bits[i], max_value, self.use_saddle)
-        vs.parallel(3, one)
-        self.top, self.sign_bits, self.shown = top, bits, shown
+            def one(i):
+                top[i], bits[i] = px.shrink_pyramid(q[i], self.qxdim, self.qydim, self.pixel_pyramid)
+                shown[i] = px.expand_pyramid(top[i], self.qxdim, self.qydim, bits[i], max_value, self.use_saddle)
+            vs.parallel(3, one)
+            self.top, self.sign_bits, self.shown = top, bits, shown
+        self.prepared = px.prepare(self.top, self.txdim, self.tydim, max_value, self.channels, self.prediction)
 
     def preview(self):
         """The quantized image as pixel_reader will show it."""
-        return px.get_rgb(self.shown, self.qxdim, self.image_xdim, self.image_ydim, self.pixel_quant, self.pixel_shift)
+        return px.get_rgb(self.shown, self.qxdim, self.image_xdim, self.image_ydim, self.pixel_quant, self.pixel_shift, True)
 
     def average_error(self):
         """How far the averaged and expanded channels are from the quantized
@@ -104,15 +108,15 @@ class PixelCoder:
 
     def survey(self):
         """Picks the block size that codes the image smallest at the current
-        quantization, coding and channels, and prints the sizes tried (Java:
+        quantization, coding, channels and prediction, and prints the sizes tried (Java:
         init)."""
         timer = vs.Timer()
         self.quantize()
         tried = []
-        self.block_size = px.find_best_block(self.top, self.txdim, self.tydim, 255 >> self.pixel_shift,
-                                             self.pixel_shift, self.coding, self.channels, tried)
-        print("Block sizes tried (%s; %s; Pixel Resolution %d, Color Resolution %d, Average %d):"
-              % (px.CODING_NAMES[self.coding], px.CHANNEL_SET_NAMES[self.channels], self.pixel_quant, self.pixel_shift,
+        self.block_size = px.find_best_block(self.prepared, self.pixel_shift, self.coding, tried)
+        print("Block sizes tried (%s; %s; %s; Pixel Resolution %d, Color Resolution %d, Average %d):"
+              % (px.CODING_NAMES[self.coding], px.CHANNEL_SET_NAMES[self.channels], px.PREDICTION_NAMES[self.prediction],
+                 self.pixel_quant, self.pixel_shift,
                  self.pixel_pyramid))
         print("bytes for the 3 channels.")
         print("<= marks the size chosen.")
@@ -127,12 +131,12 @@ class PixelCoder:
         self.applied = False
         self.quantize()
         timer = vs.Timer()
-        self.coded = px.encode(self.top, self.txdim, self.tydim, 255 >> self.pixel_shift, self.pixel_shift,
-                               self.block_size, self.coding, self.channels)
+        self.coded = px.encode(self.prepared, self.pixel_shift, self.block_size, self.coding)
         nbytes = sum(len(c) for c in self.coded)
         sign = sum(px.sign_bit_bytes(b) for b in self.sign_bits) if self.pixel_pyramid > 0 else 0
-        print("%s; %s; Pixel Resolution %d, Color Resolution %d, Average %d%s, block size %d: %s bytes coded%s (%.4f of the raw size) in %s"
-              % (px.CODING_NAMES[self.coding], px.CHANNEL_SET_NAMES[self.channels], self.pixel_quant, self.pixel_shift,
+        print("%s; %s; %s; Pixel Resolution %d, Color Resolution %d, Average %d%s, block size %d: %s bytes coded%s (%.4f of the raw size) in %s"
+              % (px.CODING_NAMES[self.coding], px.CHANNEL_SET_NAMES[self.channels], px.PREDICTION_NAMES[self.prediction],
+                 self.pixel_quant, self.pixel_shift,
                  self.pixel_pyramid, " (saddle)" if self.pixel_pyramid > 0 and self.use_saddle else "",
                  self.block_size, "{:,}".format(nbytes + sign),
                  " ({:,} pixels + {:,} sign bits)".format(nbytes, sign) if self.pixel_pyramid > 0 else "",
@@ -145,15 +149,18 @@ class PixelCoder:
     def save(self, filename="foo"):
         """Checks the channels decode back, then writes: FORMAT_ID,
         FORMAT_VERSION, width, height (unsigned shorts), pixel_shift,
-        pixel_quant (bytes), block size (short), coding and channels (bytes),
-        Average levels and saddle (bytes), then each coded channel in order
-        (green, then red and blue or their differences from green): its
+        pixel_quant (bytes), block size (short), coding, channels, prediction
+        and the least-squares window radius (bytes), Average levels and
+        saddle (bytes); for each coded channel in order (green, then the
+        differences blue - green and red - green, or red and blue), its offset
+        and largest value (ints: pixel_mapper.Prepared); then for each, its
         length (int) and bytes; then with Average, the sign bits of red, green
         and blue (pixel_mapper.write_sign_bits). Returns the file size;
         raises IOError if a channel doesn't decode back."""
         timer = vs.Timer()
-        back = px.decode(self.coded, self.txdim, self.tydim, 255 >> self.pixel_shift, self.pixel_shift,
-                         self.block_size, self.coding, self.channels)
+        pr = self.prepared
+        back = px.decode(self.coded, self.txdim, self.tydim, self.pixel_shift, self.block_size, self.coding, self.channels,
+                         self.prediction, pr.radius, pr.offset, pr.max)
         for i in range(3):
             if not np.array_equal(back[i], self.top[i]):
                 raise IOError("Nothing saved: the %s channel does not decode back." % px.CHANNEL_NAMES[i])
@@ -166,7 +173,10 @@ class PixelCoder:
         out.write_short(self.block_size)
         out.write_byte(self.coding)
         out.write_byte(self.channels)
+        out.write_byte(self.prediction); out.write_byte(pr.radius)
         out.write_byte(self.pixel_pyramid); out.write_byte(1 if self.use_saddle else 0)
+        for i in range(3):
+            out.write_int(pr.offset[i]); out.write_int(pr.max[i])
         for c in self.coded:
             out.write_int(len(c))
             out.write(np.asarray(c, dtype=np.uint8).tobytes())
@@ -236,15 +246,18 @@ class PixelWriter:
             quant.addAction(act)
         quant.addAction(self._make_pyramid_dialog())
 
-        # Block size, coding and channels: the coded size changes, the picture
-        # doesn't. A new coding or channel choice has its own best block size,
-        # so choosing one runs the block size search again.
+        # Block size, coding, channels and prediction: the coded size changes,
+        # the picture doesn't. A new coding, channel set or prediction has its
+        # own best block size, so choosing one runs the block size search again.
         block_menu = bar.addMenu("Block")
         act, self.block_slider = vs.make_slider_dialog(view, "Block Size", px.BLOCK_MIN, px.block_limit(c.image_xdim, c.image_ydim), c.block_size, self._setter("block_size"))
         block_menu.addAction(act)
         act, _ = vs.make_radio_dialog(view, "Coding", px.CODING_NAMES, c.coding, self.set_coding)
         block_menu.addAction(act)
-        act, _ = vs.make_radio_dialog(view, "Channels", px.CHANNEL_SET_NAMES, c.channels, self.set_channels)
+        act, _ = vs.make_radio_dialog(view, "Channels", [px.CHANNEL_SET_NAMES[k] for k in px.WRITER_CHANNEL_SETS],
+                                      px.WRITER_CHANNEL_SETS.index(c.channels), self.set_channels)
+        block_menu.addAction(act)
+        act, _ = vs.make_radio_dialog(view, "Prediction", px.PREDICTION_NAMES, c.prediction, self.set_prediction)
         block_menu.addAction(act)
 
         view.set_image(rgb)
@@ -311,8 +324,14 @@ class PixelWriter:
             self.find_block_size()
 
     def set_channels(self, v):
-        if v != self.coder.channels:
-            self.coder.channels = v
+        channels = px.WRITER_CHANNEL_SETS[v]
+        if channels != self.coder.channels:
+            self.coder.channels = channels
+            self.find_block_size()
+
+    def set_prediction(self, v):
+        if v != self.coder.prediction:
+            self.coder.prediction = v
             self.find_block_size()
 
     def reset(self):
