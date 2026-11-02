@@ -2423,9 +2423,8 @@ def _row_fit_row(ref, has_ref, xdim, ydim, init, every, data, value, previous, c
 def _row_fit_row_inline(ref, has_ref, xdim, ydim, init, every, data, value, previous, cross, cb, fwd, c9b, earlier, m,
                         act_table, state, coef, valid, z, delta, dst, y, r, col, points, win, a, b, dg, za, zd):
     """As _row_fit_row, with the row's fits solved first in the same call
-    (_rf_advance, _rf_solve): the decoder's way when the channels' threads
-    already fill the cores (get_values_from_row_fit_channels), so that each
-    row is a single call."""
+    (_rf_advance, _rf_solve): the decoder's way
+    (get_values_from_row_fit_channels), so that each row is a single call."""
     if y >= 1:
         nf = RF_SPATIAL + 3 if has_ref else RF_SPATIAL
         if y >= 2:
@@ -2435,33 +2434,19 @@ def _row_fit_row_inline(ref, has_ref, xdim, ydim, init, every, data, value, prev
                  act_table, state, coef, valid, z, delta, dst, y)
 
 
-_RF_POOL = ThreadPoolExecutor(_CPUS)   # RowFit's decoder tasks (they never wait, so the pool can't block)
-RF_TASKS = 4                           # the most tasks a row's RowFit work is split into in the decoder (each is a Python call)
-
-
-def _rf_split(items, least):
-    """How many tasks to split items into: at most RF_TASKS, with at least
-    least items each."""
-    return max(1, min(RF_TASKS, items // least))
-
-
-def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every, split=True):
+def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every):
     """Decodes channels pack_mixed_deltas coded (with the second opinions)
     from their RowFit deltas, rebuilding them as it goes
     (DeltaMapper.getValuesFromRowFitChannels): as
     get_values_from_least_squares_channels, a thread per channel, a row at a
-    time once the channel before has decoded a row further; before each row
-    its fits are solved in tasks run at the same time (_rf_advance,
-    _rf_solve), so decoding a row is left with the predictions and the delta
-    decoder. With split False, each row's fits are solved in the channel's
-    own thread instead, in the same compiled call that decodes the row
-    (_row_fit_row_inline): faster when the channels' threads (of all the bands
-    decoded at once) already fill the cores, since a task is a Python call and
-    the threads queue for the interpreter lock. (The Java solves the next
-    row's fits while it decodes this one,
-    following the decoder along the row: DeltaMapper.RowWave. Here that was
-    slower but for large images in one band: each of its tasks is a Python
-    call, and the threads queue for the interpreter lock. The predictions are
+    time once the channel before has decoded a row further; each row's fits
+    are solved in the channel's own thread, in the same compiled call that
+    decodes the row (_row_fit_row_inline). (No pool: splitting a row's fits
+    into tasks made each a Python call, and with the threads queuing for the
+    interpreter lock and waiting for the tasks it was slower, by 2-3 times
+    with 4 bands on Windows. The Java solves the next row's fits while it
+    decodes this one, following the decoder along the row:
+    DeltaMapper.RowWave. The predictions are the same either way.)
     the same either way.) mixed[i] may be a Future, for channels still being
     read: the channel's thread starts once it is done (init[i] set before it);
     and its coded bytes may be an Arriving (read_arriving_mixed_deltas), still
@@ -2494,18 +2479,7 @@ def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every, spl
             dst = value[i]
             terms = [np.zeros(n, dtype=np.int64) for _ in range(4)]   # cross, cb, fwd, c9b (zero for the first channel)
             earlier = np.zeros(2, dtype=np.int64)
-            ca = _rf_split(max(0, xdim - 2), 128)
-            cs = _rf_split(points, 32)
-            work = [_rf_work(nf) for _ in range(max(ca, cs))]
-
-            def advance(t, y):
-                c0, c1 = 1 + t * (xdim - 2) // ca, 1 + (t + 1) * (xdim - 2) // ca
-                _rf_advance(dst, ref, has_ref, xdim, y, r, col, c0, c1, work[t][6], work[t][7])
-
-            def solve(t):
-                p0, p1 = t * points // cs, (t + 1) * points // cs
-                w = work[t]
-                _rf_solve(col, xdim, r, nf, every, p0, p1, coef, valid, w[2], w[3], w[4], w[5])
+            w = _rf_work(nf)
 
             for y in range(ydim):
                 if i > 0:
@@ -2515,26 +2489,11 @@ def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every, spl
                             cond.wait()
                         if failed:
                             return
-                if y >= 1 and split:
-                    if y >= 2:
-                        jobs = [_RF_POOL.submit(advance, t, y) for t in range(1, ca)]
-                        advance(0, y)
-                        for j in jobs:
-                            j.result()
-                    jobs = [_RF_POOL.submit(solve, t) for t in range(1, cs)]
-                    solve(0)
-                    for j in jobs:
-                        j.result()
                 if arriving is not None:
                     have = arriving.wait_for(int(state[0][0]) + per_row)
-                if split:
-                    _row_fit_row(ref, has_ref, xdim, ydim, int(init[i]), every, coded, table, delta[:i], terms[0], terms[1], terms[2], terms[3],
-                                 earlier, m, MIX_ACTIVITY_TABLE, state, coef, valid, z, delta[i], dst, y)
-                else:
-                    w = work[0]
-                    _row_fit_row_inline(ref, has_ref, xdim, ydim, int(init[i]), every, coded, table, delta[:i], terms[0], terms[1], terms[2], terms[3],
-                                        earlier, m, MIX_ACTIVITY_TABLE, state, coef, valid, z, delta[i], dst, y,
-                                        r, col, points, w[2], w[3], w[4], w[5], w[6], w[7])
+                _row_fit_row_inline(ref, has_ref, xdim, ydim, int(init[i]), every, coded, table, delta[:i], terms[0], terms[1], terms[2], terms[3],
+                                    earlier, m, MIX_ACTIVITY_TABLE, state, coef, valid, z, delta[i], dst, y,
+                                    r, col, points, w[2], w[3], w[4], w[5], w[6], w[7])
                 if arriving is not None and have < coded.shape[0] and state[0][0] > have:
                     raise RuntimeError("row %d of channel %d read coded bytes that hadn't arrived" % (y, i))
                 with cond:
