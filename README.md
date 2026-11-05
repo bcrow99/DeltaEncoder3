@@ -23,7 +23,7 @@ python3 block_writer.py [image]      # Block format 'B'
 python3 block_reader.py foo
 python3 packet_writer.py [image]     # Packet format 'P' version 1
 python3 packet_reader.py foo
-python3 pixel_writer.py [image]      # Pixel format 'X' versions 1-4
+python3 pixel_writer.py [image]      # Pixel format 'X' version 5 (the reader reads 1-5)
 python3 pixel_reader.py foo
 ```
 
@@ -70,7 +70,7 @@ after that it loads from the cache in `__pycache__`.
 | `code_mapper.py` | CodeMapper | Huffman ("regular"), Shannon estimate, Deflate |
 | `resize_mapper.py` | ResizeMapper | Pixel Resolution resizing |
 | `segment_mapper.py` | SegmentMapper | the segmenting and packing the Packet programs use |
-| `pixel_mapper.py` | PixelMapper | per-block context models for the pixels or prediction errors, red/green/blue or green-difference channels |
+| `pixel_mapper.py` | PixelMapper | per-block context models for the pixels or prediction errors, red/green/blue or green-difference channels, MED or least-squares prediction |
 | `image_mapper.py` | ImageMapper | the pixel-pyramid operators, dilation, area resampling, registration |
 | `probabilistic_mapper.py` | ProbabilisticMapper | steering an exact arithmetic-coding interval, combinadic and c-sequence coders |
 | `fraction_mapper.py` | FractionMapper | `BigFraction` (exact fractions plus the wheel's infinity and bottom), repeating decimal and binary digits |
