@@ -2514,6 +2514,80 @@ def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every):
     return list(delta), list(value)
 
 
+
+@njit
+def _row_fit_rebuild_row(ref, has_ref, xdim, init, every, coef, valid, z, delta, dst, y, r, col, points, win, a, b, dg, za, zd):
+    """Rebuilds row y of a channel from its RowFit deltas, all known (as
+    _row_fit_row_inline, without the decoding): the row's fits solved first
+    (_rf_advance, _rf_solve), then row 0 horizontal, column 0 vertical, the
+    last column horizontal, the interior from the fit."""
+    nf = RF_SPATIAL + 3 if has_ref else RF_SPATIAL
+    if y >= 1:
+        if y >= 2:
+            _rf_advance(dst, ref, has_ref, xdim, y, r, col, 1, xdim - 1, za, zd)
+        _rf_solve(col, xdim, r, nf, every, 0, points, coef, valid, win, a, b, dg)
+    for x in range(xdim):
+        k = y * xdim + x
+        if k == 0:
+            dst[k] = init
+        elif y == 0 or x == xdim - 1:
+            dst[k] = delta[k] + dst[k - 1]
+        elif x == 0:
+            dst[k] = delta[k] + dst[k - xdim]
+        else:
+            dst[k] = delta[k] + _rf_predict(dst, ref, has_ref, xdim, nf, y, x, every, coef, valid, z)
+
+
+def get_values_from_row_fit_deltas(delta, xdim, ydim, init, radius, every):
+    """The values of a band's channels from their RowFit deltas, all known
+    (huffman_reader's: get_row_fit_deltas undone, without decoding)
+    (DeltaMapper.getValuesFromRowFitDeltas). As
+    get_values_from_row_fit_channels rebuilds them: a thread per channel, a
+    row at a time once the channel before has rebuilt that row (the fit at
+    row y uses the channel before's row y), each row's fits solved in the
+    channel's own thread, in the same compiled call that rebuilds the row
+    (_row_fit_rebuild_row). Returns the values, per channel."""
+    nch, n = len(delta), xdim * ydim
+    value = np.zeros((nch, n), dtype=np.int64)
+    done = [0] * nch
+    cond = threading.Condition()
+    failed = []
+
+    def run(i):
+        try:
+            has_ref = i > 0
+            nf = RF_SPATIAL + 3 if has_ref else RF_SPATIAL
+            col, coef, valid, z, _, _, _, _, _, _, _, points = _rf_state(xdim, has_ref, every)
+            ref = value[i - 1] if i > 0 else np.zeros(1, dtype=np.int64)
+            d = np.asarray(delta[i], dtype=np.int64)
+            dst = value[i]
+            w = _rf_work(nf)
+            for y in range(ydim):
+                if i > 0:
+                    with cond:
+                        while done[i - 1] < y + 1 and not failed:
+                            cond.wait()
+                        if failed:
+                            return
+                _row_fit_rebuild_row(ref, has_ref, xdim, int(init[i]), every, coef, valid, z, d, dst, y,
+                                     radius[i], col, points, w[2], w[3], w[4], w[5], w[6], w[7])
+                with cond:
+                    done[i] = y + 1
+                    cond.notify_all()
+        except BaseException as e:
+            with cond:
+                failed.append(e)
+                cond.notify_all()
+
+    threads = [threading.Thread(target=run, args=(i,), daemon=True) for i in range(nch)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if failed:
+        raise failed[0]
+    return list(value)
+
 class WindowSurvey:
     """What survey_windows chose for each channel, and what it measured
     (DeltaMapper.WindowSurvey): radius, deltas, coded (pack_mixed_deltas with

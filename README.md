@@ -19,6 +19,8 @@ python3 simple_writer.py [image]     # Simple format 'S' version 8
 python3 simple_reader.py foo
 python3 simple_writer2.py [image]    # Simple 2 format 'F' version 2
 python3 simple_reader2.py foo
+python3 huffman_writer.py [image]    # Huffman format 'H' version 1
+python3 huffman_reader.py foo
 python3 block_writer.py [image]      # Block format 'B'
 python3 block_reader.py foo
 python3 packet_writer.py [image]     # Packet format 'P' version 1
@@ -57,6 +59,8 @@ after that it loads from the cache in `__pycache__`.
 | `simple_reader.py` | SimpleReader | `SimpleDecoder` |
 | `simple_writer2.py` | SimpleWriter2 | `SimpleCoder2`: the same coding with the channels green, blue-green, red-green and window radius 10, no analysis |
 | `simple_reader2.py` | SimpleReader2 | `SimpleDecoder2` |
+| `huffman_writer.py` | HuffmanWriter | `HuffmanCoder`: Simple 2 up to the entropy coding, then StringMapper's unary strings and CodeMapper's regular Huffman code per channel; less compression, faster decoding |
+| `huffman_reader.py` | HuffmanReader | `HuffmanDecoder` |
 | `block_writer.py` | BlockWriter | `BlockCoder`: block map with mixed-context-coded deltas; each channel's block size and predictors chosen by the survey |
 | `block_reader.py` | BlockReader | `BlockDecoder` |
 | `packet_writer.py` | PacketWriter | `PacketCoder`: unary strings split into separately compressed packets |
