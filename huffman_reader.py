@@ -91,17 +91,10 @@ class HuffmanDecoder:
             for b in range(n):
                 band = inp.read_fully(self.length[b])
                 bi = DataInput(band)
-                # Each channel: init, then huffman_code's bytes, whose lengths
-                # say where they end.
+                # Each channel: init, then huffman_code's bytes.
                 for i in range(3):
                     init[b][i] = bi.read_int()
-                    begin = bi.f.tell()
-                    bi.read_int(); bi.read_int()
-                    dm.read_table(bi)
-                    bi.read_int()
-                    for _ in range(2):
-                        bi.read_fully(bi.read_int())
-                    coded[b][i] = band[begin:bi.f.tell()]
+                    coded[b][i] = hw.huffman_read(bi)
                 if bi.f.tell() != len(band):
                     raise IOError("%s: band %d is not the length its header says." % (self.filename, b))
         self.read_time = time.perf_counter() - start
@@ -113,7 +106,7 @@ class HuffmanDecoder:
         def decode_one(j):
             b, i = j // 3, j % 3
             y0, y1 = sw.band_start(b, n, h), sw.band_start(b + 1, n, h)
-            delta[b][i] = hw.huffman_decode(DataInput(coded[b][i]), w * (y1 - y0))
+            delta[b][i] = hw.huffman_decode(coded[b][i], w * (y1 - y0))
         vs.parallel(3 * n, decode_one)
 
         def rebuild(b):

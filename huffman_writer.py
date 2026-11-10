@@ -150,20 +150,34 @@ def huffman_code(delta):
     return out.to_bytes()
 
 
+class HuffmanChannel:
+    """A channel's Huffman coding as huffman_code wrote it, read by
+    huffman_read, its code lengths inflated (HuffmanWriter.HuffmanChannel)."""
+    __slots__ = ("min", "bits", "length", "table", "lengths", "code")
+
+
+def huffman_read(inp):
+    """Reads a channel's coding huffman_code wrote (HuffmanWriter.huffmanRead)."""
+    h = HuffmanChannel()
+    h.min = inp.read_int()
+    h.bits = inp.read_int()
+    h.table = dm.read_table(inp)
+    h.length = inp.read_int()
+    tables = inp.read_fully(inp.read_int())
+    h.code = inp.read_fully(inp.read_int())
+    h.lengths = cm.unpack_regular_tables(tables, 1)[0]
+    return h
+
+
 def huffman_decode(inp, n):
     """Reads a channel's deltas huffman_code wrote: n deltas, delta 0 being
-    0 (HuffmanWriter.huffmanDecode)."""
-    lo = inp.read_int()
-    bits = inp.read_int()
-    table = dm.read_table(inp)
-    length = inp.read_int()
-    tables = inp.read_fully(inp.read_int())
-    code = inp.read_fully(inp.read_int())
-    lengths = cm.unpack_regular_tables(tables, 1)[0]
-    string = cm.unpack_regular_code(code, lengths, length)
-    delta = np.asarray(sm.unpack_strings(sm.decompress_strings(string), table, n, bits), dtype=np.int64)
+    0 (HuffmanWriter.huffmanDecode). inp is a DataInput at their start, or
+    a HuffmanChannel already read."""
+    h = inp if isinstance(inp, HuffmanChannel) else huffman_read(inp)
+    string = cm.unpack_regular_code(h.code, h.lengths, h.length)
+    delta = np.asarray(sm.unpack_strings(sm.decompress_strings(string), h.table, n, h.bits), dtype=np.int64)
     delta[0] = 0
-    delta[1:] += lo
+    delta[1:] += h.min
     return delta
 
 
