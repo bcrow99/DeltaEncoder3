@@ -3,11 +3,11 @@
 pixel_writer.py version 1.5 -- PixelWriter.java for Python (PySide6).
 
 Codes the image's channels block by block with context-adaptive arithmetic
-coding (see pixel_mapper.py) and saves (to the file "foo", as the Java
+coding (see pixel_mapper.py) and saves (to the output file given, or "foo", as the Java
 version does) in Pixel format 'X' version 5: the same file layout as
 PixelWriter.java, so either program's files open in either reader.
 
-    python3 pixel_writer.py [image]
+    python3 pixel_writer.py [image [output]]
 
 Menus: File, View, Quantization (Pixel Resolution, resized centred with
 resize_mapper.resize2, and Color Resolution) and Block (Block Size; Coding:
@@ -207,10 +207,11 @@ _open_writers = []
 
 
 class PixelWriter:
-    def __init__(self, filename):
+    def __init__(self, filename, output_file=vs.DEFAULT_OUTPUT):
         from PySide6.QtGui import QAction, QKeySequence
 
         self.filename = filename
+        self.output_file = output_file   # the file Save writes
         try:
             rgb = vs.read_image(filename)
         except IOError as e:
@@ -392,14 +393,14 @@ class PixelWriter:
             vs.show_error(self.view, "Nothing saved: the last Apply failed.")
             return
         try:
-            self.coder.save("foo")
+            self.coder.save(self.output_file)
         except IOError as e:
             vs.show_error(self.view, str(e))
         except Exception as e:
             import traceback
             traceback.print_exc()
-            if os.path.exists("foo"):
-                os.remove("foo")
+            if os.path.exists(self.output_file):
+                os.remove(self.output_file)
             vs.show_error(self.view, "Save failed: %r" % e)
 
 
@@ -407,7 +408,8 @@ def main():
     from PySide6.QtWidgets import QApplication
     app = QApplication(sys.argv)
     if len(sys.argv) > 1:
-        PixelWriter(sys.argv[1])
+        # The image, and the file Save writes ("foo" if none is given).
+        PixelWriter(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else vs.DEFAULT_OUTPUT)
     else:
         open_image()
     if not _open_writers:

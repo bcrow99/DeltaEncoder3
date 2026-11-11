@@ -2,13 +2,13 @@
 """
 delta_writer.py version 2.3 -- DeltaWriter.java for Python (PySide6).
 
-Quantizes an image, codes it as deltas and saves it (to the file "foo", as
+Quantizes an image, codes it as deltas and saves it (to the output file given, or "foo", as
 the Java version does) in Delta format 'D' (version 4 with the block map,
 version 3 otherwise): the same file layout as DeltaWriter.java, so either
 program's files open in either reader. The block map's block sizes and
 predictors come from the survey (delta_mapper.surveyed_block_maps).
 
-    python3 delta_writer.py [image]
+    python3 delta_writer.py [image [output]]
 
 The coding (class DeltaCoder) is separate from the window (DeltaWriter), so
 it can also be used without a display:
@@ -434,11 +434,12 @@ _open_writers = []
 
 
 class DeltaWriter:
-    def __init__(self, filename):
+    def __init__(self, filename, output_file=vs.DEFAULT_OUTPUT):
         from PySide6.QtGui import QAction, QActionGroup, QKeySequence
         from PySide6.QtWidgets import QRadioButton, QButtonGroup
 
         self.filename = filename
+        self.output_file = output_file   # the file Save writes
         try:
             rgb = vs.read_image(filename)
         except IOError as e:
@@ -634,12 +635,12 @@ class DeltaWriter:
             vs.show_error(self.view, "Nothing saved: the last Apply failed.")
             return
         try:
-            self.coder.save("foo")
+            self.coder.save(self.output_file)
         except Exception as e:
             import traceback
             traceback.print_exc()
-            if os.path.exists("foo"):
-                os.remove("foo")
+            if os.path.exists(self.output_file):
+                os.remove(self.output_file)
             vs.show_error(self.view, "Save failed: %r" % e)
 
 
@@ -647,7 +648,8 @@ def main():
     from PySide6.QtWidgets import QApplication
     app = QApplication(sys.argv)
     if len(sys.argv) > 1:
-        DeltaWriter(sys.argv[1])
+        # The image, and the file Save writes ("foo" if none is given).
+        DeltaWriter(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else vs.DEFAULT_OUTPUT)
     else:
         open_image()
     if not _open_writers:

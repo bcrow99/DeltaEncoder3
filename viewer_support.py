@@ -39,6 +39,10 @@ if os.environ.get("DELTA_STACKS"):
     faulthandler.dump_traceback_later(float(os.environ["DELTA_STACKS"]), repeat=True, file=sys.stderr)
 
 
+# The file a writer's Save writes when no other is given (after the image,
+# on the command line).
+DEFAULT_OUTPUT = "foo"
+
 ZOOM_FACTOR = 1.25
 ZOOM_MIN = 0.05
 ZOOM_MAX = 32.0

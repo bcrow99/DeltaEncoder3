@@ -18,10 +18,10 @@ for a small cost per band boundary (the fit and the contexts start again at
 each band's top); the reader also decodes a band's three channels at the same
 time. Save analyses and codes the image twice (encode), printing both
 times (the first includes compiling the code) and the decode check's
-apart. Saves (to the file "foo", as the Java version does) in Simple format
+apart. Saves (to the output file given, or "foo", as the Java version does) in Simple format
 'S' version 8, read by simple_reader.py and SimpleReader.java.
 
-    python3 simple_writer.py [image]
+    python3 simple_writer.py [image [output]]
 
 The coding (class SimpleCoder) is separate from the window:
 
@@ -384,11 +384,12 @@ _open_writers = []
 
 
 class SimpleWriter:
-    def __init__(self, filename):
+    def __init__(self, filename, output_file=vs.DEFAULT_OUTPUT):
         from PySide6.QtCore import QTimer
         from PySide6.QtGui import QAction, QKeySequence
 
         self.filename = filename
+        self.output_file = output_file   # the file Save writes
         try:
             rgb = vs.read_image(filename)
         except IOError as e:
@@ -551,12 +552,12 @@ class SimpleWriter:
             vs.show_error(self.view, "Nothing saved: the last Apply failed.")
             return
         try:
-            self.coder.save("foo")
+            self.coder.save(self.output_file)
         except Exception as e:
             import traceback
             traceback.print_exc()
-            if os.path.exists("foo"):
-                os.remove("foo")
+            if os.path.exists(self.output_file):
+                os.remove(self.output_file)
             vs.show_error(self.view, "Save failed: %r" % e)
 
 
@@ -564,7 +565,8 @@ def main():
     from PySide6.QtWidgets import QApplication
     app = QApplication(sys.argv)
     if len(sys.argv) > 1:
-        SimpleWriter(sys.argv[1])
+        # The image, and the file Save writes ("foo" if none is given).
+        SimpleWriter(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else vs.DEFAULT_OUTPUT)
     else:
         open_image()
     if not _open_writers:

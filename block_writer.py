@@ -14,7 +14,7 @@ the predictor set that code the channel smallest
 estimated coded bits, the estimate's reference deltas from the whole table,
 blocks assigned by the estimate, and the real coded size measured at each
 count). It runs at startup and again after any change to the quantization
-(Pixel Resolution or Color Resolution). Saves (to the file "foo", as the
+(Pixel Resolution or Color Resolution). Saves (to the output file given, or "foo", as the
 Java version does) in Block format 'B' version 9, read by block_reader.py
 and BlockReader.java. The survey measures sizes with the Context coder
 (pack_context_deltas); the file uses the mixed coder, with its contexts
@@ -24,7 +24,7 @@ to MAX_BANDS bands of rows that a reader can decode at the same time (format
 10), for about a byte per column per band boundary; with 1 (the default) Save
 writes format 9.
 
-    python3 block_writer.py [image]
+    python3 block_writer.py [image [output]]
 
 The coding (class BlockCoder) is separate from the window:
 
@@ -369,11 +369,12 @@ _open_writers = []
 
 
 class BlockWriter:
-    def __init__(self, filename):
+    def __init__(self, filename, output_file=vs.DEFAULT_OUTPUT):
         from PySide6.QtCore import QTimer
         from PySide6.QtGui import QAction, QKeySequence
 
         self.filename = filename
+        self.output_file = output_file   # the file Save writes
         try:
             rgb = vs.read_image(filename)
         except IOError as e:
@@ -534,12 +535,12 @@ class BlockWriter:
             vs.show_error(self.view, "Nothing saved: the last Apply failed.")
             return
         try:
-            self.coder.save("foo")
+            self.coder.save(self.output_file)
         except Exception as e:
             import traceback
             traceback.print_exc()
-            if os.path.exists("foo"):
-                os.remove("foo")
+            if os.path.exists(self.output_file):
+                os.remove(self.output_file)
             vs.show_error(self.view, "Save failed: %r" % e)
 
 
@@ -547,7 +548,8 @@ def main():
     from PySide6.QtWidgets import QApplication
     app = QApplication(sys.argv)
     if len(sys.argv) > 1:
-        BlockWriter(sys.argv[1])
+        # The image, and the file Save writes ("foo" if none is given).
+        BlockWriter(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else vs.DEFAULT_OUTPUT)
     else:
         open_image()
     if not _open_writers:

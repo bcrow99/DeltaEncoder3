@@ -4,13 +4,13 @@ packet_writer.py version 2.2 -- PacketWriter.java for Python (PySide6).
 
 Quantizes an image, codes it as deltas packed into unary strings, splits
 each string into separately compressed segments ("packets") and entropy
-codes them, then saves (to the file "foo", as the Java version does) in
+codes them, then saves (to the output file given, or "foo", as the Java version does) in
 Packet format 'P' (version 4 with the block map, version 3 otherwise): the
 same file layout as PacketWriter.java, so either program's files open in
 either reader. The block map's block sizes and predictors come from the
 survey (delta_mapper.surveyed_block_maps).
 
-    python3 packet_writer.py [image]
+    python3 packet_writer.py [image [output]]
 
 The coding (class PacketCoder) is separate from the window (PacketWriter),
 so it can also be used without a display:
@@ -741,10 +741,11 @@ _open_writers = []
 
 
 class PacketWriter:
-    def __init__(self, filename):
+    def __init__(self, filename, output_file=vs.DEFAULT_OUTPUT):
         from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 
         self.filename = filename
+        self.output_file = output_file   # the file Save writes
         try:
             rgb = vs.read_image(filename)
         except IOError as e:
@@ -942,12 +943,12 @@ class PacketWriter:
             vs.show_error(self.view, "Nothing saved: the last Apply failed.")
             return
         try:
-            self.coder.save("foo")
+            self.coder.save(self.output_file)
         except Exception as e:
             import traceback
             traceback.print_exc()
-            if os.path.exists("foo"):
-                os.remove("foo")
+            if os.path.exists(self.output_file):
+                os.remove(self.output_file)
             vs.show_error(self.view, "Save failed: %r" % e)
             return
         if self.coder.packet_auto:
@@ -958,7 +959,8 @@ def main():
     from PySide6.QtWidgets import QApplication
     app = QApplication(sys.argv)
     if len(sys.argv) > 1:
-        PacketWriter(sys.argv[1])
+        # The image, and the file Save writes ("foo" if none is given).
+        PacketWriter(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else vs.DEFAULT_OUTPUT)
     else:
         open_image()
     if not _open_writers:

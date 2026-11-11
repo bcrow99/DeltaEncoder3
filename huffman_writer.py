@@ -14,10 +14,10 @@ Huffman code over the string's bytes, one per channel and band (code_mapper's
 regular Huffman code, delta_writer's entropy type 1). No contexts, so a
 channel's coding uses no other channel. Less compression than Simple 2 (on
 the test photos the files are 9-29% bigger), faster to decode. Saves (to
-the file "foo", as the Java version does) in Huffman format 'H' version 1,
+the output file given, or "foo", as the Java version does) in Huffman format 'H' version 1,
 read by huffman_reader.py and HuffmanReader.java.
 
-    python3 huffman_writer.py [image]
+    python3 huffman_writer.py [image [output]]
 
 The coding (class HuffmanCoder) is separate from the window:
 
@@ -211,11 +211,12 @@ _open_writers = []
 
 
 class HuffmanWriter:
-    def __init__(self, filename):
+    def __init__(self, filename, output_file=vs.DEFAULT_OUTPUT):
         from PySide6.QtCore import QTimer
         from PySide6.QtGui import QAction, QKeySequence
 
         self.filename = filename
+        self.output_file = output_file   # the file Save writes
         try:
             rgb = vs.read_image(filename)
         except IOError as e:
@@ -303,12 +304,12 @@ class HuffmanWriter:
             vs.show_error(self.view, "Nothing saved: the last Apply failed.")
             return
         try:
-            self.coder.save("foo")
+            self.coder.save(self.output_file)
         except Exception as e:
             import traceback
             traceback.print_exc()
-            if os.path.exists("foo"):
-                os.remove("foo")
+            if os.path.exists(self.output_file):
+                os.remove(self.output_file)
             vs.show_error(self.view, "Save failed: %r" % e)
 
 
@@ -316,7 +317,8 @@ def main():
     from PySide6.QtWidgets import QApplication
     app = QApplication(sys.argv)
     if len(sys.argv) > 1:
-        HuffmanWriter(sys.argv[1])
+        # The image, and the file Save writes ("foo" if none is given).
+        HuffmanWriter(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else vs.DEFAULT_OUTPUT)
     else:
         open_image()
     if not _open_writers:

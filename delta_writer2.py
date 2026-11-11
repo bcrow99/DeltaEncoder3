@@ -6,7 +6,7 @@ A streamlined Delta Writer. Its files are read by delta_reader.py (and
 DeltaReader.java): the header and per-channel layout are the same, with
 compress_type 3 (see COMPRESS_TYPE) and the pixel pyramid bytes 0.
 
-    python3 delta_writer2.py [image]      # saves to the file "foo"
+    python3 delta_writer2.py [image [output]]   # saves to output, or the file "foo"
 
 Compared with delta_writer.py:
   - no Datatype menu and no Integer path: deltas are always unary strings
@@ -445,10 +445,11 @@ _open_writers = []
 
 
 class DeltaWriter2:
-    def __init__(self, filename):
+    def __init__(self, filename, output_file=vs.DEFAULT_OUTPUT):
         from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 
         self.filename = filename
+        self.output_file = output_file   # the file Save writes
         try:
             rgb = vs.read_image(filename)
         except IOError as e:
@@ -603,12 +604,12 @@ class DeltaWriter2:
             vs.show_error(self.view, "Nothing saved: the last Apply failed.")
             return
         try:
-            self.coder.save("foo")
+            self.coder.save(self.output_file)
         except Exception as e:
             import traceback
             traceback.print_exc()
-            if os.path.exists("foo"):
-                os.remove("foo")
+            if os.path.exists(self.output_file):
+                os.remove(self.output_file)
             vs.show_error(self.view, "Save failed: %r" % e)
 
 
@@ -616,7 +617,8 @@ def main():
     from PySide6.QtWidgets import QApplication
     app = QApplication(sys.argv)
     if len(sys.argv) > 1:
-        DeltaWriter2(sys.argv[1])
+        # The image, and the file Save writes ("foo" if none is given).
+        DeltaWriter2(sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else vs.DEFAULT_OUTPUT)
     else:
         open_image()
     if not _open_writers:
