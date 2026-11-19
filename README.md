@@ -21,6 +21,8 @@ python3 simple_writer2.py [image]    # Simple 2 format 'F' version 2
 python3 simple_reader2.py foo
 python3 huffman_writer.py [image]    # Huffman format 'H' version 1
 python3 huffman_reader.py foo
+python3 generic_writer.py [image]    # Simple 2 'F' versions 2 and 3, Huffman 'H' versions 1 and 2
+python3 generic_reader.py foo
 python3 block_writer.py [image]      # Block format 'B'
 python3 block_reader.py foo
 python3 packet_writer.py [image]     # Packet format 'P' version 1
@@ -28,6 +30,20 @@ python3 packet_reader.py foo
 python3 pixel_writer.py [image]      # Pixel format 'X' version 5 (the reader reads 1-5)
 python3 pixel_reader.py foo
 ```
+
+simple_writer.py, simple_writer2.py, huffman_writer.py, generic_writer.py and
+pixel_writer.py have **File > Decode Check**, as in Java (off unless switched
+on): Save also decodes what it coded and says whether it comes back the same.
+Save is faster without it; if a file doesn't decode right in its reader,
+switching it on tells whether the writer or the reader is at fault.
+
+generic_writer.py and generic_reader.py are GenericWriter.java and
+GenericReader.java (NativeEncoder's NativeWriter and NativeReader in Java
+alone): simple_writer2.py's and huffman_writer.py's codings in one program (the
+**Entropy** menu), each with the least-squares deltas or the average filter
+(the **Delta** menu), in up to 64 bands. Their files are the Java programs',
+byte for byte; with the least-squares deltas those are simple_writer2.py's and
+huffman_writer.py's, so generic_reader.py opens those too.
 
 The Pixel format's ID byte is 'X'; it was 'P' until that turned out to be the
 Packet format's too, so pixel_reader.py explains a 'P' file instead of
@@ -61,6 +77,8 @@ after that it loads from the cache in `__pycache__`.
 | `simple_reader2.py` | SimpleReader2 | `SimpleDecoder2` |
 | `huffman_writer.py` | HuffmanWriter | `HuffmanCoder`: Simple 2 up to the entropy coding, then StringMapper's unary strings and CodeMapper's regular Huffman code per channel; less compression, faster decoding |
 | `huffman_reader.py` | HuffmanReader | `HuffmanDecoder` |
+| `generic_writer.py` | GenericWriter | `GenericCoder`: Simple 2's channels, LS or average deltas, mixed context or Huffman coded (NativeWriter's files) |
+| `generic_reader.py` | GenericReader | `GenericDecoder`: reads all four (and Simple 2 and Huffman files) |
 | `block_writer.py` | BlockWriter | `BlockCoder`: block map with mixed-context-coded deltas; each channel's block size and predictors chosen by the survey |
 | `block_reader.py` | BlockReader | `BlockDecoder` |
 | `packet_writer.py` | PacketWriter | `PacketCoder`: unary strings split into separately compressed packets |

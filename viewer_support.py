@@ -122,6 +122,54 @@ def parallel(n, body):
         f.result()
 
 
+def ls_bands_at_once(bands):
+    """How many bands of a least-squares coding a reader decodes at the same
+    time: one for each 6 processors, rounded up, at most bands
+    (ViewerSupport.lsBandsAtOnce, which says why)."""
+    cores = os.cpu_count() or 1
+    return max(1, min(bands, (cores + 5) // 6))
+
+
+def start_band_threads(bands, at_once, body):
+    """Starts at_once threads that run body(0), body(1), ... body(bands - 1)
+    between them, in order: each takes the next band when it's done with one
+    (ViewerSupport.startBandThreads). Returns the threads, to join; body
+    deals with its own exceptions."""
+    lock = threading.Lock()
+    next_band = [0]
+
+    def run():
+        while True:
+            with lock:
+                b = next_band[0]
+                next_band[0] += 1
+            if b >= bands:
+                return
+            body(b)
+
+    threads = [threading.Thread(target=run, daemon=True) for _ in range(at_once)]
+    for t in threads:
+        t.start()
+    return threads
+
+
+def for_bands(bands, at_once, body):
+    """Runs body(0..bands-1), at_once at a time, in order, and waits
+    (ViewerSupport.forBands); exceptions reach the caller."""
+    lock = threading.Lock()
+    next_band = [0]
+
+    def run(_):
+        while True:
+            with lock:
+                b = next_band[0]
+                next_band[0] += 1
+            if b >= bands:
+                return
+            body(b)
+    parallel(at_once, run)
+
+
 def channels(in_order, n, body):
     """body(0..n-1): in order when in_order (block-map channels, which predict
     from the one before), else in parallel."""

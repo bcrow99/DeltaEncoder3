@@ -61,6 +61,7 @@ class PixelCoder:
         self.prediction = px.MED
         self.pixel_pyramid = 0          # Average: levels of 2 x 2 averaging (0..pixel_mapper.PYRAMID_MAX)
         self.use_saddle = False         # expand with the cross-derivative term too
+        self.decode_check = False       # Save decodes the channels back first (File > Decode Check: off unless switched on)
         self.coded = None
         self.applied = False
         self.quantize()
@@ -147,9 +148,9 @@ class PixelCoder:
         return self.preview()
 
     def save(self, filename="foo"):
-        """Checks the channels decode back, then writes: FORMAT_ID,
-        FORMAT_VERSION, width, height (unsigned shorts), pixel_shift,
-        pixel_quant (bytes), block size (short), coding, channels, prediction
+        """With Decode Check on, checks the channels decode back; then
+        writes: FORMAT_ID, FORMAT_VERSION, width, height (unsigned shorts),
+        pixel_shift, pixel_quant (bytes), block size (short), coding, channels, prediction
         and the least-squares window radius (bytes), Average levels and
         saddle (bytes); for each coded channel in order (green, then the
         differences blue - green and red - green, or red and blue), its offset
@@ -157,14 +158,15 @@ class PixelCoder:
         length (int) and bytes; then with Average, the sign bits of red, green
         and blue (pixel_mapper.write_sign_bits). Returns the file size;
         raises IOError if a channel doesn't decode back."""
-        timer = vs.Timer()
         pr = self.prepared
-        back = px.decode(self.coded, self.txdim, self.tydim, self.pixel_shift, self.block_size, self.coding, self.channels,
-                         self.prediction, pr.radius, pr.offset, pr.max)
-        for i in range(3):
-            if not np.array_equal(back[i], self.top[i]):
-                raise IOError("Nothing saved: the %s channel does not decode back." % px.CHANNEL_NAMES[i])
-        print("Decode check took " + timer.elapsed())
+        if self.decode_check:
+            timer = vs.Timer()
+            back = px.decode(self.coded, self.txdim, self.tydim, self.pixel_shift, self.block_size, self.coding, self.channels,
+                             self.prediction, pr.radius, pr.offset, pr.max)
+            for i in range(3):
+                if not np.array_equal(back[i], self.top[i]):
+                    raise IOError("Nothing saved: the %s channel does not decode back." % px.CHANNEL_NAMES[i])
+            print("Decode check took " + timer.elapsed())
 
         out = DataOutput()
         out.write_byte(FORMAT_ID); out.write_byte(FORMAT_VERSION)
@@ -236,6 +238,14 @@ class PixelWriter:
         file_menu.addAction(a)
         a = QAction("Save", view)
         a.triggered.connect(self.save)
+        file_menu.addAction(a)
+        # Decode Check: Save first decodes the channels and checks they come
+        # back the same (off unless switched on: Save is faster without it; if
+        # a file doesn't decode right, it tells whether the writer or the
+        # reader is at fault).
+        a = QAction("Decode Check", view, checkable=True)
+        a.setChecked(c.decode_check)
+        a.toggled.connect(lambda on: setattr(c, "decode_check", on))
         file_menu.addAction(a)
 
         view.make_view_menu()

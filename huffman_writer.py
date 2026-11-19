@@ -46,7 +46,7 @@ FORMAT_ID = ord('H')
 FORMAT_VERSION = 1     # 1: the first
 
 
-def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, n):
+def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, n, check=False):
     """Codes the channels (as quantized, in coding order, difference
     channels less their minimums mins) and returns (the file's bytes, the
     seconds the decode check took) (HuffmanWriter.encode). Format 1. Header: FORMAT_ID, FORMAT_VERSION,
@@ -66,9 +66,9 @@ def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, 
     across the cores); the bands' deltas come from it, with only each band's
     first rows fitted again (delta_mapper.get_row_fit_band_deltas). A
     channel's coding needs only its own deltas, so its bands are coded while
-    the next channel is fitted. Once everything is
-    coded, each band's channels are checked by decoding them back, at the
-    same time; the time that took is returned, so the coding can be timed
+    the next channel is fitted. Once everything is coded, if check is set,
+    each band's channels are checked by decoding them back, at the same time;
+    the time that took is returned (0 without it), so the coding can be timed
     without it."""
     value = [np.asarray(v, dtype=np.int64) for v in value]
     rows = len(value[0]) // xdim
@@ -78,7 +78,7 @@ def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, 
     def code(b, i):
         coded[b][i] = huffman_code(d[b][i])
 
-    def check(b, i):
+    def check_band(b, i):
         dd = np.asarray(d[b][i], dtype=np.int64)
         back = huffman_decode(DataInput(coded[b][i]), len(dd))
         # (Delta 0 isn't coded: the band's first value, init, is written instead.)
@@ -98,11 +98,14 @@ def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, 
         finally:
             for j in jobs:
                 j.result()
-        # The check, once everything is coded (so its time can be told apart).
-        start = time.perf_counter()
-        for j in [coder.submit(check, b, i) for b in range(n) for i in range(3)]:
-            j.result()
-        check_time = time.perf_counter() - start
+        # The check (if asked for), once everything is coded (so its time can
+        # be told apart).
+        check_time = 0.0
+        if check:
+            start = time.perf_counter()
+            for j in [coder.submit(check_band, b, i) for b in range(n) for i in range(3)]:
+                j.result()
+            check_time = time.perf_counter() - start
 
     out = DataOutput()
     out.write_byte(FORMAT_ID); out.write_byte(FORMAT_VERSION)
@@ -192,7 +195,7 @@ class HuffmanCoder(SimpleCoder2):
 
     def encode(self):
         """(The file's bytes, the seconds the decode check took) (encode)."""
-        return encode(self.value_list, self.channel_min, self.delta_xdim, self.image_xdim, self.image_ydim, self.pixel_shift, self.pixel_quant, self.bands_used())
+        return encode(self.value_list, self.channel_min, self.delta_xdim, self.image_xdim, self.image_ydim, self.pixel_shift, self.pixel_quant, self.bands_used(), self.decode_check)
 
 
 # =============================================================================
@@ -241,6 +244,14 @@ class HuffmanWriter:
         file_menu.addAction(a)
         a = QAction("Save", view)
         a.triggered.connect(self.save)
+        file_menu.addAction(a)
+        # Decode Check: Save also decodes what it coded and says whether it
+        # comes back the same (off unless switched on: Save is faster without
+        # it; if a file doesn't decode right, it tells whether the writer or
+        # the reader is at fault).
+        a = QAction("Decode Check", view, checkable=True)
+        a.setChecked(c.decode_check)
+        a.toggled.connect(lambda on: setattr(c, "decode_check", on))
         file_menu.addAction(a)
 
         view.make_view_menu()

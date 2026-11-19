@@ -51,7 +51,7 @@ MAX_BANDS = 16         # the most bands Save offers
 BAND_MIN_ROWS = 64     # the fewest rows (of the quantized image) a band may have
 
 
-def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, n):
+def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, n, check=False):
     """Codes the channels (as quantized, in coding order, difference
     channels less their minimums mins) and returns (the file's bytes, the
     seconds the decode check took) (SimpleWriter2.encode). Format 2. Header: FORMAT_ID, FORMAT_VERSION,
@@ -73,9 +73,9 @@ def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, 
     first rows fitted again (delta_mapper.get_row_fit_band_deltas). A
     channel's coding needs only the deltas of the channels before it, so its
     bands are coded while the next channel is fitted. Once everything is
-    coded, each band's channels are checked by decoding them back, at the
-    same time; the time that took is returned, so the coding can be timed
-    without it."""
+    coded, if check is set, each band's channels are checked by decoding them
+    back, at the same time; the time that took is returned (0 without it), so
+    the coding can be timed without it."""
     value = [np.asarray(v, dtype=np.int64) for v in value]
     rows = len(value[0]) // xdim
     d = [[None] * 3 for _ in range(n)]          # [band][channel]
@@ -88,7 +88,7 @@ def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, 
         previous = d[b][:i]
         coded[b][i] = dm.pack_mixed_deltas(dd, ch, previous, xdim, True)
 
-    def check(b, i):
+    def check_band(b, i):
         y0, y1 = band_start(b, n, rows), band_start(b + 1, n, rows)
         ch = value[i][y0 * xdim:y1 * xdim]
         dd = d[b][i]
@@ -109,11 +109,14 @@ def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, 
         finally:
             for j in jobs:
                 j.result()
-        # The check, once everything is coded (so its time can be told apart).
-        start = time.perf_counter()
-        for j in [coder.submit(check, b, i) for b in range(n) for i in range(3)]:
-            j.result()
-        check_time = time.perf_counter() - start
+        # The check (if asked for), once everything is coded (so its time can
+        # be told apart).
+        check_time = 0.0
+        if check:
+            start = time.perf_counter()
+            for j in [coder.submit(check_band, b, i) for b in range(n) for i in range(3)]:
+                j.result()
+            check_time = time.perf_counter() - start
 
     out = DataOutput()
     out.write_byte(FORMAT_ID); out.write_byte(FORMAT_VERSION)
@@ -154,6 +157,7 @@ class SimpleCoder2:
         self.pixel_shift = 3
         self.correction = 0         # preview only
         self.bands = 1              # independently decodable bands Save writes
+        self.decode_check = False   # Save checks its coding by decoding it back (File > Decode Check)
         self.channel_min = [0] * 3  # each channel's minimum, in coding order (added back to the difference channels by the reader)
         self.applied = False
 
@@ -216,13 +220,13 @@ class SimpleCoder2:
 
     def encode(self):
         """(The file's bytes, the seconds the decode check took) (encode)."""
-        return encode(self.value_list, self.channel_min, self.delta_xdim, self.image_xdim, self.image_ydim, self.pixel_shift, self.pixel_quant, self.bands_used())
+        return encode(self.value_list, self.channel_min, self.delta_xdim, self.image_xdim, self.image_ydim, self.pixel_shift, self.pixel_quant, self.bands_used(), self.decode_check)
 
     def save(self, filename="foo"):
         """Codes the image (encode), twice, and writes it; prints both times
         (the first includes compiling the code: Numba's, the first time it
-        runs, or loading it from the cache), without the decode check, and the
-        check's time. Returns the file size."""
+        runs, or loading it from the cache), without the decode check (if it's
+        on: File > Decode Check), and the check's time. Returns the file size."""
         took, check = [], []
         data = None
         for _ in range(2):
@@ -246,7 +250,7 @@ class SimpleCoder2:
         print("Coded %d x %d (%s pixels)" % (w, rows, format(w * rows, ",")))
         print("Run time plus compile time: " + vs.format_duration(took[0]))
         print("Run time only:              " + vs.format_duration(took[1]))
-        print("Decode check:               " + vs.format_duration(check[1]))
+        print("Decode check:               " + (vs.format_duration(check[1]) if self.decode_check else "off"))
         print("Original compression rate: %.4f" % (self.file_length / raw))
         print("Output  compression rate:  %.4f" % (len(data) / raw))
         print()
@@ -299,6 +303,14 @@ class SimpleWriter2:
         file_menu.addAction(a)
         a = QAction("Save", view)
         a.triggered.connect(self.save)
+        file_menu.addAction(a)
+        # Decode Check: Save also decodes what it coded and says whether it
+        # comes back the same (off unless switched on: Save is faster without
+        # it; if a file doesn't decode right, it tells whether the writer or
+        # the reader is at fault).
+        a = QAction("Decode Check", view, checkable=True)
+        a.setChecked(c.decode_check)
+        a.toggled.connect(lambda on: setattr(c, "decode_check", on))
         file_menu.addAction(a)
 
         view.make_view_menu()

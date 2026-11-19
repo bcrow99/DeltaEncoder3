@@ -2515,6 +2515,93 @@ def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every):
 
 
 
+
+@njit
+def _average_row(xdim, ydim, init, data, value, previous, cross, cb, fwd, c9b, earlier, m, act_table, state, delta, dst, y):
+    """Decodes row y of a channel's average deltas (into delta, each just
+    before it is used) and rebuilds it (into dst), as _row_fit_row does its
+    RowFit deltas: each pixel predicted from (left + above) / 2 (the first
+    row from the left, the first column from above), the prediction the
+    second opinions' too; state is the delta decoder's (_mix_state); cross,
+    cb, fwd, c9b and earlier hold the earlier channels' terms, filled here as
+    far as row y + 1 (the earlier channels must be decoded to row y + 1)."""
+    if m == 3:
+        _mix_earlier_rows(previous, xdim, ydim, MIX_CROSS_TABLE, cross, cb, fwd, c9b, earlier, min(ydim, y + 1))
+    for x in range(xdim):
+        k = y * xdim + x
+        if k == 0:
+            p = init
+        elif y == 0:
+            p = dst[k - 1]
+        elif x == 0:
+            p = dst[k - xdim]
+        else:
+            p = jdiv(dst[k - 1] + dst[k - xdim], 2)
+        _mix_decode_one(state, data, k, delta, dst, value, xdim, cb, fwd, c9b, m, act_table, True, p)
+        dst[k] = init if k == 0 else p + delta[k]
+
+
+def get_values_from_average_channels(mixed, xdim, ydim, init):
+    """Decodes channels pack_mixed_deltas coded (with the second opinions)
+    from their average deltas (get_deltas' type 2: each pixel from the
+    average of the pixels left and above), rebuilding them as it goes
+    (DeltaMapper.getValuesFromAverageChannels): a thread per channel, a row
+    at a time once the channel before has decoded two rows further (this
+    row's contexts use its rows y and y + 1), each row a single compiled call
+    (_average_row). mixed[i] may be a Future and its coded bytes an Arriving,
+    as in get_values_from_row_fit_channels. Returns (deltas, values), each
+    per channel."""
+    nch, n = len(mixed), xdim * ydim
+    delta = np.zeros((nch, n), dtype=np.int64)     # rows of one array: a channel's previous is delta[:i], no copy
+    value = np.zeros((nch, n), dtype=np.int64)
+    done = [0] * nch
+    cond = threading.Condition()
+    failed = []
+
+    def run(i):
+        try:
+            table, coded = mixed[i].result() if hasattr(mixed[i], "result") else mixed[i]
+            arriving = coded if isinstance(coded, Arriving) else None
+            if arriving is not None:
+                coded = arriving.data
+                per_row = mix_bytes_per_delta(len(table)) * xdim
+                arriving.wait_for(6)       # the decoder's first reads: the cache byte and 5 code bytes
+            m = 3 if i > 0 else 2
+            state = _mix_state(coded, m, len(table), _mix_contexts_count(True))
+            terms = [np.zeros(n, dtype=np.int64) for _ in range(4)]   # cross, cb, fwd, c9b (zero for the first channel)
+            earlier = np.zeros(2, dtype=np.int64)
+            for y in range(ydim):
+                if i > 0:
+                    need = min(ydim, y + 2)
+                    with cond:
+                        while done[i - 1] < need and not failed:
+                            cond.wait()
+                        if failed:
+                            return
+                if arriving is not None:
+                    have = arriving.wait_for(int(state[0][0]) + per_row)
+                _average_row(xdim, ydim, int(init[i]), coded, table, delta[:i], terms[0], terms[1], terms[2], terms[3],
+                             earlier, m, MIX_ACTIVITY_TABLE, state, delta[i], value[i], y)
+                if arriving is not None and have < coded.shape[0] and state[0][0] > have:
+                    raise RuntimeError("row %d of channel %d read coded bytes that hadn't arrived" % (y, i))
+                with cond:
+                    done[i] = y + 1
+                    cond.notify_all()
+        except BaseException as e:
+            with cond:
+                failed.append(e)
+                cond.notify_all()
+
+    threads = [threading.Thread(target=run, args=(i,), daemon=True) for i in range(nch)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    if failed:
+        raise failed[0]
+    return list(delta), list(value)
+
+
 @njit
 def _row_fit_rebuild_row(ref, has_ref, xdim, init, every, coef, valid, z, delta, dst, y, r, col, points, win, a, b, dg, za, zd):
     """Rebuilds row y of a channel from its RowFit deltas, all known (as
