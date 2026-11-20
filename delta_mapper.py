@@ -2129,34 +2129,72 @@ def get_values_from_least_squares_channels(mixed, xdim, ydim, init, radius, ever
 
 RF_SPATIAL = 6   # the neighbours fitted (RowFit.SPATIAL), features 0 to 5
 
-@njit(inline="always")   # a call per pixel passing arrays is slow in Numba
-def _rf_products(v, ref, has_ref, xdim, nf, y, x, z, out):
-    """Pixel (y, x)'s products into out."""
-    _rf_features(v, ref, has_ref, xdim, nf, y, x, z)
+@njit
+def _rf_start(v, ref, has_ref, xdim, y0, r, col, z, fa):
+    """Sets the columns to row y0's window (rows y0 - r .. y0 - 1, from 1)
+    (RowFit.start): each row's features as rows (_rf_feature_rows), then
+    each product added along the row."""
+    nf = RF_SPATIAL + 3 if has_ref else RF_SPATIAL
     m = nf + 2
-    t = 0
-    for i in range(m):
-        zi = z[i]
-        for j in range(i, m):
-            out[t] = zi * z[j]
-            t += 1
+    col[:] = 0
+    if xdim <= 2:
+        return
+    for ty in range(max(1, y0 - r), y0):
+        _rf_feature_rows(v, ref, has_ref, xdim, nf, ty, 1, xdim - 1, z, fa)
+        t = 0
+        for i in range(m):
+            for j in range(i, m):
+                c = np.uint64(t * xdim)
+                ai = np.uint64(i * xdim)
+                aj = np.uint64(j * xdim)
+                for x in range(1, xdim - 1):
+                    ux = np.uint64(x)
+                    col[c + ux] += fa[ai + ux] * fa[aj + ux]
+                t += 1
 
 
 @njit
-def _rf_start(v, ref, has_ref, xdim, y0, r, col, z, p):
-    """Sets the columns to row y0's window (rows y0 - r .. y0 - 1, from 1)
-    (RowFit.start)."""
-    nf = RF_SPATIAL + 3 if has_ref else RF_SPATIAL
+def _rf_feature_rows(v, ref, has_ref, xdim, nf, y, c0, c1, z, out):
+    """The features (with 1 and the value) of row y's pixels c0 <= x < c1,
+    as rows: feature i at x into out[i * xdim + x]; the same values as
+    _rf_features. Where no pixel needs clamping to the image they're copies
+    of the rows around, shifted."""
     m = nf + 2
-    nt = m * (m + 1) // 2
-    col[:] = 0
-    for ty in range(max(1, y0 - r), y0):
-        for tx in range(1, xdim - 1):
-            _rf_products(v, ref, has_ref, xdim, nf, ty, tx, z, p)
-            c = np.uint64(tx * nt)
-            for t in range(nt):
-                ut = np.uint64(t)
-                col[c + ut] += p[ut]
+    # The interior: columns 2 to xdim - 3 of rows from 2 on.
+    if y >= 2:
+        i0 = max(c0, 2)
+        i1 = min(c1, xdim - 2)
+    else:
+        i0 = c1
+        i1 = c1
+    if i0 > i1:
+        i0 = c1
+        i1 = c1
+    for x in range(c0, i0):
+        _rf_features(v, ref, has_ref, xdim, nf, y, x, z)
+        for i in range(m):
+            out[i * xdim + x] = z[i]
+    for x in range(i1, c1):
+        _rf_features(v, ref, has_ref, xdim, nf, y, x, z)
+        for i in range(m):
+            out[i * xdim + x] = z[i]
+    if i0 >= i1:
+        return
+    row = y * xdim
+    up = row - xdim
+    up2 = up - xdim
+    out[i0:i1] = v[row - 1 + i0:row - 1 + i1]                          # W
+    out[xdim + i0:xdim + i1] = v[up + i0:up + i1]                      # N
+    out[2 * xdim + i0:2 * xdim + i1] = v[up - 1 + i0:up - 1 + i1]      # NW
+    out[3 * xdim + i0:3 * xdim + i1] = v[up + 1 + i0:up + 1 + i1]      # NE
+    out[4 * xdim + i0:4 * xdim + i1] = v[row - 2 + i0:row - 2 + i1]    # WW
+    out[5 * xdim + i0:5 * xdim + i1] = v[up2 + 1 + i0:up2 + 1 + i1]    # NNE
+    if has_ref:
+        out[6 * xdim + i0:6 * xdim + i1] = ref[row + i0:row + i1]
+        out[7 * xdim + i0:7 * xdim + i1] = ref[row - 1 + i0:row - 1 + i1]
+        out[8 * xdim + i0:8 * xdim + i1] = ref[up + i0:up + i1]
+    out[nf * xdim + i0:nf * xdim + i1] = 1
+    out[(nf + 1) * xdim + i0:(nf + 1) * xdim + i1] = v[row + i0:row + i1]
 
 
 @njit(inline="always")   # a call per pixel passing arrays is slow in Numba
@@ -2189,68 +2227,77 @@ def _rf_features(v, ref, has_ref, xdim, nf, y, x, z):
 
 
 @njit
-def _rf_advance(v, ref, has_ref, xdim, y, r, col, c0, c1, za, zd):
+def _rf_advance(v, ref, has_ref, xdim, y, r, col, c0, c1, z, fa, fd):
     """Columns c0..c1-1 from row y - 1's window to row y's: adds row y - 1,
-    drops row y - 1 - r (RowFit.addColumns; y - 1 >= 1): each column gains
-    the added pixel's products and loses the dropped one's, in one pass (the
-    sums are ints, so the same in any order). za, zd: two vectors of nf + 2."""
+    drops row y - 1 - r (RowFit.addColumns; y - 1 >= 1): the two rows'
+    features as rows (_rf_feature_rows, into fa and fd), then each product
+    along the run of columns, the added pixel's in and the dropped one's out
+    (the sums are ints, so the same in any order)."""
     nf = RF_SPATIAL + 3 if has_ref else RF_SPATIAL
     m = nf + 2
-    nt = m * (m + 1) // 2
     drop = y - 1 - r
-    for tx in range(c0, c1):
-        t = tx * nt
-        _rf_features(v, ref, has_ref, xdim, nf, y - 1, tx, za)
-        if drop >= 1:
-            _rf_features(v, ref, has_ref, xdim, nf, drop, tx, zd)
-            for i in range(m):
-                ai = za[i]
-                di = zd[i]
-                for j in range(i, m):
-                    col[t] += ai * za[j] - di * zd[j]
-                    t += 1
-        else:
-            for i in range(m):
-                ai = za[i]
-                for j in range(i, m):
-                    col[t] += ai * za[j]
-                    t += 1
+    if c0 >= c1:
+        return
+    _rf_feature_rows(v, ref, has_ref, xdim, nf, y - 1, c0, c1, z, fa)
+    if drop >= 1:
+        _rf_feature_rows(v, ref, has_ref, xdim, nf, drop, c0, c1, z, fd)
+    t = 0
+    for i in range(m):
+        for j in range(i, m):
+            c = np.uint64(t * xdim)
+            ai = np.uint64(i * xdim)
+            aj = np.uint64(j * xdim)
+            if drop >= 1:
+                for x in range(c0, c1):
+                    ux = np.uint64(x)
+                    col[c + ux] += fa[ai + ux] * fa[aj + ux] - fd[ai + ux] * fd[aj + ux]
+            else:
+                for x in range(c0, c1):
+                    ux = np.uint64(x)
+                    col[c + ux] += fa[ai + ux] * fa[aj + ux]
+            t += 1
 
 
 @njit
-def _rf_solve(col, xdim, r, nf, every, p0, p1, coef, valid, win, a, b, dg):
+def _rf_window_sums(col, xdim, r, nt, every, points, p0, p1, wsum, prefix):
+    """Solved pixels p0 <= p < p1's window sums, product by product, into
+    wsum (product t's for pixel p at wsum[t * points + p]): pixel p's window
+    is columns x - r to x + r (x = 1 + p * every), clamped to 1 and xdim - 2.
+    Each product's sums along the columns the windows cover are added up as
+    they go (prefix), and each window's sum is the difference of two of
+    those: exact integers, the same as adding up its columns."""
+    lo0 = max(1, 1 + p0 * every - r)
+    hi1 = min(xdim - 2, 1 + (p1 - 1) * every + r)
+    prefix[0] = 0     # prefix[k]: the sum of columns lo0 to lo0 + k - 1
+    for t in range(nt):
+        c = t * xdim + lo0
+        total = 0
+        for k in range(hi1 - lo0 + 1):
+            total += col[c + k]
+            prefix[k + 1] = total
+        out = t * points
+        for p in range(p0, p1):
+            x = 1 + p * every
+            lo = max(x - r, 1)
+            hi = min(x + r, xdim - 2)
+            wsum[out + p] = prefix[hi - lo0 + 1] - prefix[lo - lo0]
+
+
+@njit
+def _rf_solve(col, xdim, r, nf, every, p0, p1, coef, valid, win, a, b, dg, wsum, prefix):
     """Solves solved pixels p0..p1-1 of a row (column 1 + every * p) from the
-    columns (RowFit.solveRow and solve): each one's window sums, slid from
-    the one before, then L D L^T as in the Java."""
+    columns (RowFit.solveRow and solve): their window sums first
+    (_rf_window_sums), then each one's L D L^T as in the Java."""
     m = nf + 2
     nt = m * (m + 1) // 2
     n = nf + 1
-    lo = 0
-    hi = -1
+    if p0 >= p1:
+        return
+    points = (xdim - 2 + every - 1) // every
+    _rf_window_sums(col, xdim, r, nt, every, points, p0, p1, wsum, prefix)
     for p in range(p0, p1):
-        x = 1 + p * every
-        nlo = max(1, x - r)
-        nhi = min(xdim - 2, x + r)
-        if p == p0:
-            win[:] = 0
-            for c in range(nlo, nhi + 1):
-                o = np.uint64(c * nt)
-                for s in range(nt):
-                    us = np.uint64(s)
-                    win[us] += col[o + us]
-        else:
-            for c in range(lo, nlo):
-                o = np.uint64(c * nt)
-                for s in range(nt):
-                    us = np.uint64(s)
-                    win[us] -= col[o + us]
-            for c in range(hi + 1, nhi + 1):
-                o = np.uint64(c * nt)
-                for s in range(nt):
-                    us = np.uint64(s)
-                    win[us] += col[o + us]
-        lo = nlo
-        hi = nhi
+        for t in range(nt):
+            win[t] = wsum[t * points + p]
         valid[p] = False
         if win[nf * m - nf * (nf - 1) // 2] < 2 * n:
             continue
@@ -2318,36 +2365,42 @@ def _rf_predict(v, ref, has_ref, xdim, nf, y, x, every, coef, valid, z):
 
 
 def _rf_state(xdim, has_ref, every):
-    """(col, coef, valid, z, p, win, a, b, dg, za, zd, points): a RowFit's
-    columns and a row's solutions, and one task's working arrays (_rf_work)."""
+    """(col, coef, valid, z, win, a, b, dg, fa, fd, wsum, prefix, points): a
+    RowFit's columns (product t's sum at column x in col[t * xdim + x], so
+    each product's sums run along the row) and a row's solutions, and one
+    task's working arrays (_rf_work)."""
     nf = RF_SPATIAL + 3 if has_ref else RF_SPATIAL
     m = nf + 2
     nt = m * (m + 1) // 2
     n = nf + 1
     points = max(0, (xdim - 2 + every - 1) // every)
-    return (np.zeros(xdim * nt, dtype=np.int32), np.zeros(max(1, points) * n), np.zeros(max(1, points), dtype=np.bool_)) + _rf_work(nf) + (points,)
+    return (np.zeros(xdim * nt, dtype=np.int32), np.zeros(max(1, points) * n), np.zeros(max(1, points), dtype=np.bool_)) + _rf_work(nf, xdim, every) + (points,)
 
 
-def _rf_work(nf):
-    """One task's working arrays: (z, products, window sums, a, b, dg, and
-    _rf_advance's two vectors)."""
+def _rf_work(nf, xdim, every):
+    """One task's working arrays: (z, a window's sums, a, b, dg, the rows of
+    features _rf_advance adds and drops (fa, fd: feature i at column x in
+    [i * xdim + x]), the solved pixels' window sums (wsum) and
+    _rf_window_sums' prefix sums)."""
     m = nf + 2
     nt = m * (m + 1) // 2
     n = nf + 1
-    return (np.zeros(m, dtype=np.int64), np.zeros(nt, dtype=np.int32), np.zeros(nt, dtype=np.int64),
-            np.zeros((n, n)), np.zeros(n), np.zeros(n), np.zeros(m, dtype=np.int64), np.zeros(m, dtype=np.int64))
+    points = max(1, (xdim - 2 + every - 1) // every)
+    return (np.zeros(m, dtype=np.int64), np.zeros(nt, dtype=np.int64), np.zeros((n, n)), np.zeros(n), np.zeros(n),
+            np.zeros(m * xdim, dtype=np.int32), np.zeros(m * xdim, dtype=np.int32),
+            np.zeros(nt * points, dtype=np.int64), np.zeros(xdim + 1, dtype=np.int64))
 
 
 @njit
-def _rf_band(v, ref, has_ref, xdim, y0, y1, out, r, every, col, coef, valid, z, p, win, a, b, dg, za, zd, points):
+def _rf_band(v, ref, has_ref, xdim, y0, y1, out, r, every, col, coef, valid, z, win, a, b, dg, fa, fd, wsum, prefix, points):
     """The encoder's predictions for rows y0..y1-1, the window started at
     y0 on its own (RowFit.plane's bands)."""
     nf = RF_SPATIAL + 3 if has_ref else RF_SPATIAL
-    _rf_start(v, ref, has_ref, xdim, y0, r, col, z, p)
+    _rf_start(v, ref, has_ref, xdim, y0, r, col, z, fa)
     for y in range(y0, y1):
         if y > y0 and y - 1 >= 1:
-            _rf_advance(v, ref, has_ref, xdim, y, r, col, 1, xdim - 1, za, zd)
-        _rf_solve(col, xdim, r, nf, every, 0, points, coef, valid, win, a, b, dg)
+            _rf_advance(v, ref, has_ref, xdim, y, r, col, 1, xdim - 1, z, fa, fd)
+        _rf_solve(col, xdim, r, nf, every, 0, points, coef, valid, win, a, b, dg, wsum, prefix)
         for x in range(1, xdim - 1):
             out[y * xdim + x] = _rf_predict(v, ref, has_ref, xdim, nf, y, x, every, coef, valid, z)
 
@@ -2421,15 +2474,15 @@ def _row_fit_row(ref, has_ref, xdim, ydim, init, every, data, value, previous, c
 
 @njit
 def _row_fit_row_inline(ref, has_ref, xdim, ydim, init, every, data, value, previous, cross, cb, fwd, c9b, earlier, m,
-                        act_table, state, coef, valid, z, delta, dst, y, r, col, points, win, a, b, dg, za, zd):
+                        act_table, state, coef, valid, z, delta, dst, y, r, col, points, win, a, b, dg, fa, fd, wsum, prefix):
     """As _row_fit_row, with the row's fits solved first in the same call
     (_rf_advance, _rf_solve): the decoder's way
     (get_values_from_row_fit_channels), so that each row is a single call."""
     if y >= 1:
         nf = RF_SPATIAL + 3 if has_ref else RF_SPATIAL
         if y >= 2:
-            _rf_advance(dst, ref, has_ref, xdim, y, r, col, 1, xdim - 1, za, zd)
-        _rf_solve(col, xdim, r, nf, every, 0, points, coef, valid, win, a, b, dg)
+            _rf_advance(dst, ref, has_ref, xdim, y, r, col, 1, xdim - 1, z, fa, fd)
+        _rf_solve(col, xdim, r, nf, every, 0, points, coef, valid, win, a, b, dg, wsum, prefix)
     _row_fit_row(ref, has_ref, xdim, ydim, init, every, data, value, previous, cross, cb, fwd, c9b, earlier, m,
                  act_table, state, coef, valid, z, delta, dst, y)
 
@@ -2474,12 +2527,12 @@ def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every):
             nf = RF_SPATIAL + 3 if has_ref else RF_SPATIAL
             r = radius[i]
             state = _mix_state(coded, m, len(table), _mix_contexts_count(True))
-            col, coef, valid, z, _, _, _, _, _, _, _, points = _rf_state(xdim, has_ref, every)
+            col, coef, valid, z, _, _, _, _, _, _, _, _, points = _rf_state(xdim, has_ref, every)
             ref = value[i - 1] if i > 0 else np.zeros(1, dtype=np.int64)
             dst = value[i]
             terms = [np.zeros(n, dtype=np.int64) for _ in range(4)]   # cross, cb, fwd, c9b (zero for the first channel)
             earlier = np.zeros(2, dtype=np.int64)
-            w = _rf_work(nf)
+            w = _rf_work(nf, xdim, every)
 
             for y in range(ydim):
                 if i > 0:
@@ -2493,7 +2546,7 @@ def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every):
                     have = arriving.wait_for(int(state[0][0]) + per_row)
                 _row_fit_row_inline(ref, has_ref, xdim, ydim, int(init[i]), every, coded, table, delta[:i], terms[0], terms[1], terms[2], terms[3],
                                     earlier, m, MIX_ACTIVITY_TABLE, state, coef, valid, z, delta[i], dst, y,
-                                    r, col, points, w[2], w[3], w[4], w[5], w[6], w[7])
+                                    r, col, points, w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
                 if arriving is not None and have < coded.shape[0] and state[0][0] > have:
                     raise RuntimeError("row %d of channel %d read coded bytes that hadn't arrived" % (y, i))
                 with cond:
@@ -2603,7 +2656,7 @@ def get_values_from_average_channels(mixed, xdim, ydim, init):
 
 
 @njit
-def _row_fit_rebuild_row(ref, has_ref, xdim, init, every, coef, valid, z, delta, dst, y, r, col, points, win, a, b, dg, za, zd):
+def _row_fit_rebuild_row(ref, has_ref, xdim, init, every, coef, valid, z, delta, dst, y, r, col, points, win, a, b, dg, fa, fd, wsum, prefix):
     """Rebuilds row y of a channel from its RowFit deltas, all known (as
     _row_fit_row_inline, without the decoding): the row's fits solved first
     (_rf_advance, _rf_solve), then row 0 horizontal, column 0 vertical, the
@@ -2611,8 +2664,8 @@ def _row_fit_rebuild_row(ref, has_ref, xdim, init, every, coef, valid, z, delta,
     nf = RF_SPATIAL + 3 if has_ref else RF_SPATIAL
     if y >= 1:
         if y >= 2:
-            _rf_advance(dst, ref, has_ref, xdim, y, r, col, 1, xdim - 1, za, zd)
-        _rf_solve(col, xdim, r, nf, every, 0, points, coef, valid, win, a, b, dg)
+            _rf_advance(dst, ref, has_ref, xdim, y, r, col, 1, xdim - 1, z, fa, fd)
+        _rf_solve(col, xdim, r, nf, every, 0, points, coef, valid, win, a, b, dg, wsum, prefix)
     for x in range(xdim):
         k = y * xdim + x
         if k == 0:
@@ -2644,11 +2697,11 @@ def get_values_from_row_fit_deltas(delta, xdim, ydim, init, radius, every):
         try:
             has_ref = i > 0
             nf = RF_SPATIAL + 3 if has_ref else RF_SPATIAL
-            col, coef, valid, z, _, _, _, _, _, _, _, points = _rf_state(xdim, has_ref, every)
+            col, coef, valid, z, _, _, _, _, _, _, _, _, points = _rf_state(xdim, has_ref, every)
             ref = value[i - 1] if i > 0 else np.zeros(1, dtype=np.int64)
             d = np.asarray(delta[i], dtype=np.int64)
             dst = value[i]
-            w = _rf_work(nf)
+            w = _rf_work(nf, xdim, every)
             for y in range(ydim):
                 if i > 0:
                     with cond:
@@ -2657,7 +2710,7 @@ def get_values_from_row_fit_deltas(delta, xdim, ydim, init, radius, every):
                         if failed:
                             return
                 _row_fit_rebuild_row(ref, has_ref, xdim, int(init[i]), every, coef, valid, z, d, dst, y,
-                                     radius[i], col, points, w[2], w[3], w[4], w[5], w[6], w[7])
+                                     radius[i], col, points, w[1], w[2], w[3], w[4], w[5], w[6], w[7], w[8])
                 with cond:
                     done[i] = y + 1
                     cond.notify_all()

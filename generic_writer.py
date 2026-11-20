@@ -195,6 +195,11 @@ class GenericCoder(SimpleCoder2):
         return encode(self.value_list, self.channel_min, self.delta_xdim, self.image_xdim, self.image_ydim, self.pixel_shift, self.pixel_quant,
                       self.bands_used(), self.delta_type, self.entropy_type, self.decode_check)
 
+    def timing_key(self):
+        """The coding's name, for print_run_times: each choice of deltas and
+        coding is code of its own, compiled the first time it runs."""
+        return "GenericCoder %s %s" % (DELTA_NAMES[self.delta_type], ENTROPY_NAMES[self.entropy_type])
+
     def save(self, filename="foo"):
         """As SimpleCoder2.save, saying the deltas and coding first."""
         print("%s deltas, %s" % (DELTA_NAMES[self.delta_type], ENTROPY_NAMES[self.entropy_type]))

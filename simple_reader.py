@@ -179,10 +179,9 @@ class SimpleReader:
         self.view.make_view_menu()
         self.view.set_status("decoding…")
         self.view.show_window()
-        # Decoded twice, the times of both printed: the first includes
-        # compiling the code (Numba's, the first time it runs, or loading it
-        # from the cache), the second is the run time only. The image shows
-        # after the first.
+        # Decoded twice (viewer_support.print_run_times: the first decoding in
+        # this process includes compiling the code, so the times are printed
+        # apart, the second as the run time). The image shows after the first.
         vs.run_in_background(d.decode, self.done)
 
     def done(self, rgb, error):
@@ -205,8 +204,10 @@ class SimpleReader:
         d = self.decoder
         print("Image rebuilt (%d x %d); the file read in %s, then %s, while decoding." % (
             d.xdim, d.ydim, vs.format_duration(self.first_read), vs.format_duration(d.read_time)))
-        print("Run time plus compile time: " + vs.format_duration(self.first_time))
-        print("Run time only:              " + vs.format_duration(d.took))
+        # (The image is shown between the two decodings, so they aren't timed
+        # together: their sum stands in for it. A reader decodes one file, so
+        # its first decoding is always the first in the process anyway.)
+        vs.print_run_times(type(d).__name__, self.first_time, d.took, self.first_time + d.took)
 
 
 def main():

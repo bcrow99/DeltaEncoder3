@@ -122,6 +122,31 @@ def parallel(n, body):
         f.result()
 
 
+_ran = set()                 # the codings (or decodings) that have run in this process: see print_run_times
+_ran_lock = threading.Lock()
+
+
+def print_run_times(key, first, second, both):
+    """Prints the times (seconds) of the two runs of a coding (or a
+    decoding) that key names, and returns whether it printed their halved
+    total (ViewerSupport.printRunTimes). first and second are each run's
+    time, both a single timing of the two together. The first time it runs
+    in this process its code is compiled (Numba compiles each function the
+    first time it's called, or loads it from its cache), so the first run is
+    printed on its own, and the second, compiled, as the run time. Every
+    time after that both runs are compiled, so the run time printed is the
+    single timing of the two, halved: less noise than either run alone."""
+    with _ran_lock:
+        new = key not in _ran
+        _ran.add(key)
+    if new:
+        print("First run (includes compile):     " + format_duration(first))
+        print("Run time:                         " + format_duration(second))
+        return False
+    print("Run time (2 runs timed, halved):  " + format_duration(both / 2))
+    return True
+
+
 def ls_bands_at_once(bands):
     """How many bands of a least-squares coding a reader decodes at the same
     time: one for each 6 processors, rounded up, at most bands

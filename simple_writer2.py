@@ -222,21 +222,31 @@ class SimpleCoder2:
         """(The file's bytes, the seconds the decode check took) (encode)."""
         return encode(self.value_list, self.channel_min, self.delta_xdim, self.image_xdim, self.image_ydim, self.pixel_shift, self.pixel_quant, self.bands_used(), self.decode_check)
 
+    def timing_key(self):
+        """The coding's name, for print_run_times: the coder's class."""
+        return type(self).__name__
+
     def save(self, filename="foo"):
-        """Codes the image (encode), twice, and writes it; prints both times
-        (the first includes compiling the code: Numba's, the first time it
-        runs, or loading it from the cache), without the decode check (if it's
-        on: File > Decode Check), and the check's time. Returns the file size."""
-        took, check = [], []
-        data = None
+        """Codes the image (encode), twice, and writes it; prints the times
+        (viewer_support.print_run_times: the first run of this coding in this
+        process includes compiling the code, so the two are printed apart;
+        after that, the two timed together, halved), without the decode check
+        (if it's on: File > Decode Check), and the check's time. Returns the
+        file size."""
+        # Each run timed, and the two together (the decode checks taken out of
+        # both); the bytes compared after them.
+        took, check, got = [], [], []
+        everything = time.perf_counter()
         for _ in range(2):
             start = time.perf_counter()
-            got, c = self.encode()
+            data, c = self.encode()
             took.append(time.perf_counter() - start - c)
             check.append(c)
-            if data is not None and got != data:
-                print("WARNING: the second coding differs from the first.")
-            data = got
+            got.append(data)
+        both = time.perf_counter() - everything - check[0] - check[1]
+        if got[0] != got[1]:
+            print("WARNING: the second coding differs from the first.")
+        data = got[1]
         with open(filename, "wb") as f:
             f.write(data)
         n = self.bands_used()
@@ -248,9 +258,9 @@ class SimpleCoder2:
         else:
             print("Saved %s: %s bytes" % (os.path.basename(filename), format(len(data), ",")))
         print("Coded %d x %d (%s pixels)" % (w, rows, format(w * rows, ",")))
-        print("Run time plus compile time: " + vs.format_duration(took[0]))
-        print("Run time only:              " + vs.format_duration(took[1]))
-        print("Decode check:               " + (vs.format_duration(check[1]) if self.decode_check else "off"))
+        halved = vs.print_run_times(self.timing_key(), took[0], took[1], both)
+        check_time = (check[0] + check[1]) / 2 if halved else check[1]
+        print("Decode check:                     " + (vs.format_duration(check_time) if self.decode_check else "off"))
         print("Original compression rate: %.4f" % (self.file_length / raw))
         print("Output  compression rate:  %.4f" % (len(data) / raw))
         print()
