@@ -4,7 +4,7 @@ simple_reader.py version 3.3 -- SimpleReader.java for Python (PySide6).
 
 Reads Simple format 'S' version 8, from simple_writer.py or
 SimpleWriter.java: every interior pixel predicted by the least-squares fit
-(the wide clamp) with each channel's window radius, the deltas mixed-context
+(the wide clamp) with each channel's window radius, the deltas context-aware
 coded with the second opinions, in bands of rows decoded at the same time,
 resized back with resize_mapper.resize2 (centred). The file is read in
 stages: each band's channels start decoding as soon as the start of them has

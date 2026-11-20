@@ -4,7 +4,7 @@ block_reader.py version 2.5 -- BlockReader.java for Python (PySide6).
 
 Reads Block format 'B' versions 3 to 10, from block_writer.py or
 BlockWriter.java: block map deltas (delta type 13), Context coded (version
-3) or mixed-context coded (versions 4 to 8; from 5 each channel has its own
+3) or context-aware coded (versions 4 to 8; from 5 each channel has its own
 block size; 6, 8 and 10 are in bands of rows, decoded at the same time; 7 to
 10 code with the second opinions; 9 and 10 use the 225-entry table). See
 block_writer.BlockCoder.save for the layout.
@@ -27,7 +27,7 @@ import viewer_support as vs
 from java_io import DataInput
 
 FORMAT_ID = ord('B')
-FORMAT_VERSION = 10  # 3: one predictor table (delta_mapper.TABLE_256) and cross-channel block maps; 4: mixed context coding; 5: a block size per channel; 6: independently decodable bands; 7 and 8: 5 and 6 with the mixed coder's second opinions; 9 and 10: 7 and 8 with the 225-entry predictor table (delta_mapper.TABLE)
+FORMAT_VERSION = 10  # 3: one predictor table (delta_mapper.TABLE_256) and cross-channel block maps; 4: context aware coding; 5: a block size per channel; 6: independently decodable bands; 7 and 8: 5 and 6 with the mixed coder's second opinions; 9 and 10: 7 and 8 with the 225-entry predictor table (delta_mapper.TABLE)
 OLDEST_VERSION = 3   # older files are not read (the block predictors changed in version 3)
 
 

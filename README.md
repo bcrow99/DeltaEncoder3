@@ -71,22 +71,22 @@ after that it loads from the cache in `__pycache__`.
 | `delta_writer.py` | DeltaWriter | `DeltaCoder` (survey, apply, save — usable without a window) and the window |
 | `delta_reader.py` | DeltaReader | `DeltaDecoder` (usable without a window) and the window |
 | `delta_writer2.py` | DeltaWriter2 | `DeltaCoder2`: delta types 6–13 only, String* datatype, map-coding report |
-| `simple_writer.py` | SimpleWriter | `SimpleCoder`: least squares alone, mixed-context-coded deltas; each channel's window radius chosen by the analysis |
+| `simple_writer.py` | SimpleWriter | `SimpleCoder`: least squares alone, context-aware-coded deltas; each channel's window radius chosen by the analysis |
 | `simple_reader.py` | SimpleReader | `SimpleDecoder` |
 | `simple_writer2.py` | SimpleWriter2 | `SimpleCoder2`: the same coding with the channels green, blue-green, red-green and window radius 10, no analysis |
 | `simple_reader2.py` | SimpleReader2 | `SimpleDecoder2` |
 | `huffman_writer.py` | HuffmanWriter | `HuffmanCoder`: Simple 2 up to the entropy coding, then StringMapper's unary strings and CodeMapper's regular Huffman code per channel; less compression, faster decoding |
 | `huffman_reader.py` | HuffmanReader | `HuffmanDecoder` |
-| `generic_writer.py` | GenericWriter | `GenericCoder`: Simple 2's channels, LS or average deltas, mixed context or Huffman coded (NativeWriter's files) |
+| `generic_writer.py` | GenericWriter | `GenericCoder`: Simple 2's channels, LS or average deltas, context aware or Huffman coded (NativeWriter's files) |
 | `generic_reader.py` | GenericReader | `GenericDecoder`: reads all four (and Simple 2 and Huffman files) |
-| `block_writer.py` | BlockWriter | `BlockCoder`: block map with mixed-context-coded deltas; each channel's block size and predictors chosen by the survey |
+| `block_writer.py` | BlockWriter | `BlockCoder`: block map with context-aware-coded deltas; each channel's block size and predictors chosen by the survey |
 | `block_reader.py` | BlockReader | `BlockDecoder` |
 | `packet_writer.py` | PacketWriter | `PacketCoder`: unary strings split into separately compressed packets |
 | `packet_reader.py` | PacketReader | `PacketDecoder` |
 | `pixel_writer.py` | PixelWriter | `PixelCoder`: context-adaptive arithmetic coding of the pixels, block size search |
 | `pixel_reader.py` | PixelReader | `PixelDecoder` |
 | `viewer_support.py` | ViewerSupport | image window with zoom, dialogs, image loading, background jobs |
-| `delta_mapper.py` | DeltaMapper | channel sets, delta types 0–13, maps, context-coded and mixed-context-coded deltas, block search |
+| `delta_mapper.py` | DeltaMapper | channel sets, delta types 0–13, maps, context-coded and context-aware-coded deltas, block search |
 | `arithmetic_mapper.py` | ArithmeticMapper | range coder; static, adaptive and context coders; frequency tables |
 | `string_mapper.py` | StringMapper | unary strings and their bit-run compression |
 | `code_mapper.py` | CodeMapper | Huffman ("regular"), Shannon estimate, Deflate |

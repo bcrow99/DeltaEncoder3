@@ -4,7 +4,7 @@ huffman_reader.py version 1.0 -- HuffmanReader.java for Python (PySide6).
 
 Reads Huffman format 'H' version 1 only, from huffman_writer.py or
 HuffmanWriter.java: simple_reader2.py with the Huffman decoding in place of
-the mixed context decoding. The file is read whole; then each band's
+the context aware decoding. The file is read whole; then each band's
 channels' deltas are decoded (code_mapper's regular Huffman code, then
 string_mapper's unary strings), all bands and channels at the same time;
 then each band's channels are rebuilt from them with the least-squares fit

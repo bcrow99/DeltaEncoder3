@@ -10,7 +10,7 @@ _rf_*, DeltaMapper.RowFit; the wide clamp: the window is the RADIUS rows
 above, with none of the pixel's own row, so a reader solves a whole row's
 fits at the same time before decoding it) with one window radius for every
 channel and image, solved at every EVERY-th pixel along a row, and the
-deltas mixed-context coded with the second opinions
+deltas context-aware coded with the second opinions
 (delta_mapper.pack_mixed_deltas). As in simple_writer.py, a channel's fit
 uses the channel before it and its contexts the deltas of the channels
 before it. Nothing is fitted or coded until Save. Pixel Resolution resizes
@@ -62,7 +62,7 @@ def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, 
     (the fit and the contexts start again at its top): per channel (green,
     blue-green, red-green), int init, then the deltas of the least-squares
     fit from the rows above (radius RADIUS, solved at every EVERY-th pixel
-    along a row) mixed-context coded
+    along a row) context-aware coded
     with the second opinions (pack_mixed_deltas). Channels 1 and 2 use the ones before
     them (their values in the fit, their deltas as context), so a band's
     channels are decoded in order, each a few rows behind the one before; the

@@ -3,7 +3,7 @@
 block_writer.py version 2.5 -- BlockWriter.java for Python (PySide6).
 
 A writer with one delta type and one entropy coder: the block map (delta
-type 13) with mixed-context-coded deltas (delta_mapper.pack_mixed_deltas)
+type 13) with context-aware-coded deltas (delta_mapper.pack_mixed_deltas)
 and a coded map. Each block uses one predictor from its channel's set, and
 a set can be any of the 225 predictors delta_mapper has ids for (id 223 is
 the least-squares predictor, LS; 224 the same fit with a wider clamp). There are no block settings to choose:
@@ -45,7 +45,7 @@ import viewer_support as vs
 from java_io import DataOutput
 
 FORMAT_ID = ord('B')
-FORMAT_VERSION = 10  # 3: one predictor table (delta_mapper.TABLE_256) and cross-channel block maps; 4: mixed context coding; 5: a block size per channel; 6: independently decodable bands; 7 and 8: 5 and 6 with the mixed coder's second opinions; 9 and 10: 7 and 8 with the 225-entry predictor table (delta_mapper.TABLE)
+FORMAT_VERSION = 10  # 3: one predictor table (delta_mapper.TABLE_256) and cross-channel block maps; 4: context aware coding; 5: a block size per channel; 6: independently decodable bands; 7 and 8: 5 and 6 with the mixed coder's second opinions; 9 and 10: 7 and 8 with the 225-entry predictor table (delta_mapper.TABLE)
 ONE_BAND_VERSION = 9   # the version written with one band: the layout before bands
 MAX_BANDS = 16         # the most bands Save offers
 BAND_MIN_ROWS = 64     # the fewest rows (of the quantized image) a band may have
@@ -55,7 +55,7 @@ QUANT_SETTLE_MS = 400   # how long a quantization slider must rest before the su
 
 
 def mixed_code(delta, values, xdim):
-    """Each channel's deltas mixed-context coded with the second opinions
+    """Each channel's deltas context-aware coded with the second opinions
     (pack_mixed_deltas), channel i's contexts using channels 0..i-1. Checks
     each decodes back."""
     coded = [None] * 3
@@ -283,7 +283,7 @@ class BlockCoder:
         channel: int min, int init, the block map (write_map, type 13; it
         carries the channel's block size and predictor ids; its context lines
         up the previous channel's map, align_map), then the deltas,
-        mixed-context coded with the second opinions (pack_mixed_deltas). Channels 1 and 2 use the ones
+        context-aware coded with the second opinions (pack_mixed_deltas). Channels 1 and 2 use the ones
         before them as context, so the reader decodes in order. Returns the
         bytes."""
         coded = mixed_code(self.delta_list, self.value_list, self.delta_xdim)

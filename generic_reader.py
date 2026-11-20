@@ -10,7 +10,7 @@ red-green (generic_writer.SET_ID), in bands of rows decoded at the same time
 resize_mapper.resize2 (centred). The file's first byte says how its deltas
 were coded:
 
-  Simple 2 ('F', mixed context): the file is read in stages: each band's
+  Simple 2 ('F', context aware): the file is read in stages: each band's
   channels start decoding as soon as the start of them has been read, and
   decode their coded bytes as they arrive, while the rest of the file is
   read; a band's channels are decoded at the same time, each a few rows

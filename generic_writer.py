@@ -19,7 +19,7 @@ The Delta menu chooses the deltas:
        pixel from (left + above) / 2), no fit.
 
 The Entropy menu chooses the coding:
-  Mixed context: the deltas mixed-context coded with the second opinions
+  Context aware: the deltas context-aware coded with the second opinions
        (delta_mapper.pack_mixed_deltas; a channel's contexts use the deltas
        of the channels before it). Simple 2 format 'F': version 2 with LS,
        the same files as simple_writer2.py; 3 with Avg (the delta type after
@@ -63,7 +63,7 @@ HUFFMAN_ID = ord('H')
 HUFFMAN_VERSION = 1             # the Huffman format with the LS deltas: huffman_writer.py's
 HUFFMAN_VERSION_DELTA_TYPE = 2  # version 1 with the delta type, as above
 ENTROPY_MIXED, ENTROPY_HUFFMAN = 0, 1
-ENTROPY_NAMES = ("Mixed context", "Huffman")
+ENTROPY_NAMES = ("Context aware", "Huffman")
 DELTA_LS, DELTA_AVERAGE = 0, 1
 DELTA_NAMES = ("LS", "Avg")
 MAX_BANDS = 64                  # the most bands Save offers (GenericWriter.MAX_BANDS)
@@ -80,7 +80,7 @@ def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, 
     bands n (an unsigned byte), n int lengths, and the n bands. Band b is rows
     band_start(b) to band_start(b + 1) of the quantized image, coded as an
     image of its own (the fit and the contexts start again at its top): per
-    channel, int init, then its deltas coded: mixed context
+    channel, int init, then its deltas coded: context aware
     (pack_mixed_deltas, with the second opinions) or Huffman
     (huffman_writer.huffman_code).
 
@@ -88,7 +88,7 @@ def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, 
     deltas come from it, with only each band's first rows fitted again
     (delta_mapper.get_row_fit_band_deltas). The average deltas are found a
     band at a time. A channel's coding needs only the deltas of the channels
-    before it (mixed context) or its own (Huffman), so its bands are coded
+    before it (context aware) or its own (Huffman), so its bands are coded
     while the next channel's deltas are found. Once everything is coded, if
     check is set, each band's channels are checked by decoding them back, at
     the same time; the time that took is returned (0 without it), so the

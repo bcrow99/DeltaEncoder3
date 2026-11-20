@@ -6,7 +6,7 @@ simple_writer2.py up to the entropy coding: the same channels (green,
 blue-green and red-green, SET_ID), the same least-squares fit from the rows
 above (delta_mapper's _rf_*, DeltaMapper.RowFit: the window is the RADIUS
 rows above, solved at every EVERY-th pixel along a row), the same bands,
-Apply and Save. Then, in place of the mixed context coding, each band's
+Apply and Save. Then, in place of the context aware coding, each band's
 channel's deltas are coded as delta_writer2.py codes them: unary strings by
 frequency rank (string_mapper.get_string_list), with string_mapper's
 bit-pair transform kept only if it saves enough (its rule), then a canonical

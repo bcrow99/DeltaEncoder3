@@ -1972,7 +1972,7 @@ def get_values_from_mixed_deltas(value, coded, previous, xdim, ydim, init, mp, r
 #
 # Every interior pixel predicted by the least-squares fit with the wide clamp
 # (LS wide), with no blocks and no map: per channel only the window radius.
-# The edges are as the block map's, and the deltas are mixed-context coded
+# The edges are as the block map's, and the deltas are context-aware coded
 # with the second opinions (the prediction is the fit's). survey_windows
 # picks each channel's radius by the real coded size.
 
@@ -3195,7 +3195,7 @@ def read_context_deltas(inp, n, previous, xdim):
 
 
 # =============================================================================
-# Mixed context coding (Block format 4; DeltaMapper.packMixedDeltas)
+# Context aware coding (Block format 4; DeltaMapper.packMixedDeltas)
 # =============================================================================
 #
 # The deltas as ranks (as pack_context_deltas), coded with a mixture of
@@ -3510,7 +3510,7 @@ def _mix_setup(previous, xdim, n):
 
 
 def pack_mixed_deltas(delta, values, previous, xdim, opinions=False):
-    """A channel's deltas, mixed-context coded: int min, the rank table (as
+    """A channel's deltas, context-aware coded: int min, the rank table (as
     pack_context_deltas), int coded length, coded bytes. values: the channel
     as the decoder rebuilds it (before any minimum is added back); previous:
     the deltas of the channels coded before it; opinions: with the second

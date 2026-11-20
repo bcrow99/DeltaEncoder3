@@ -8,7 +8,7 @@ SimpleWriter2.java: the channels green, blue-green and red-green
 fit from the rows above (the wide clamp, window radius simple_writer2.RADIUS,
 solved at every simple_writer2.EVERY-th pixel along a row; a row's fits are
 solved at the same time, before the row is decoded), the deltas
-mixed-context coded with the second opinions, in bands of rows decoded at
+context-aware coded with the second opinions, in bands of rows decoded at
 the same time, resized back with resize_mapper.resize2 (centred). The file
 is read in stages: each band's channels start decoding as soon as the start
 of them has been read, and decode their coded bytes as they arrive (a row at

@@ -6,7 +6,7 @@ A writer with one predictor and one entropy coder: every interior pixel is
 predicted by the least-squares fit (at each pixel, the linear predictor that
 best fits a causal window of the pixels before it, clamped to 2 beyond the
 range of its eight neighbours; delta_mapper's _ls_*), with no blocks and no
-map, and the deltas are mixed-context coded with the second opinions
+map, and the deltas are context-aware coded with the second opinions
 (delta_mapper.pack_mixed_deltas). The analysis picks the channel set, then,
 channel by channel, the window radius (4, 8 or 16: delta_mapper.WINDOW_RADII)
 that codes the channel smallest, by the real coded size
@@ -302,7 +302,7 @@ def encode(qc, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, n, 
     Band b is rows band_start(b) to band_start(b + 1) of the quantized image,
     coded as an image of its own (the fit and the contexts start again at
     its top): per channel, int init, then the least-squares deltas
-    mixed-context coded with the second opinions (pack_mixed_deltas).
+    context-aware coded with the second opinions (pack_mixed_deltas).
     Channels 1 and 2 use the ones before them (their values in the fit,
     their deltas as context), so a band's channels are decoded in order,
     each a few rows behind the one before; the bands can be decoded at the
