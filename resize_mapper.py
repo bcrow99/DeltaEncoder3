@@ -321,11 +321,6 @@ def _half(s):
     return np.where(s >= 0, s // 2, -((-s) // 2))
 
 
-def _quarter(s):
-    """s / 4 with Java's truncation toward zero."""
-    return np.where(s >= 0, s // 4, -((-s) // 4))
-
-
 def resize_x2(src, xdim, new_xdim):
     """Changes the width with centred columns (ResizeMapper.resizeX2)."""
     src = np.asarray(src, dtype=np.int64)
@@ -349,10 +344,26 @@ def resize2(src, xdim, new_xdim, new_ydim):
     and rows centred, so mirroring or rotating before shrinking keeps the same
     original pixels and the edges are kept (ResizeMapper.resize2). Both
     directions in one pass, each pixel the average of up to four source
-    pixels with one rounding, so the order of the directions doesn't matter."""
+    pixels with one rounding, so the order of the directions doesn't matter
+    (_resize2_pixels, compiled: one pass over the new pixels)."""
     src = np.asarray(src, dtype=np.int64)
     ydim = src.shape[0] // xdim
     ca, cb = _centred_map(xdim, new_xdim)
     ra, rb = _centred_map(ydim, new_ydim)
-    m = src.reshape(ydim, xdim)
-    return _quarter(m[np.ix_(ra, ca)] + m[np.ix_(ra, cb)] + m[np.ix_(rb, ca)] + m[np.ix_(rb, cb)]).reshape(-1)
+    out = np.empty(new_xdim * new_ydim, dtype=np.int64)
+    _resize2_pixels(src, xdim, new_xdim, new_ydim, ca, cb, ra, rb, out)
+    return out
+
+
+@njit
+def _resize2_pixels(src, xdim, new_xdim, new_ydim, ca, cb, ra, rb, out):
+    """resize2's pixels: new pixel (i, j) is the sum of source pixels (ra[i],
+    ca[j]), (ra[i], cb[j]), (rb[i], ca[j]) and (rb[i], cb[j]), divided by 4
+    with Java's truncation toward zero."""
+    for i in range(new_ydim):
+        ya = ra[i] * xdim
+        yb = rb[i] * xdim
+        o = i * new_xdim
+        for j in range(new_xdim):
+            s = src[ya + ca[j]] + src[ya + cb[j]] + src[yb + ca[j]] + src[yb + cb[j]]
+            out[o + j] = s // 4 if s >= 0 else -((-s) // 4)
