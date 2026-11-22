@@ -2095,7 +2095,7 @@ def get_values_from_least_squares_channels(mixed, xdim, ydim, init, radius, ever
             state = _mix_state(coded, m, len(table), _mix_contexts_count(True))
             ls = _ls_state(xdim, i > 0, radius[i])
             ref = value[i - 1] if i > 0 else np.zeros(1, dtype=np.int64)
-            terms = [np.zeros(n, dtype=np.int64) for _ in range(4)]   # cross, cb, fwd, c9b (zero for the first channel)
+            terms = _mix_terms(n)   # cross, cb, fwd, c9b (zero for the first channel)
             earlier = np.zeros(2, dtype=np.int64)
             for y0 in range(0, ydim, LS_DECODE_ROWS):
                 y1 = min(ydim, y0 + LS_DECODE_ROWS)
@@ -2493,7 +2493,7 @@ def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every):
             col, coef, valid, z, _, _, _, _, _, _, _, points = _rf_state(xdim, has_ref, every)
             ref = value[i - 1] if i > 0 else np.zeros(1, dtype=np.int64)
             dst = value[i]
-            terms = [np.zeros(n, dtype=np.int64) for _ in range(4)]   # cross, cb, fwd, c9b (zero for the first channel)
+            terms = _mix_terms(n)   # cross, cb, fwd, c9b (zero for the first channel)
             earlier = np.zeros(2, dtype=np.int64)
             w = _rf_work(nf)
 
@@ -2584,7 +2584,7 @@ def get_values_from_average_channels(mixed, xdim, ydim, init):
                 arriving.wait_for(6)       # the decoder's first reads: the cache byte and 5 code bytes
             m = 3 if i > 0 else 2
             state = _mix_state(coded, m, len(table), _mix_contexts_count(True))
-            terms = [np.zeros(n, dtype=np.int64) for _ in range(4)]   # cross, cb, fwd, c9b (zero for the first channel)
+            terms = _mix_terms(n)   # cross, cb, fwd, c9b (zero for the first channel)
             earlier = np.zeros(2, dtype=np.int64)
             for y in range(ydim):
                 if i > 0:
@@ -3181,9 +3181,25 @@ def _decode_context_deltas(data, n, value, previous, xdim, act_limit, cross_limi
 
 
 def _previous_2d(previous, n):
+    """The earlier channels' deltas as the rows of one array: a view of the
+    one channel's, or the two copied in by _stack2 (compiled: without the
+    interpreter lock, as the writers' threads code bands at the same time)."""
     if not previous:
         return np.zeros((0, n), dtype=np.int64)
-    return np.stack([np.asarray(p, dtype=np.int64) for p in previous])
+    p = [np.ascontiguousarray(q, dtype=np.int64) for q in previous]
+    if len(p) == 1:
+        return p[0].reshape(1, -1)
+    if len(p) == 2:
+        return _stack2(p[0], p[1])
+    return np.stack(p)
+
+
+@njit
+def _stack2(a, b):
+    out = np.empty((2, a.shape[0]), dtype=np.int64)
+    out[0] = a
+    out[1] = b
+    return out
 
 
 def pack_context_deltas(delta, previous, xdim):
@@ -3273,24 +3289,47 @@ MIX_CROSS_TABLE = _bucket_table(CROSS_LIMIT, 64)
 
 def _rank_symbols(delta):
     """(each delta's rank, most frequent value first, ties: smaller first; the minimum; the rank table)."""
-    delta = np.asarray(delta, dtype=np.int64)
-    lo = int(delta.min())
-    count = np.bincount(delta - lo)
-    order = sorted(range(len(count)), key=lambda v: (-count[v], v))
-    rank = np.zeros(len(count), dtype=np.int64)
-    rank[order] = np.arange(len(count))
-    return rank[delta - lo], lo, rank
+    symbol, lo, rank = _rank_symbols_compiled(np.asarray(delta, dtype=np.int64))
+    return symbol, int(lo), rank
+
+
+@njit
+def _rank_symbols_compiled(delta):
+    """_rank_symbols, compiled: so that it runs without the interpreter lock
+    (the writers code their bands' channels in threads at the same time)
+    and quickly. The ranks: the values in order of their counts, most first,
+    a stable sort keeping equal counts in order of value."""
+    lo = delta.min()
+    count = np.zeros(delta.max() - lo + 1, dtype=np.int64)
+    for k in range(delta.shape[0]):
+        count[delta[k] - lo] += 1
+    order = np.argsort(-count, kind="mergesort")
+    rank = np.zeros(count.shape[0], dtype=np.int64)
+    for r in range(order.shape[0]):
+        rank[order[r]] = r
+    symbol = np.empty(delta.shape[0], dtype=np.int64)
+    for k in range(delta.shape[0]):
+        symbol[k] = rank[delta[k] - lo]
+    return symbol, lo, rank
+
+
+@njit
+def _mix_terms(n):
+    """Arrays for _mix_earlier_rows' terms, per pixel, zeroed: the earlier
+    channels' |deltas| summed, the cross bucket, the forward sum and the 3x3
+    cross bucket. As small as their values allow (the buckets under
+    CROSS_LIMIT's length, the sums of a few |deltas|): a quarter of the
+    memory of 64-bit numbers, which is slow to touch the first time on a big
+    image, and a writer or reader makes them for every band's channels."""
+    return (np.zeros(n, dtype=np.int32), np.zeros(n, dtype=np.uint8),
+            np.zeros(n, dtype=np.int32), np.zeros(n, dtype=np.uint8))
 
 
 @njit
 def _mix_earlier(previous, xdim, ydim, cross_table):
     """From the earlier channels' deltas: the cross bucket, the forward sum
     (E, SW, S, SE) and the 3x3 cross bucket, per pixel."""
-    n = xdim * ydim
-    cross = np.zeros(n, dtype=np.int64)
-    cb = np.zeros(n, dtype=np.int64)
-    fwd = np.zeros(n, dtype=np.int64)
-    c9b = np.zeros(n, dtype=np.int64)
+    cross, cb, fwd, c9b = _mix_terms(xdim * ydim)
     done = np.zeros(2, dtype=np.int64)
     _mix_earlier_rows(previous, xdim, ydim, cross_table, cross, cb, fwd, c9b, done, ydim)
     return cb, fwd, c9b
@@ -3312,13 +3351,25 @@ def _mix_earlier_rows(previous, xdim, ydim, cross_table, cross, cb, fwd, c9b, do
         cross[k] = t
     done[0] = max(done[0], c1)
     top = cross_table.shape[0] - 1
+    # The 3x3 sums (s9) from the columns' sums over the three rows, kept for
+    # the columns either side as the row is gone through: each column summed
+    # once rather than in each of its neighbours' sums (as the Java's
+    # earlierRows).
     for y in range(done[1], y1):
+        ya, yb = max(0, y - 1), min(ydim, y + 2)
+        col_left = 0
+        col_here = 0
+        for yy in range(ya, yb):
+            col_here += cross[yy * xdim]
         for x in range(xdim):
             k = y * xdim + x
-            s9 = 0
-            for yy in range(max(0, y - 1), min(ydim, y + 2)):
-                for xx in range(max(0, x - 1), min(xdim, x + 2)):
-                    s9 += cross[yy * xdim + xx]
+            col_right = 0
+            if x + 1 < xdim:
+                for yy in range(ya, yb):
+                    col_right += cross[yy * xdim + x + 1]
+            s9 = col_left + col_here + col_right
+            col_left = col_here
+            col_here = col_right
             f = 0
             if x + 1 < xdim:
                 f += cross[k + 1]
@@ -3576,8 +3627,8 @@ def _mix_decode_known_pixels(data, value, v, xdim, cb, fwd, c9b, m, act_table, o
 def _mix_setup(previous, xdim, n):
     """(cb, fwd, c9b, number of models) for a channel with the earlier channels' deltas previous."""
     if not previous:
-        z = np.zeros(n, dtype=np.int64)
-        return z, z, z, 2
+        _, cb, fwd, c9b = _mix_terms(n)
+        return cb, fwd, c9b, 2
     prev2d = _previous_2d(previous, n)
     cb, fwd, c9b = _mix_earlier(prev2d, xdim, n // xdim, MIX_CROSS_TABLE)
     return cb, fwd, c9b, 3
