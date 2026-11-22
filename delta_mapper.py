@@ -3248,7 +3248,9 @@ MIX_WMIN = 256
 MIX_RATE = 32
 # The decoder's blocks of symbols (_mix_decode_one), and when it passes over
 # them: the symbols' running average (scaled by 2^MIX_RANK_SHIFT) above
-# MIX_BLOCKS_FIRST (DeltaMapper.MIX_BLOCK, MIX_RANK_SHIFT, MIX_BLOCKS_FIRST).
+# MIX_BLOCKS_FIRST (8 symbols). (The Java and C decoders pass over symbols
+# one at a time without dividing, in a pass of their own; here, in Numba,
+# blocks were faster, and only while the symbols are large.)
 MIX_BLOCK = 8
 MIX_RANK_SHIFT = 5
 MIX_BLOCKS_FIRST = 8 << MIX_RANK_SHIFT
@@ -3500,7 +3502,7 @@ def _mix_decode_one(state, data, k, d, v, value, xdim, cb, fwd, c9b, m, act_tabl
     s = 0
     lo = 0
     # The symbol is the first whose interval's top is above t. While the
-    # symbols have been large (as the Java's MixedModels.decode), whole
+    # symbols have been large, whole
     # blocks of MIX_BLOCK symbols whose tops can't be above t are passed
     # over first: a model's scaled count (cum << MIX_R_BITS) // total is at
     # most w * cum / total in the top, so the top of a block's last symbol is
