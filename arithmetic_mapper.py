@@ -50,24 +50,35 @@ def _enc_init(n):
 
 
 @njit(inline="always")   # called per symbol: a call passing arrays is slow in Numba
-def _put(st, out, b):
-    if st[4] == out.shape[0]:
-        bigger = np.zeros(out.shape[0] * 2, dtype=np.uint8)
-        bigger[:out.shape[0]] = out
-        out = bigger
-    out[st[4]] = b & 0xFF
-    st[4] += 1
-    return out
+def _has_room(st, out):
+    """Whether out has room for what the next _encode_into (or _finish) can
+    put: the cache_size bytes waiting for a carry and a byte for each shift
+    (at most 4 for one symbol, the range staying at least RANGE_BOTTOM /
+    total, and 6 to finish)."""
+    return st[4] + st[3] + 8 <= out.shape[0]
+
+
+@njit
+def _room(st, out):
+    """out, or, if it hasn't room (_has_room), a copy twice as long (or
+    longer) that has."""
+    if _has_room(st, out):
+        return out
+    bigger = np.zeros(max(out.shape[0] * 2, st[4] + st[3] + 8), dtype=np.uint8)
+    bigger[:out.shape[0]] = out
+    return bigger
 
 
 @njit(inline="always")   # called per symbol: a call passing arrays is slow in Numba
 def _shift_low(st, out):
+    """(out must have room: _has_room.)"""
     low = st[0]
     if low < 0xFF00000000 or low >= RANGE_TOP:
         carry = low >> 40
         temp = st[2]
         while True:
-            out = _put(st, out, temp + carry)
+            out[st[4]] = (temp + carry) & 0xFF
+            st[4] += 1
             temp = 0xFF
             st[3] -= 1
             if st[3] == 0:
@@ -75,24 +86,34 @@ def _shift_low(st, out):
         st[2] = (low >> 32) & 0xFF
     st[3] += 1
     st[0] = (low & 0xFFFFFFFF) << 8
-    return out
 
 
 @njit(inline="always")   # called per symbol: a call passing arrays is slow in Numba
-def _encode(st, out, start, count, total):
+def _encode_into(st, out, start, count, total):
+    """Codes the interval start, start + count of total into out, which
+    must have room (_has_room): without making an array, for loops compiled
+    without reference counts (numba_support.njit_no_refs)."""
     r = st[1] // total
     st[0] += start * r
     st[1] = count * r
     while st[1] < RANGE_BOTTOM:
         st[1] <<= 8
-        out = _shift_low(st, out)
+        _shift_low(st, out)
+
+
+@njit(inline="always")   # called per symbol: a call passing arrays is slow in Numba
+def _encode(st, out, start, count, total):
+    """_encode_into, out first made longer if it needs to be; returns out."""
+    out = _room(st, out)
+    _encode_into(st, out, start, count, total)
     return out
 
 
 @njit
 def _finish(st, out):
+    out = _room(st, out)
     for _ in range(6):
-        out = _shift_low(st, out)
+        _shift_low(st, out)
     return out[:st[4]].copy()
 
 

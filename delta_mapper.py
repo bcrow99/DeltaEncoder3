@@ -17,7 +17,7 @@ import threading
 
 import numpy as np
 
-from numba_support import njit, jdiv
+from numba_support import njit, njit_no_refs, jdiv
 import arithmetic_mapper as am
 import string_mapper as sm
 from code_mapper import _shannon_limit
@@ -1256,7 +1256,7 @@ def _ls_state(xdim, has_ref, r):
             np.zeros((nf + 1, nf + 1)), np.zeros(nf + 1), np.zeros(nf + 1), np.zeros(nf + 1))
 
 
-@njit
+@njit_no_refs   # (no arrays made: see numba_support)
 def _ls_start(v, ref, has_ref, xdim, y0, row, col, ring, z, r):
     """Sets the window up as if the rows before y0 had been gone through:
     the columns hold rows y0 - 1 - r .. y0 - 2 (from 1); row y0 - 1 joins
@@ -1415,6 +1415,12 @@ def _ls_next(v, ref, has_ref, xdim, k, row, col, win, ring, z, a, b, coef, dg, f
 def _ls_band(v, ref, has_ref, xdim, y0, y1, out, wide, r, every):
     row, col, win, ring, z, a, b, coef, dg = _ls_state(xdim, has_ref, r)
     _ls_start(v, ref, has_ref, xdim, y0, row, col, ring, z, r)
+    _ls_band_pixels(v, ref, has_ref, xdim, y0, y1, out, wide, r, every, row, col, win, ring, z, a, b, coef, dg)
+
+
+@njit_no_refs   # (no arrays made: see numba_support)
+def _ls_band_pixels(v, ref, has_ref, xdim, y0, y1, out, wide, r, every, row, col, win, ring, z, a, b, coef, dg):
+    """_ls_band's pixels, with the window _ls_band made."""
     for y in range(y0, y1):
         for x in range(1, xdim - 1):
             k = y * xdim + x
@@ -1889,6 +1895,17 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
     bcount = np.zeros((4, 729), dtype=np.int64)
     prim = np.zeros(ALL_PRIMITIVES, dtype=np.int64)
     row, col, win, ring, z, a, b, coef, dg = _ls_state(xdim, has_ref, LS_RADIUS)
+    _from_block_pixels(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, bias_base, use_ls, mixed, data, value,
+                       cb, fwd, c9b, m, act_table, opinions, state, bwd, bht, bw, head, dst, corr, ctx, bsum, bcount, prim,
+                       row, col, win, ring, z, a, b, coef, dg)
+    return dst
+
+
+@njit_no_refs   # (no arrays made: see numba_support)
+def _from_block_pixels(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, bias_base, use_ls, mixed, data, value,
+                       cb, fwd, c9b, m, act_table, opinions, state, bwd, bht, bw, head, dst, corr, ctx, bsum, bcount, prim,
+                       row, col, win, ring, z, a, b, coef, dg):
+    """_from_block's pixels, into dst, with the arrays _from_block made."""
     # One pixel at a time, with one call site of each helper (the per-pixel
     # ones are inlined): the prediction (row 0 horizontal, column 0
     # vertical, the last column horizontal, the interior the block's
@@ -1922,7 +1939,6 @@ def _from_block(delta, ref, has_ref, xdim, ydim, init, mp, ids, first, second, c
             dst[k] = init if k == 0 else delta[k] + p
             if interior:
                 _bias_commit(dst, k, xdim, ctx, bsum, bcount, bias_base)
-    return dst
 
 
 def _from_block_args(xdim, mp, ref, table=None):
@@ -2008,7 +2024,7 @@ def get_least_squares_band_deltas(whole, v, ref, xdim, y0, y1, radius, every=1):
     return np.concatenate([top, np.asarray(whole, dtype=np.int64)[(y0 + k) * xdim:y1 * xdim]])
 
 
-@njit
+@njit_no_refs   # (no arrays made: see numba_support)
 def _least_squares_rows(ref, has_ref, xdim, ydim, init, radius, every, data, value, previous, cross, cb, fwd, c9b, earlier, m,
                         act_table, state, ls, delta, dst, y0, y1):
     """Decodes rows y0..y1-1 of a channel's least-squares deltas (into delta,
@@ -2142,7 +2158,7 @@ def _rf_products(v, ref, has_ref, xdim, nf, y, x, z, out):
             t += 1
 
 
-@njit
+@njit_no_refs   # (no arrays made: see numba_support)
 def _rf_start(v, ref, has_ref, xdim, y0, r, col, z, p):
     """Sets the columns to row y0's window (rows y0 - r .. y0 - 1, from 1)
     (RowFit.start)."""
@@ -2188,7 +2204,7 @@ def _rf_features(v, ref, has_ref, xdim, nf, y, x, z):
     z[nf + 1] = v[k]
 
 
-@njit
+@njit_no_refs   # (no arrays made: see numba_support)
 def _rf_advance(v, ref, has_ref, xdim, y, r, col, c0, c1, za, zd):
     """Columns c0..c1-1 from row y - 1's window to row y's: adds row y - 1,
     drops row y - 1 - r (RowFit.addColumns; y - 1 >= 1): each column gains
@@ -2217,7 +2233,7 @@ def _rf_advance(v, ref, has_ref, xdim, y, r, col, c0, c1, za, zd):
                     t += 1
 
 
-@njit
+@njit_no_refs   # (no arrays made: see numba_support)
 def _rf_solve(col, xdim, r, nf, every, p0, p1, coef, valid, win, a, b, dg):
     """Solves solved pixels p0..p1-1 of a row (column 1 + every * p) from the
     columns (RowFit.solveRow and solve): each one's window sums, slid from
@@ -2338,7 +2354,7 @@ def _rf_work(nf):
             np.zeros((n, n)), np.zeros(n), np.zeros(n), np.zeros(m, dtype=np.int64), np.zeros(m, dtype=np.int64))
 
 
-@njit
+@njit_no_refs   # (no arrays made: see numba_support)
 def _rf_band(v, ref, has_ref, xdim, y0, y1, out, r, every, col, coef, valid, z, p, win, a, b, dg, za, zd, points):
     """The encoder's predictions for rows y0..y1-1, the window started at
     y0 on its own (RowFit.plane's bands)."""
@@ -2392,7 +2408,7 @@ def get_row_fit_band_deltas(whole, v, ref, xdim, y0, y1, radius, every):
     return np.concatenate([top, np.asarray(whole, dtype=np.int64)[(y0 + k) * xdim:y1 * xdim]])
 
 
-@njit
+@njit_no_refs   # (no arrays made: see numba_support)
 def _row_fit_row(ref, has_ref, xdim, ydim, init, every, data, value, previous, cross, cb, fwd, c9b, earlier, m,
                  act_table, state, coef, valid, z, delta, dst, y):
     """Decodes row y of a channel's RowFit deltas (into delta, each just
@@ -2419,7 +2435,7 @@ def _row_fit_row(ref, has_ref, xdim, ydim, init, every, data, value, previous, c
         dst[k] = init if k == 0 else delta[k] + p
 
 
-@njit
+@njit_no_refs   # (no arrays made: see numba_support)
 def _row_fit_row_inline(ref, has_ref, xdim, ydim, init, every, data, value, previous, cross, cb, fwd, c9b, earlier, m,
                         act_table, state, coef, valid, z, delta, dst, y, r, col, points, win, a, b, dg, za, zd):
     """As _row_fit_row, with the row's fits solved first in the same call
@@ -2516,7 +2532,7 @@ def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every):
 
 
 
-@njit
+@njit_no_refs   # (no arrays made: see numba_support)
 def _average_row(xdim, ydim, init, data, value, previous, cross, cb, fwd, c9b, earlier, m, act_table, state, delta, dst, y):
     """Decodes row y of a channel's average deltas (into delta, each just
     before it is used) and rebuilds it (into dst), as _row_fit_row does its
@@ -2602,7 +2618,7 @@ def get_values_from_average_channels(mixed, xdim, ydim, init):
     return list(delta), list(value)
 
 
-@njit
+@njit_no_refs   # (no arrays made: see numba_support)
 def _row_fit_rebuild_row(ref, has_ref, xdim, init, every, coef, valid, z, delta, dst, y, r, col, points, win, a, b, dg, za, zd):
     """Rebuilds row y of a channel from its RowFit deltas, all known (as
     _row_fit_row_inline, without the decoding): the row's fits solved first
@@ -3230,6 +3246,12 @@ MIX_R_BITS = 16
 MIX_W_BITS = 16
 MIX_WMIN = 256
 MIX_RATE = 32
+# The decoder's blocks of symbols (_mix_decode_one), and when it passes over
+# them: the symbols' running average (scaled by 2^MIX_RANK_SHIFT) above
+# MIX_BLOCKS_FIRST (DeltaMapper.MIX_BLOCK, MIX_RANK_SHIFT, MIX_BLOCKS_FIRST).
+MIX_BLOCK = 8
+MIX_RANK_SHIFT = 5
+MIX_BLOCKS_FIRST = 8 << MIX_RANK_SHIFT
 
 
 def _bucket_table(limit, size):
@@ -3418,8 +3440,23 @@ def _mix_encode(symbol, d, v, xdim, n_symbols, cb, fwd, c9b, m, act_table, n_con
     st, out = am._enc_init(n)
     ctx = np.zeros(3, dtype=np.int64)
     q = np.zeros(m, dtype=np.int64)
+    k = 0
+    while k < n:
+        out = am._room(st, out)
+        k = _mix_encode_symbols(symbol, d, v, xdim, n_symbols, cb, fwd, c9b, m, act_table, opinions, f, total, w, ctx, q, st, out, k)
+    return am._finish(st, out)
+
+
+@njit_no_refs   # (no arrays made: see numba_support)
+def _mix_encode_symbols(symbol, d, v, xdim, n_symbols, cb, fwd, c9b, m, act_table, opinions, f, total, w, ctx, q, st, out, k0):
+    """_mix_encode's symbols from k0 on, into out, until out has no more
+    room (am._has_room) or they are all coded; returns the next symbol to
+    code."""
+    n = symbol.shape[0]
     T = (1 << MIX_R_BITS) + n_symbols
-    for k in range(n):
+    for k in range(k0, n):
+        if not am._has_room(st, out):
+            return k
         _mix_contexts(k, d, v, xdim, cb, fwd, c9b, m, act_table, ctx, opinions, v[k] - d[k])
         s = symbol[k]
         a = 0
@@ -3436,23 +3473,24 @@ def _mix_encode(symbol, d, v, xdim, n_symbols, cb, fwd, c9b, m, act_table, n_con
             q[j] = C1 - C0
         lo = (a >> MIX_W_BITS) + s
         hi = (b >> MIX_W_BITS) + s + 1
-        out = am._encode(st, out, lo, hi - lo, T)
+        am._encode_into(st, out, lo, hi - lo, T)
         _mix_update(f, total, w, ctx, m, s, n_symbols, q)
-    return am._finish(st, out)
+    return n
 
 
 @njit
 def _mix_state(data, m, n_symbols, n_contexts):
     f, total, w = _mix_init(m, n_symbols, n_contexts)
     return (am._dec_init(data), f, total, w, np.zeros(3, dtype=np.int64), np.zeros(m, dtype=np.int64),
-            np.zeros(m, dtype=np.int64), np.zeros(m, dtype=np.int64), np.zeros(m, dtype=np.int64))
+            np.zeros(m, dtype=np.int64), np.zeros(m, dtype=np.int64), np.zeros(m, dtype=np.int64),
+            np.zeros(m, dtype=np.float64), np.zeros(m, dtype=np.int64), np.zeros(1, dtype=np.int64))
 
 
 @njit(inline="always")   # a call per pixel passing arrays is slow in Numba
 def _mix_decode_one(state, data, k, d, v, value, xdim, cb, fwd, c9b, m, act_table, opinions, pred):
     """Decodes delta k into d[k] (d and v must be filled below k; pred: the
     block's prediction at k, used with opinions at interior pixels)."""
-    dt, f, total, w, ctx, cum, C0, C1, q = state
+    dt, f, total, w, ctx, cum, C0, C1, q, kf, bs, rank_average = state
     n_symbols = value.shape[0]
     _mix_contexts(k, d, v, xdim, cb, fwd, c9b, m, act_table, ctx, opinions, pred)
     t = am._target(dt, (1 << MIX_R_BITS) + n_symbols)
@@ -3461,12 +3499,39 @@ def _mix_decode_one(state, data, k, d, v, value, xdim, cb, fwd, c9b, m, act_tabl
         C1[j] = 0
     s = 0
     lo = 0
-    # The symbol is the first whose interval's top is above t, found a
-    # symbol at a time. The Java (MixedModels.decode), while the symbols have
-    # been large, first passes over whole blocks of them using block sums;
-    # either way finds the same symbol. Here that was no faster: the search
-    # is a smaller part of the time, and the extra code, even untaken, slowed
-    # Numba's code for the rest.
+    # The symbol is the first whose interval's top is above t. While the
+    # symbols have been large (as the Java's MixedModels.decode), whole
+    # blocks of MIX_BLOCK symbols whose tops can't be above t are passed
+    # over first: a model's scaled count (cum << MIX_R_BITS) // total is at
+    # most w * cum / total in the top, so the top of a block's last symbol is
+    # at most the sum of those, plus its number + 1 (in floating point, with
+    # a margin far larger than its rounding), with no division. Never the
+    # last symbol (it ends the search). Then the scaled counts before the
+    # symbol reached are worked out exactly, and the search goes on a symbol
+    # at a time; either way the same symbol is found.
+    if rank_average[0] > MIX_BLOCKS_FIRST:
+        for j in range(m):
+            kf[j] = w[j] / total[j, ctx[j]]
+        while s + MIX_BLOCK < n_symbols:
+            top = 0.0
+            for j in range(m):
+                c = ctx[j]
+                b = 0
+                for i in range(s, s + MIX_BLOCK):
+                    b += f[j, c, i]
+                bs[j] = b
+                top += (cum[j] + b) * kf[j]
+            if top + (s + MIX_BLOCK) + 1e-6 > t:
+                break
+            for j in range(m):
+                cum[j] += bs[j]
+            s += MIX_BLOCK
+        if s > 0:
+            a = 0
+            for j in range(m):
+                C1[j] = (cum[j] << MIX_R_BITS) // total[j, ctx[j]]
+                a += w[j] * C1[j]
+            lo = (a >> MIX_W_BITS) + s
     while True:
         a = 0
         for j in range(m):
@@ -3484,6 +3549,7 @@ def _mix_decode_one(state, data, k, d, v, value, xdim, cb, fwd, c9b, m, act_tabl
         q[j] = C1[j] - C0[j]
     am._decode(dt, data, lo, hi - lo)
     _mix_update(f, total, w, ctx, m, s, n_symbols, q)
+    rank_average[0] += s - (rank_average[0] >> MIX_RANK_SHIFT)
     d[k] = value[s]
 
 
@@ -3494,9 +3560,15 @@ def _mix_decode_known(data, value, v, xdim, cb, fwd, c9b, m, act_table, n_contex
     n = v.shape[0]
     d = np.zeros(n, dtype=np.int64)
     state = _mix_state(data, m, value.shape[0], n_contexts)
-    for k in range(n):
-        _mix_decode_one(state, data, k, d, v, value, xdim, cb, fwd, c9b, m, act_table, opinions, pred[k] if opinions else 0)
+    _mix_decode_known_pixels(data, value, v, xdim, cb, fwd, c9b, m, act_table, opinions, pred, state, d)
     return d
+
+
+@njit_no_refs   # (no arrays made: see numba_support)
+def _mix_decode_known_pixels(data, value, v, xdim, cb, fwd, c9b, m, act_table, opinions, pred, state, d):
+    """_mix_decode_known's deltas, into d."""
+    for k in range(v.shape[0]):
+        _mix_decode_one(state, data, k, d, v, value, xdim, cb, fwd, c9b, m, act_table, opinions, pred[k] if opinions else 0)
 
 
 def _mix_setup(previous, xdim, n):
