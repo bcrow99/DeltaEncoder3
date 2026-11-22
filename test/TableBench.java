@@ -35,7 +35,9 @@ import java.security.MessageDigest;
  *   e.g. java TableBench GenericWriter GenericReader scrubjay.jpg 0/0,2/2,3/4 1,2,4,8 LS-A,LS-H,Avg-A,Avg-H 2
  * </pre>
  *
- * quants are Color Resolution / Pixel Resolution pairs. Output lines:
+ * quants are Color Resolution / Pixel Resolution pairs; methods are the
+ * deltas (LS or Avg), a dash, and the coding (A context aware, H Huffman,
+ * ZS Deflate (Strings), Z Deflate, N neighbour Huffman). Output lines:
  * <pre>
  * INFO java=... processors=... native=...
  * ROW color/pixel method bands bytes file_md5 image_md5 lossless encode_ms decode_ms
@@ -117,7 +119,7 @@ public class TableBench
 			for(String m : methods)
 			{
 				int delta_type   = m.startsWith("LS") ? (Integer) constant(writer, "DELTA_LS") : (Integer) constant(writer, "DELTA_AVERAGE");
-				int entropy_type = m.endsWith("A") ? (Integer) constant(writer, "ENTROPY_MIXED") : (Integer) constant(writer, "ENTROPY_HUFFMAN");
+				int entropy_type = (Integer) constant(writer, entropyConstant(m.substring(m.indexOf('-') + 1)));
 				int last = -1;
 				for(String b : bands)
 				{
@@ -158,6 +160,26 @@ public class TableBench
 			}
 		}
 		temp.delete();
+	}
+
+	/**
+	 * The writer's constant for a method's coding: A context aware, H
+	 * Huffman, ZS Deflate (Strings), Z Deflate, N neighbour Huffman.
+	 *
+	 * @param coding the coding's letters
+	 * @return the constant's name
+	 */
+	private static String entropyConstant(String coding)
+	{
+		switch(coding)
+		{
+			case "A":  return "ENTROPY_MIXED";
+			case "H":  return "ENTROPY_HUFFMAN";
+			case "ZS": return "ENTROPY_DEFLATE_STRINGS";
+			case "Z":  return "ENTROPY_DEFLATE";
+			case "N":  return "ENTROPY_NEIGHBOUR";
+			default: throw new IllegalArgumentException("unknown coding " + coding + ": use A, H, ZS, Z or N");
+		}
 	}
 
 	/**
