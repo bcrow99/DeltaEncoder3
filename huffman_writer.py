@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-huffman_writer.py version 1.0 -- HuffmanWriter.java for Python (PySide6).
+huffman_writer.py version 1.1 -- HuffmanWriter.java for Python (PySide6).
 
 simple_writer2.py up to the entropy coding: the same channels (green,
 blue-green and red-green, SET_ID), the same least-squares fit from the rows
@@ -14,7 +14,7 @@ Huffman code over the string's bytes, one per channel and band (code_mapper's
 regular Huffman code, delta_writer's entropy type 1). No contexts, so a
 channel's coding uses no other channel. Less compression than Simple 2 (on
 the test photos the files are 9-29% bigger), faster to decode. Saves (to
-the output file given, or "foo", as the Java version does) in Huffman format 'H' version 1,
+the output file given, or "foo", as the Java version does) in Huffman format 'H' version 3,
 read by huffman_reader.py and HuffmanReader.java.
 
     python3 huffman_writer.py [image [output]]
@@ -35,6 +35,7 @@ import numpy as np
 import arithmetic_mapper as am
 import code_mapper as cm
 import delta_mapper as dm
+import neighbour_mapper as nm
 import string_mapper as sm
 import viewer_support as vs
 from java_io import DataInput, DataOutput
@@ -43,7 +44,8 @@ from simple_writer import band_start
 from simple_writer2 import SET_ID, CHANNELS, RADIUS, EVERY, MAX_BANDS, SimpleCoder2  # noqa: F401
 
 FORMAT_ID = ord('H')
-FORMAT_VERSION = 1     # 1: the first
+FORMAT_VERSION = 3          # 3: the code lengths coded compactly, with no Deflate (neighbour_mapper.pack_lengths), so the files don't depend on a zlib
+FORMAT_VERSION_DEFLATE = 1  # 1: the first, the code lengths Deflated (read too). (2 is generic_writer.py's version 1 with the delta type.)
 
 
 def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, n, check=False):
@@ -137,12 +139,14 @@ def huffman_code(delta):
     code) (HuffmanWriter.huffmanCode). Layout: int the deltas' minimum, int
     the unary string's bit length, its rank table (delta_mapper.write_table),
     int the (transformed) string's byte length, int and the Huffman code
-    lengths (code_mapper.pack_regular_tables), int and the code. Delta 0
-    isn't used (the band's first value is written instead)."""
+    lengths (neighbour_mapper.pack_lengths: compactly, with no Deflate; the
+    formats before had them Deflated, code_mapper.pack_regular_tables), int
+    and the code. Delta 0 isn't used (the band's first value is written
+    instead)."""
     lo, bits, table, string = sm.get_string_list(delta, True)
     lengths = cm.get_regular_huffman_length(am.get_frequency(string))
     code = cm.pack_regular_code(string, lengths)
-    tables = cm.pack_regular_tables([lengths], 9)
+    tables = nm.pack_lengths(lengths, cm.REGULAR_MAX_CODE_LENGTH)   # (no Deflate)
     out = DataOutput()
     out.write_int(int(lo))
     out.write_int(int(bits))
@@ -155,12 +159,14 @@ def huffman_code(delta):
 
 class HuffmanChannel:
     """A channel's Huffman coding as huffman_code wrote it, read by
-    huffman_read, its code lengths inflated (HuffmanWriter.HuffmanChannel)."""
+    huffman_read, its code lengths unpacked (HuffmanWriter.HuffmanChannel)."""
     __slots__ = ("min", "bits", "length", "table", "lengths", "code")
 
 
-def huffman_read(inp):
-    """Reads a channel's coding huffman_code wrote (HuffmanWriter.huffmanRead)."""
+def huffman_read(inp, deflated=False):
+    """Reads a channel's coding huffman_code wrote, or (deflated) the one the
+    formats before wrote: the same, the code lengths Deflated
+    (HuffmanWriter.huffmanRead)."""
     h = HuffmanChannel()
     h.min = inp.read_int()
     h.bits = inp.read_int()
@@ -168,7 +174,7 @@ def huffman_read(inp):
     h.length = inp.read_int()
     tables = inp.read_fully(inp.read_int())
     h.code = inp.read_fully(inp.read_int())
-    h.lengths = cm.unpack_regular_tables(tables, 1)[0]
+    h.lengths = cm.unpack_regular_tables(tables, 1)[0] if deflated else nm.unpack_lengths(tables, 256, cm.REGULAR_MAX_CODE_LENGTH)
     return h
 
 

@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-huffman_reader.py version 1.0 -- HuffmanReader.java for Python (PySide6).
+huffman_reader.py version 1.1 -- HuffmanReader.java for Python (PySide6).
 
-Reads Huffman format 'H' version 1 only, from huffman_writer.py or
+Reads Huffman format 'H' versions 3 and 1 (its code lengths Deflated), from huffman_writer.py or
 HuffmanWriter.java: simple_reader2.py with the Huffman decoding in place of
 the context aware decoding. The file is read whole; then each band's
 channels' deltas are decoded (code_mapper's regular Huffman code, then
@@ -57,8 +57,10 @@ class HuffmanDecoder:
         ident, version = inp.read_unsigned_byte(), inp.read_unsigned_byte()
         if ident != FORMAT_ID:
             raise IOError(self.filename + " is not a Huffman file.")
-        if version != FORMAT_VERSION:
-            raise IOError("%s is Huffman format version %d; this reader reads version %d only." % (self.filename, version, FORMAT_VERSION))
+        if version != FORMAT_VERSION and version != hw.FORMAT_VERSION_DEFLATE:
+            raise IOError("%s is Huffman format version %d; this reader reads versions %d and %d only."
+                          % (self.filename, version, FORMAT_VERSION, hw.FORMAT_VERSION_DEFLATE))
+        self.deflated = version == hw.FORMAT_VERSION_DEFLATE
         self.xdim = inp.read_unsigned_short()
         self.ydim = inp.read_unsigned_short()
         self.pixel_shift, self.pixel_quant = inp.read_byte(), inp.read_byte()
@@ -94,7 +96,7 @@ class HuffmanDecoder:
                 # Each channel: init, then huffman_code's bytes.
                 for i in range(3):
                     init[b][i] = bi.read_int()
-                    coded[b][i] = hw.huffman_read(bi)
+                    coded[b][i] = hw.huffman_read(bi, self.deflated)
                 if bi.f.tell() != len(band):
                     raise IOError("%s: band %d is not the length its header says." % (self.filename, b))
         self.read_time = time.perf_counter() - start

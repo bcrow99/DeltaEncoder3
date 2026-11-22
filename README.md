@@ -19,9 +19,9 @@ python3 simple_writer.py [image]     # Simple format 'S' version 8
 python3 simple_reader.py foo
 python3 simple_writer2.py [image]    # Simple 2 format 'F' version 2
 python3 simple_reader2.py foo
-python3 huffman_writer.py [image]    # Huffman format 'H' version 1
+python3 huffman_writer.py [image]    # Huffman format 'H' version 3 (the reader reads 1 too)
 python3 huffman_reader.py foo
-python3 generic_writer.py [image]    # Simple 2 'F' versions 2 and 3, Huffman 'H' versions 1 and 2, Neighbour Huffman 'N' version 1
+python3 generic_writer.py [image]    # Simple 2 'F' versions 2 and 3, Huffman 'H' versions 3 and 4 (the reader reads 1 and 2 too), Neighbour Huffman 'N' version 1
 python3 generic_reader.py foo
 python3 block_writer.py [image]      # Block format 'B'
 python3 block_reader.py foo

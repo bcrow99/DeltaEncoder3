@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-generic_reader.py version 1.1 -- GenericReader.java for Python (PySide6).
+generic_reader.py version 1.2 -- GenericReader.java for Python (PySide6).
 
 Reads generic_writer.py's files (and GenericWriter.java's and NativeEncoder's
 NativeWriter's, the same files, and simple_writer2.py's and huffman_writer.py's:
-Simple 2 format 2 and Huffman format 1): the channels green, blue-green and
+Simple 2 format 2 and Huffman formats 3 and 1): the channels green, blue-green and
 red-green (generic_writer.SET_ID), in bands of rows decoded at the same time
 (with LS deltas, viewer_support.ls_bands_at_once at a time), resized back with
 resize_mapper.resize2 (centred). The file's first byte says how its deltas
@@ -115,6 +115,11 @@ class GenericDecoder:
             self.entropy_type, ls_version, type_version, fmt = gw.ENTROPY_MIXED, gw.SIMPLE_VERSION, gw.SIMPLE_VERSION_DELTA_TYPE, "Simple 2"
         elif ident == gw.HUFFMAN_ID:
             self.entropy_type, ls_version, type_version, fmt = gw.ENTROPY_HUFFMAN, gw.HUFFMAN_VERSION, gw.HUFFMAN_VERSION_DELTA_TYPE, "Huffman"
+            # The versions before, with the code lengths Deflated, are read
+            # too: as the ones they came before.
+            self.huffman_deflated = version in (gw.HUFFMAN_VERSION_DEFLATE, gw.HUFFMAN_VERSION_DEFLATE_DELTA_TYPE)
+            if self.huffman_deflated:
+                version += gw.HUFFMAN_VERSION - gw.HUFFMAN_VERSION_DEFLATE
         elif ident in gw.FORMAT_IDS[2:]:
             # Neighbour Huffman: one version, the delta type always there.
             self.entropy_type = gw.FORMAT_IDS.index(ident)
@@ -268,7 +273,7 @@ class GenericDecoder:
                 # Each channel: init, then huffman_code's or neighbour_code's bytes.
                 for i in range(3):
                     init[b][i] = bi.read_int()
-                    coded[b][i] = hw.huffman_read(bi) if self.entropy_type == gw.ENTROPY_HUFFMAN else nm.neighbour_read(bi)
+                    coded[b][i] = hw.huffman_read(bi, self.huffman_deflated) if self.entropy_type == gw.ENTROPY_HUFFMAN else nm.neighbour_read(bi)
                 if bi.f.tell() != len(band):
                     raise IOError("%s: band %d is not the length its header says." % (self.filename, b))
         self.read_time = time.perf_counter() - read

@@ -225,11 +225,18 @@ def _canonical_codes(length, size):
 
 
 @njit
-def _length_symbols(all_lengths):
-    """NeighbourMapper.writeLengths, as (value, bits) pairs to write: the
-    code lengths' own code's lengths (4 bits each), then the tables' lengths
-    as that code's symbols (a length, the last length again 3 to 6 times, or
-    a run of zeros), each followed by its extra bits."""
+def _length_symbols(all_lengths, max_length):
+    """NeighbourMapper.writeLengthSymbols, as (value, bits) pairs to write:
+    the code lengths' own code's lengths (4 bits each), then the lengths (0
+    to max_length) as that code's symbols (a length, the last length again 3
+    to 6 times, or a run of zeros), each followed by its extra bits. With
+    max_length MAX_CODE_LENGTH, the neighbour Huffman tables'; with
+    code_mapper.REGULAR_MAX_CODE_LENGTH, the Huffman coding's code lengths
+    (pack_lengths)."""
+    repeat = max_length + 1
+    zeros = repeat + 1
+    many_zeros = zeros + 1
+    symbols = many_zeros + 1
     total = len(all_lengths)
     symbol = np.empty(total + 1, dtype=np.int64)
     extra = np.empty(total + 1, dtype=np.int64)
@@ -244,12 +251,12 @@ def _length_symbols(all_lengths):
         if v == 0:
             while run >= 11:
                 r = min(run, 138)
-                symbol[m] = LENGTH_MANY_ZEROS
+                symbol[m] = many_zeros
                 extra[m] = r - 11
                 m += 1
                 run -= r
             if run >= 3:
-                symbol[m] = LENGTH_ZEROS
+                symbol[m] = zeros
                 extra[m] = run - 3
                 m += 1
                 run = 0
@@ -263,7 +270,7 @@ def _length_symbols(all_lengths):
             run -= 1
             while run >= 3:
                 r = min(run, 6)
-                symbol[m] = LENGTH_REPEAT
+                symbol[m] = repeat
                 extra[m] = r - 3
                 m += 1
                 run -= r
@@ -271,15 +278,15 @@ def _length_symbols(all_lengths):
                 symbol[m] = v
                 m += 1
                 run -= 1
-    frequency = np.zeros(LENGTH_SYMBOLS, dtype=np.int64)
+    frequency = np.zeros(symbols, dtype=np.int64)
     for j in range(m):
         frequency[symbol[j]] += 1
-    length = _code_lengths(frequency, LENGTH_SYMBOLS, MAX_LENGTH_CODE_LENGTH)
-    code = _canonical_codes(length, LENGTH_SYMBOLS)
-    vals = np.empty(LENGTH_SYMBOLS + 2 * m, dtype=np.int64)
-    bits = np.empty(LENGTH_SYMBOLS + 2 * m, dtype=np.int64)
+    length = _code_lengths(frequency, symbols, MAX_LENGTH_CODE_LENGTH)
+    code = _canonical_codes(length, symbols)
+    vals = np.empty(symbols + 2 * m, dtype=np.int64)
+    bits = np.empty(symbols + 2 * m, dtype=np.int64)
     p = 0
-    for s in range(LENGTH_SYMBOLS):
+    for s in range(symbols):
         vals[p] = length[s]
         bits[p] = 4
         p += 1
@@ -288,15 +295,15 @@ def _length_symbols(all_lengths):
         vals[p] = code[s]
         bits[p] = length[s]
         p += 1
-        if s == LENGTH_REPEAT:
+        if s == repeat:
             vals[p] = extra[j]
             bits[p] = 2
             p += 1
-        elif s == LENGTH_ZEROS:
+        elif s == zeros:
             vals[p] = extra[j]
             bits[p] = 3
             p += 1
-        elif s == LENGTH_MANY_ZEROS:
+        elif s == many_zeros:
             vals[p] = extra[j]
             bits[p] = 7
             p += 1
@@ -427,7 +434,7 @@ def _code(delta, xdim):
         code[t, :size] = ct
         all_lengths[at:at + size] = lt
         at += size
-    pre_vals, pre_bits = _length_symbols(all_lengths)
+    pre_vals, pre_bits = _length_symbols(all_lengths, MAX_CODE_LENGTH)
 
     # The bits counted, then written.
     nbits = 0
@@ -593,6 +600,53 @@ def _read_symbol(buf, st, t, longest, first, count, start, sorted_, lookup):
 
 
 @njit
+def _read_lengths(buf, st, total, max_length, L, longest, first, count, start, sorted_, lookup):
+    """NeighbourMapper.readLengthSymbols: total code lengths (0 to
+    max_length) written by _length_symbols, the code lengths' own code made
+    as table L of the tables' arrays. Returns (False if they aren't what
+    _length_symbols writes, the lengths)."""
+    repeat = max_length + 1
+    zeros = repeat + 1
+    symbols = zeros + 2
+    all_lengths = np.zeros(total, dtype=np.int64)
+    cl = np.empty(symbols, dtype=np.int64)
+    for s in range(symbols):
+        cl[s] = _read_bits(buf, st, 4)
+    if not _make_table(cl, symbols, L, longest, first, count, start, sorted_, lookup):
+        return False, all_lengths
+    i = 0
+    last = -1
+    while i < total:
+        s = _read_symbol(buf, st, L, longest, first, count, start, sorted_, lookup)
+        if s < 0:
+            return False, all_lengths
+        if s <= max_length:
+            all_lengths[i] = s
+            i += 1
+            last = s
+            continue
+        if s == repeat:
+            if last < 0:
+                return False, all_lengths
+            run = 3 + _read_bits(buf, st, 2)
+            v = last
+        elif s == zeros:
+            run = 3 + _read_bits(buf, st, 3)
+            v = 0
+            last = 0
+        else:
+            run = 11 + _read_bits(buf, st, 7)
+            v = 0
+            last = 0
+        if i + run > total or 8 * st[3] > st[1]:
+            return False, all_lengths
+        for j in range(run):
+            all_lengths[i + j] = v
+        i += run
+    return True, all_lengths
+
+
+@njit
 def _decode(buf, lo, values, xdim, ydim):
     """neighbour_decode's work: (0 and the deltas, or a code saying what's
     wrong and None-like zeros)."""
@@ -607,46 +661,13 @@ def _decode(buf, lo, values, xdim, ydim):
     sorted_ = np.zeros((TABLES + 1, width), dtype=np.int64)
     lookup = np.zeros((TABLES + 1, 1 << LOOKUP_BITS), dtype=np.int64)
 
-    # The code lengths' own code (table TABLES), then the tables' lengths.
-    cl = np.empty(LENGTH_SYMBOLS, dtype=np.int64)
-    for s in range(LENGTH_SYMBOLS):
-        cl[s] = _read_bits(buf, st, 4)
-    L = TABLES
-    if not _make_table(cl, LENGTH_SYMBOLS, L, longest, first, count, start, sorted_, lookup):
-        return 1, delta
+    # The tables' lengths (with the code lengths' own code as table TABLES).
     total = 0
     for t in range(TABLES):
         total += _table_size(t, values)
-    all_lengths = np.zeros(total, dtype=np.int64)
-    i = 0
-    last = -1
-    while i < total:
-        s = _read_symbol(buf, st, L, longest, first, count, start, sorted_, lookup)
-        if s < 0:
-            return 1, delta
-        if s <= MAX_CODE_LENGTH:
-            all_lengths[i] = s
-            i += 1
-            last = s
-            continue
-        if s == LENGTH_REPEAT:
-            if last < 0:
-                return 1, delta
-            run = 3 + _read_bits(buf, st, 2)
-            v = last
-        elif s == LENGTH_ZEROS:
-            run = 3 + _read_bits(buf, st, 3)
-            v = 0
-            last = 0
-        else:
-            run = 11 + _read_bits(buf, st, 7)
-            v = 0
-            last = 0
-        if i + run > total or 8 * st[3] > st[1]:
-            return 1, delta
-        for j in range(run):
-            all_lengths[i + j] = v
-        i += run
+    ok, all_lengths = _read_lengths(buf, st, total, MAX_CODE_LENGTH, TABLES, longest, first, count, start, sorted_, lookup)
+    if not ok:
+        return 1, delta
     at = 0
     for t in range(TABLES):
         size = _table_size(t, values)
@@ -788,3 +809,67 @@ def neighbour_decode(h, xdim, ydim):
     if status != 0:
         raise IOError("bad neighbour Huffman coding: " + _DECODE_ERRORS[status])
     return delta
+
+
+# ---- A code length table on its own (the Huffman coding's) -----------------
+
+@njit
+def _pack_bits(vals, nbits):
+    """The (value, bits) pairs written most significant first, the last byte
+    filled out with 0 bits."""
+    total = 0
+    for j in range(len(nbits)):
+        total += nbits[j]
+    out = np.zeros((total + 7) // 8, dtype=np.uint8)
+    size = 0
+    bits = 0
+    count = 0
+    for j in range(len(nbits)):
+        bits = (bits << nbits[j]) | (vals[j] & ((1 << nbits[j]) - 1))
+        count += nbits[j]
+        while count >= 8:
+            count -= 8
+            out[size] = (bits >> count) & 0xff
+            size += 1
+        bits &= (1 << count) - 1
+    if count > 0:
+        out[size] = (bits << (8 - count)) & 0xff
+    return out
+
+
+@njit
+def _unpack_lengths(buf, size, max_length):
+    """_read_lengths for one table on its own: (0, the lengths), or a code
+    saying what's wrong."""
+    st = np.zeros(4, dtype=np.int64)
+    symbols = max_length + 4
+    longest = np.zeros(1, dtype=np.int64)
+    first = np.zeros((1, MAX_CODE_LENGTH + 2), dtype=np.int64)
+    count = np.zeros((1, MAX_CODE_LENGTH + 2), dtype=np.int64)
+    start = np.zeros((1, MAX_CODE_LENGTH + 2), dtype=np.int64)
+    sorted_ = np.zeros((1, symbols), dtype=np.int64)
+    lookup = np.zeros((1, 1 << LOOKUP_BITS), dtype=np.int64)
+    ok, lengths = _read_lengths(buf, st, size, max_length, 0, longest, first, count, start, sorted_, lookup)
+    if not ok:
+        return 1, lengths
+    if 8 * st[3] > st[1]:
+        return 4, lengths
+    return 0, lengths
+
+
+def pack_lengths(lengths, max_length):
+    """A code length table written compactly, on its own
+    (NeighbourMapper.packLengths: no Deflate, so it doesn't depend on a
+    zlib): the Huffman coding's code lengths (huffman_writer.huffman_code)."""
+    vals, nbits = _length_symbols(np.ascontiguousarray(lengths, dtype=np.int64), int(max_length))
+    return _pack_bits(vals, nbits).tobytes()
+
+
+def unpack_lengths(packed, size, max_length):
+    """Reads a code length table pack_lengths wrote
+    (NeighbourMapper.unpackLengths): size lengths, as uint8. Raises IOError
+    if they aren't what pack_lengths writes."""
+    status, lengths = _unpack_lengths(np.frombuffer(packed, dtype=np.uint8), int(size), int(max_length))
+    if status != 0:
+        raise IOError("bad code lengths" + (": they end too soon" if status == 4 else ""))
+    return lengths.astype(np.uint8)

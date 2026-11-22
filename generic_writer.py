@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-generic_writer.py version 1.1 -- GenericWriter.java for Python (PySide6).
+generic_writer.py version 1.2 -- GenericWriter.java for Python (PySide6).
 
 simple_writer2.py and huffman_writer.py in one, with a choice of deltas: the
 same image, the same Apply and the same channels (green, blue-green and
@@ -26,8 +26,9 @@ The Entropy menu chooses the coding:
        the Pixel Resolution). The default.
   Huffman: each channel's deltas as huffman_writer.py codes them
        (huffman_writer.huffman_code); no contexts, so a channel's coding uses
-       no other channel. Huffman format 'H': version 1 with LS, the same files
-       as huffman_writer.py; 2 with Avg. Bigger files, faster to decode.
+       no other channel. Huffman format 'H': version 3 with LS, the same files
+       as huffman_writer.py; 4 with Avg (1 and 2 had the code lengths
+       Deflated: read, not written). Bigger files, faster to decode.
   Neighbour Huffman: each channel's deltas Huffman coded with tables chosen
        from the neighbours, a run mode and pairs in the quiet parts
        (neighbour_mapper.neighbour_code); no contexts across channels.
@@ -66,8 +67,9 @@ SIMPLE_ID = ord('F')
 SIMPLE_VERSION = 2              # the Simple 2 format with the LS deltas: simple_writer2.py's
 SIMPLE_VERSION_DELTA_TYPE = 3   # version 2 with a byte, the delta type, after the Pixel Resolution: written for the average deltas
 HUFFMAN_ID = ord('H')
-HUFFMAN_VERSION = 1             # the Huffman format with the LS deltas: huffman_writer.py's
-HUFFMAN_VERSION_DELTA_TYPE = 2  # version 1 with the delta type, as above
+HUFFMAN_VERSION = 3             # the Huffman format with the LS deltas: huffman_writer.py's (the code lengths coded compactly, no Deflate)
+HUFFMAN_VERSION_DELTA_TYPE = 4  # version 3 with the delta type, as above
+HUFFMAN_VERSION_DEFLATE, HUFFMAN_VERSION_DEFLATE_DELTA_TYPE = 1, 2   # the versions before, the code lengths Deflated: read, not written
 ENTROPY_MIXED, ENTROPY_HUFFMAN, ENTROPY_NEIGHBOUR = 0, 1, 2
 ENTROPY_NAMES = ("Context aware", "Huffman", "Neighbour Huffman")
 FORMAT_IDS = (0, 0, ord('N'))   # the formats after Huffman, by entropy type: Neighbour Huffman's (HuffmanWriter2.java's)
