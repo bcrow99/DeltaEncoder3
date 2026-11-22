@@ -58,8 +58,9 @@ CHUNK = 1 << 16   # how many coded bytes are read at a time, saying each time th
 # each), and fresh memory is slow to touch for the first time, more so on
 # Windows; so the decoding writes into memory it already has where it can:
 # the average deltas' values straight into the channel (_average_into), and,
-# without resizing, the minimums, blue, green and red and the packing in one
-# pass into the image (_pack_set7), not an array for each.
+# the minimums, blue, green and red, the resizing (if any) and the packing in
+# one pass into the image (_pack_set7, or _resize_set7), not an array for
+# each.
 
 @njit
 def _average_into(delta, xdim, ydim, init, dst):
@@ -88,6 +89,32 @@ def _pack_set7(c0, c1, c2, add1, add2, amount, out, k0, k1):
             v = g + c1[k] + add1 if c == 0 else (g if c == 1 else g + c2[k] + add2)
             v = v >> -amount if amount < 0 else v << amount
             out[k, c] = 0 if v < 0 else (255 if v > 255 else v)
+
+
+@njit
+def _resize_set7(c0, c1, c2, add1, add2, amount, w, xdim, ca, cb, ra, rb, out, i0, i1):
+    """Rows i0 to i1 of the image from channel set 7 (as _pack_set7) w wide,
+    resized to xdim wide: the same as get_blue_green_red, resize_mapper.resize2
+    (ca, cb, ra and rb its centred maps: each new pixel the average of four
+    source pixels, truncated toward zero) and pack_image, in one pass."""
+    for i in range(i0, i1):
+        ya = ra[i] * w
+        yb = rb[i] * w
+        o = i * xdim
+        for j in range(xdim):
+            k0 = ya + ca[j]
+            k1 = ya + cb[j]
+            k2 = yb + ca[j]
+            k3 = yb + cb[j]
+            g = c0[k0] + c0[k1] + c0[k2] + c0[k3]
+            sums = (g + c1[k0] + c1[k1] + c1[k2] + c1[k3] + 4 * add1,
+                    g,
+                    g + c2[k0] + c2[k1] + c2[k2] + c2[k3] + 4 * add2)
+            for c in range(3):
+                s = sums[c]
+                v = s // 4 if s >= 0 else -((-s) // 4)
+                v = v >> -amount if amount < 0 else v << amount
+                out[o + j, c] = 0 if v < 0 else (255 if v > 255 else v)
 
 
 class GenericDecoder:
@@ -164,14 +191,21 @@ class GenericDecoder:
             self._decode_mixed(w, h, raw)
         else:
             self._decode_huffman(w, h, raw)
-        if self.pixel_quant == 0 and gw.SET_ID == 7:
-            # No resizing: the minimums, blue, green and red, and the packing
-            # in one pass, in pieces at the same time.
+        if gw.SET_ID == 7:
+            # The minimums, blue, green and red, the resizing (if any) and
+            # the packing in one pass, in pieces at the same time.
             add = [self.min[i] if gw.CHANNELS[i] > 2 else 0 for i in range(3)]
-            out = np.empty((w * h, 3), dtype=np.uint8)
+            out = np.empty((self.xdim * self.ydim, 3), dtype=np.uint8)
             pieces = 16
-            def pack(p):
-                _pack_set7(raw[0], raw[1], raw[2], add[1], add[2], self.pixel_shift, out, p * len(out) // pieces, (p + 1) * len(out) // pieces)
+            if self.pixel_quant == 0:
+                def pack(p):
+                    _pack_set7(raw[0], raw[1], raw[2], add[1], add[2], self.pixel_shift, out, p * len(out) // pieces, (p + 1) * len(out) // pieces)
+            else:
+                ca, cb = rm._centred_map(w, self.xdim)
+                ra, rb = rm._centred_map(h, self.ydim)
+                def pack(p):
+                    _resize_set7(raw[0], raw[1], raw[2], add[1], add[2], self.pixel_shift, w, self.xdim, ca, cb, ra, rb, out,
+                                 p * self.ydim // pieces, (p + 1) * self.ydim // pieces)
             vs.parallel(pieces, pack)
             rgb = out.reshape(self.ydim, self.xdim, 3)
         else:
