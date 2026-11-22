@@ -192,7 +192,6 @@ python test/coding_table.py scrubjay.jpg    # NativeWriter's codings compared
 `results_table.py` times NativeWriter/NativeReader, GenericWriter/GenericReader
 and generic_writer.py/generic_reader.py at each quantization, coding and number
 of bands, and checks that all three write the same files. `coding_table.py`
-compares NativeWriter's codings (Context aware, Huffman, Deflate (Strings),
-Deflate and Neighbour Huffman) at each quantization, delta type and number of
-bands. Each saves its table as a .txt and a .csv in the current folder; the
+compares NativeWriter's codings (Context aware, Huffman and Neighbour Huffman)
+at each quantization, delta type and number of bands. Each saves its table as a .txt and a .csv in the current folder; the
 top of each script lists its options.
