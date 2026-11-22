@@ -37,7 +37,7 @@ import java.security.MessageDigest;
  *
  * quants are Color Resolution / Pixel Resolution pairs; methods are the
  * deltas (LS or Avg), a dash, and the coding (A context aware, H Huffman,
- * ZS Deflate (Strings), Z Deflate, N neighbour Huffman). Output lines:
+ * N neighbour Huffman). Output lines:
  * <pre>
  * INFO java=... processors=... native=...
  * ROW color/pixel method bands bytes file_md5 image_md5 lossless encode_ms decode_ms
@@ -164,7 +164,7 @@ public class TableBench
 
 	/**
 	 * The writer's constant for a method's coding: A context aware, H
-	 * Huffman, ZS Deflate (Strings), Z Deflate, N neighbour Huffman.
+	 * Huffman, N neighbour Huffman.
 	 *
 	 * @param coding the coding's letters
 	 * @return the constant's name
@@ -175,10 +175,8 @@ public class TableBench
 		{
 			case "A":  return "ENTROPY_MIXED";
 			case "H":  return "ENTROPY_HUFFMAN";
-			case "ZS": return "ENTROPY_DEFLATE_STRINGS";
-			case "Z":  return "ENTROPY_DEFLATE";
 			case "N":  return "ENTROPY_NEIGHBOUR";
-			default: throw new IllegalArgumentException("unknown coding " + coding + ": use A, H, ZS, Z or N");
+			default: throw new IllegalArgumentException("unknown coding " + coding + ": use A, H or N");
 		}
 	}
 
