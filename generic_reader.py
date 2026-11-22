@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-generic_reader.py version 1.0 -- GenericReader.java for Python (PySide6).
+generic_reader.py version 1.1 -- GenericReader.java for Python (PySide6).
 
 Reads generic_writer.py's files (and GenericWriter.java's and NativeEncoder's
 NativeWriter's, the same files, and simple_writer2.py's and huffman_writer.py's:
@@ -18,6 +18,8 @@ were coded:
 
   Huffman ('H'): the file is read, then every band's channels' deltas are
   decoded (huffman_writer.huffman_decode) and the channels rebuilt from them.
+
+  Neighbour Huffman ('N'): as Huffman, with neighbour_mapper.neighbour_decode.
 
 The deltas: LS, every interior pixel predicted by the least-squares fit from
 the rows above (window radius generic_writer.RADIUS, solved at every
@@ -42,6 +44,7 @@ import numpy as np
 import delta_mapper as dm
 import generic_writer as gw
 import huffman_writer as hw
+import neighbour_mapper as nm
 import resize_mapper as rm
 import simple_writer as sw
 import viewer_support as vs
@@ -51,8 +54,8 @@ CHUNK = 1 << 16   # how many coded bytes are read at a time, saying each time th
 
 
 class GenericDecoder:
-    """Reads a Simple 2 or Huffman file's header; decode() reads the rest and
-    decodes it (GenericReader.decodeFile)."""
+    """Reads a Simple 2, Huffman or Neighbour Huffman file's header; decode()
+    reads the rest and decodes it (GenericReader.decodeFile)."""
 
     def __init__(self, filename):
         self.filename = filename
@@ -75,9 +78,15 @@ class GenericDecoder:
             self.entropy_type, ls_version, type_version, fmt = gw.ENTROPY_MIXED, gw.SIMPLE_VERSION, gw.SIMPLE_VERSION_DELTA_TYPE, "Simple 2"
         elif ident == gw.HUFFMAN_ID:
             self.entropy_type, ls_version, type_version, fmt = gw.ENTROPY_HUFFMAN, gw.HUFFMAN_VERSION, gw.HUFFMAN_VERSION_DELTA_TYPE, "Huffman"
+        elif ident in gw.FORMAT_IDS[2:]:
+            # Neighbour Huffman: one version, the delta type always there.
+            self.entropy_type = gw.FORMAT_IDS.index(ident)
+            ls_version, type_version, fmt = -1, gw.FORMAT_VERSION, gw.ENTROPY_NAMES[self.entropy_type]
         else:
-            raise IOError(self.filename + " is neither a Simple 2 nor a Huffman file.")
+            raise IOError(self.filename + " is not a file generic_writer.py writes.")
         if version != ls_version and version != type_version:
+            if ls_version < 0:
+                raise IOError("%s is %s format version %d; this reader reads version %d only." % (self.filename, fmt, version, type_version))
             raise IOError("%s is %s format version %d; this reader reads versions %d and %d only." % (self.filename, fmt, version, ls_version, type_version))
         self.xdim = inp.read_unsigned_short()
         self.ydim = inp.read_unsigned_short()
@@ -102,8 +111,8 @@ class GenericDecoder:
 
     def decode(self):
         """The image as an (ydim, xdim, 3) uint8 array, R, G, B
-        (GenericReader.decodeFile): the channels decoded (_decode_mixed or
-        _decode_huffman, by the format), then blue, green and red rebuilt,
+        (GenericReader.decodeFile): the channels decoded (_decode_mixed, or
+        _decode_huffman for Huffman and Neighbour Huffman, by the format), then blue, green and red rebuilt,
         resized and shifted. Its time (seconds) is left in took, and the
         reading's in read_time."""
         start = time.perf_counter()
@@ -192,7 +201,8 @@ class GenericDecoder:
             raise failed[0]
 
     def _decode_huffman(self, w, h, raw):
-        """A Huffman file (GenericReader.decodeHuffman): read whole, then
+        """A Huffman or Neighbour Huffman file (GenericReader.decodeHuffman
+        and decodeAlone): read whole, then
         every band's channels' deltas decoded at the same time, then the
         channels rebuilt: with the average deltas each on its own, all at
         once; with LS, viewer_support.ls_bands_at_once bands at a time."""
@@ -207,10 +217,10 @@ class GenericDecoder:
             for b in range(n):
                 band = inp.read_fully(self.length[b])
                 bi = DataInput(band)
-                # Each channel: init, then huffman_code's bytes.
+                # Each channel: init, then huffman_code's or neighbour_code's bytes.
                 for i in range(3):
                     init[b][i] = bi.read_int()
-                    coded[b][i] = hw.huffman_read(bi)
+                    coded[b][i] = hw.huffman_read(bi) if self.entropy_type == gw.ENTROPY_HUFFMAN else nm.neighbour_read(bi)
                 if bi.f.tell() != len(band):
                     raise IOError("%s: band %d is not the length its header says." % (self.filename, b))
         self.read_time = time.perf_counter() - read
@@ -220,7 +230,10 @@ class GenericDecoder:
         def decode_one(j):
             b, i = j // 3, j % 3
             y0, y1 = sw.band_start(b, n, h), sw.band_start(b + 1, n, h)
-            delta[b][i] = hw.huffman_decode(coded[b][i], w * (y1 - y0))
+            if self.entropy_type == gw.ENTROPY_HUFFMAN:
+                delta[b][i] = hw.huffman_decode(coded[b][i], w * (y1 - y0))
+            else:
+                delta[b][i] = nm.neighbour_decode(coded[b][i], w, y1 - y0)
             if self.delta_type == gw.DELTA_AVERAGE:
                 raw[i][y0 * w:y1 * w] = dm.get_values_from_deltas(delta[b][i], w, y1 - y0, init[b][i], 2)
         vs.parallel(3 * n, decode_one)

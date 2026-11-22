@@ -21,7 +21,7 @@ python3 simple_writer2.py [image]    # Simple 2 format 'F' version 2
 python3 simple_reader2.py foo
 python3 huffman_writer.py [image]    # Huffman format 'H' version 1
 python3 huffman_reader.py foo
-python3 generic_writer.py [image]    # Simple 2 'F' versions 2 and 3, Huffman 'H' versions 1 and 2
+python3 generic_writer.py [image]    # Simple 2 'F' versions 2 and 3, Huffman 'H' versions 1 and 2, Neighbour Huffman 'N' version 1
 python3 generic_reader.py foo
 python3 block_writer.py [image]      # Block format 'B'
 python3 block_reader.py foo
@@ -43,7 +43,10 @@ alone): simple_writer2.py's and huffman_writer.py's codings in one program (the
 **Entropy** menu), each with the least-squares deltas or the average filter
 (the **Delta** menu), in up to 64 bands. Their files are the Java programs',
 byte for byte; with the least-squares deltas those are simple_writer2.py's and
-huffman_writer.py's, so generic_reader.py opens those too.
+huffman_writer.py's, so generic_reader.py opens those too. The Entropy menu
+also has Neighbour Huffman (neighbour_mapper.py): the deltas Huffman coded
+with tables chosen by each delta's neighbours, a run mode and pairs in the
+quiet parts, the same files as HuffmanWriter2.java.
 
 The Pixel format's ID byte is 'X'; it was 'P' until that turned out to be the
 Packet format's too, so pixel_reader.py explains a 'P' file instead of
@@ -77,8 +80,8 @@ after that it loads from the cache in `__pycache__`.
 | `simple_reader2.py` | SimpleReader2 | `SimpleDecoder2` |
 | `huffman_writer.py` | HuffmanWriter | `HuffmanCoder`: Simple 2 up to the entropy coding, then StringMapper's unary strings and CodeMapper's regular Huffman code per channel; less compression, faster decoding |
 | `huffman_reader.py` | HuffmanReader | `HuffmanDecoder` |
-| `generic_writer.py` | GenericWriter | `GenericCoder`: Simple 2's channels, LS or average deltas, context aware or Huffman coded (NativeWriter's files) |
-| `generic_reader.py` | GenericReader | `GenericDecoder`: reads all four (and Simple 2 and Huffman files) |
+| `generic_writer.py` | GenericWriter | `GenericCoder`: Simple 2's channels, LS or average deltas, context aware, Huffman or neighbour Huffman coded (NativeWriter's files) |
+| `generic_reader.py` | GenericReader | `GenericDecoder`: reads all six (and Simple 2 and Huffman files) |
 | `block_writer.py` | BlockWriter | `BlockCoder`: block map with context-aware-coded deltas; each channel's block size and predictors chosen by the survey |
 | `block_reader.py` | BlockReader | `BlockDecoder` |
 | `packet_writer.py` | PacketWriter | `PacketCoder`: unary strings split into separately compressed packets |
@@ -90,6 +93,7 @@ after that it loads from the cache in `__pycache__`.
 | `arithmetic_mapper.py` | ArithmeticMapper | range coder; static, adaptive and context coders; frequency tables |
 | `string_mapper.py` | StringMapper | unary strings and their bit-run compression |
 | `code_mapper.py` | CodeMapper | Huffman ("regular"), Shannon estimate, Deflate |
+| `neighbour_mapper.py` | NeighbourMapper | the neighbour Huffman coding: tables chosen by each delta's neighbours, run mode, pairs |
 | `resize_mapper.py` | ResizeMapper | Pixel Resolution resizing |
 | `segment_mapper.py` | SegmentMapper | the segmenting and packing the Packet programs use |
 | `pixel_mapper.py` | PixelMapper | per-block context models for the pixels or prediction errors, red/green/blue or green-difference channels, MED or least-squares prediction |
@@ -190,8 +194,9 @@ python test/coding_table.py scrubjay.jpg    # NativeWriter's codings compared
 ```
 
 `results_table.py` times NativeWriter/NativeReader, GenericWriter/GenericReader
-and generic_writer.py/generic_reader.py at each quantization, coding and number
-of bands, and checks that all three write the same files. `coding_table.py`
+and generic_writer.py/generic_reader.py at each quantization, coding (context
+aware, Huffman, neighbour Huffman) and number of bands, and checks that all
+three write the same files. `coding_table.py`
 compares NativeWriter's codings (Context aware, Huffman and Neighbour Huffman)
 at each quantization, delta type and number of bands. Each saves its table as a .txt and a .csv in the current folder; the
 top of each script lists its options.

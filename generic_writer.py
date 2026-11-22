@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-generic_writer.py version 1.0 -- GenericWriter.java for Python (PySide6).
+generic_writer.py version 1.1 -- GenericWriter.java for Python (PySide6).
 
 simple_writer2.py and huffman_writer.py in one, with a choice of deltas: the
 same image, the same Apply and the same channels (green, blue-green and
@@ -28,6 +28,11 @@ The Entropy menu chooses the coding:
        (huffman_writer.huffman_code); no contexts, so a channel's coding uses
        no other channel. Huffman format 'H': version 1 with LS, the same files
        as huffman_writer.py; 2 with Avg. Bigger files, faster to decode.
+  Neighbour Huffman: each channel's deltas Huffman coded with tables chosen
+       from the neighbours, a run mode and pairs in the quiet parts
+       (neighbour_mapper.neighbour_code); no contexts across channels.
+       Neighbour Huffman format 'N' 1 (the delta type always after the Pixel
+       Resolution), the same files as HuffmanWriter2.java.
 
 The files are GenericWriter.java's (and NativeEncoder's NativeWriter's),
 byte for byte, read by generic_reader.py and GenericReader.java (versions 2
@@ -51,6 +56,7 @@ import numpy as np
 
 import delta_mapper as dm
 import huffman_writer as hw
+import neighbour_mapper as nm
 import viewer_support as vs
 from java_io import DataInput, DataOutput
 from simple_writer import band_start
@@ -62,8 +68,10 @@ SIMPLE_VERSION_DELTA_TYPE = 3   # version 2 with a byte, the delta type, after t
 HUFFMAN_ID = ord('H')
 HUFFMAN_VERSION = 1             # the Huffman format with the LS deltas: huffman_writer.py's
 HUFFMAN_VERSION_DELTA_TYPE = 2  # version 1 with the delta type, as above
-ENTROPY_MIXED, ENTROPY_HUFFMAN = 0, 1
-ENTROPY_NAMES = ("Context aware", "Huffman")
+ENTROPY_MIXED, ENTROPY_HUFFMAN, ENTROPY_NEIGHBOUR = 0, 1, 2
+ENTROPY_NAMES = ("Context aware", "Huffman", "Neighbour Huffman")
+FORMAT_IDS = (0, 0, ord('N'))   # the formats after Huffman, by entropy type: Neighbour Huffman's (HuffmanWriter2.java's)
+FORMAT_VERSION = 1              # their version, with the delta type always there
 DELTA_LS, DELTA_AVERAGE = 0, 1
 DELTA_NAMES = ("LS", "Avg")
 MAX_BANDS = 64                  # the most bands Save offers (GenericWriter.MAX_BANDS)
@@ -73,16 +81,18 @@ def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, 
     """Codes the channels (as quantized, in coding order, difference
     channels less their minimums mins) and returns (the file's bytes, the
     seconds the decode check took) (GenericWriter.encode). Header: the
-    format's id and version (SIMPLE_ID or HUFFMAN_ID; the version for LS, or
-    the one with the delta type), width, height (unsigned shorts),
-    pixel_shift, pixel_quant, the delta type (an unsigned byte, only in the
-    versions with it); per channel (coding order) int min; the number of
+    format's id and version (SIMPLE_ID or HUFFMAN_ID: the version for LS, or
+    the one with the delta type; or FORMAT_IDS[entropy_type] and
+    FORMAT_VERSION), width, height (unsigned shorts), pixel_shift,
+    pixel_quant, the delta type (an unsigned byte, only in the versions with
+    it); per channel (coding order) int min; the number of
     bands n (an unsigned byte), n int lengths, and the n bands. Band b is rows
     band_start(b) to band_start(b + 1) of the quantized image, coded as an
     image of its own (the fit and the contexts start again at its top): per
     channel, int init, then its deltas coded: context aware
-    (pack_mixed_deltas, with the second opinions) or Huffman
-    (huffman_writer.huffman_code).
+    (pack_mixed_deltas, with the second opinions), Huffman
+    (huffman_writer.huffman_code) or neighbour Huffman
+    (neighbour_mapper.neighbour_code).
 
     With LS, each channel is fitted once over the whole image; the bands'
     deltas come from it, with only each band's first rows fitted again
@@ -93,7 +103,7 @@ def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, 
     check is set, each band's channels are checked by decoding them back, at
     the same time; the time that took is returned (0 without it), so the
     coding can be timed without it."""
-    huffman = entropy_type == ENTROPY_HUFFMAN
+    alone = entropy_type != ENTROPY_MIXED   # each channel coded on its own
     value = [np.asarray(v, dtype=np.int64) for v in value]
     rows = len(value[0]) // xdim
     d = [[None] * 3 for _ in range(n)]          # [band][channel]
@@ -104,15 +114,20 @@ def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, 
         return value[i][y0 * xdim:y1 * xdim]
 
     def code(b, i):
-        if huffman:
+        if entropy_type == ENTROPY_HUFFMAN:
             coded[b][i] = hw.huffman_code(d[b][i])
+        elif entropy_type == ENTROPY_NEIGHBOUR:
+            coded[b][i] = nm.neighbour_code(d[b][i], xdim)
         else:
             coded[b][i] = dm.pack_mixed_deltas(d[b][i], band(b, i), d[b][:i], xdim, True)
 
     def check_band(b, i):
         dd = np.asarray(d[b][i], dtype=np.int64)
-        if huffman:
-            back = hw.huffman_decode(DataInput(coded[b][i]), len(dd))
+        if alone:
+            if entropy_type == ENTROPY_HUFFMAN:
+                back = hw.huffman_decode(DataInput(coded[b][i]), len(dd))
+            else:
+                back = nm.neighbour_decode(nm.neighbour_read(DataInput(coded[b][i])), xdim, len(dd) // xdim)
             # (Delta 0 isn't coded: the band's first value, init, is written instead.)
             same = len(back) == len(dd) and np.array_equal(back[1:], dd[1:])
         else:
@@ -150,13 +165,17 @@ def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, 
             check_time = time.perf_counter() - start
 
     out = DataOutput()
-    if huffman:
-        out.write_byte(HUFFMAN_ID); out.write_byte(HUFFMAN_VERSION if delta_type == DELTA_LS else HUFFMAN_VERSION_DELTA_TYPE)
+    with_type = delta_type != DELTA_LS
+    if entropy_type == ENTROPY_HUFFMAN:
+        out.write_byte(HUFFMAN_ID); out.write_byte(HUFFMAN_VERSION_DELTA_TYPE if with_type else HUFFMAN_VERSION)
+    elif entropy_type == ENTROPY_MIXED:
+        out.write_byte(SIMPLE_ID); out.write_byte(SIMPLE_VERSION_DELTA_TYPE if with_type else SIMPLE_VERSION)
     else:
-        out.write_byte(SIMPLE_ID); out.write_byte(SIMPLE_VERSION if delta_type == DELTA_LS else SIMPLE_VERSION_DELTA_TYPE)
+        out.write_byte(FORMAT_IDS[entropy_type]); out.write_byte(FORMAT_VERSION)
+        with_type = True
     out.write_short(image_xdim); out.write_short(image_ydim)
     out.write_byte(pixel_shift); out.write_byte(pixel_quant)
-    if delta_type != DELTA_LS:
+    if with_type:
         out.write_byte(delta_type)
     for i in range(3):
         out.write_int(int(mins[i]))
