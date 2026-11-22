@@ -49,8 +49,45 @@ import resize_mapper as rm
 import simple_writer as sw
 import viewer_support as vs
 from java_io import DataInput
+from numba_support import njit, jdiv
 
 CHUNK = 1 << 16   # how many coded bytes are read at a time, saying each time that they have arrived (GenericReader.CHUNK)
+
+
+# Big images are a lot of memory each step (scrubjay's channels are 76 MB
+# each), and fresh memory is slow to touch for the first time, more so on
+# Windows; so the decoding writes into memory it already has where it can:
+# the average deltas' values straight into the channel (_average_into), and,
+# without resizing, the minimums, blue, green and red and the packing in one
+# pass into the image (_pack_set7), not an array for each.
+
+@njit
+def _average_into(delta, xdim, ydim, init, dst):
+    """delta_mapper.get_values_from_deltas for the average deltas (type 2),
+    the values written into dst (a band of the channel)."""
+    dst[0] = init
+    for k in range(1, xdim):
+        dst[k] = dst[k - 1] + delta[k]
+    for i in range(1, ydim):
+        k = i * xdim
+        dst[k] = dst[k - xdim] + delta[k]
+        for j in range(1, xdim):
+            k = i * xdim + j
+            dst[k] = jdiv(dst[k - 1] + dst[k - xdim], 2) + delta[k]
+
+
+@njit
+def _pack_set7(c0, c1, c2, add1, add2, amount, out, k0, k1):
+    """Pixels k0 to k1 of the image from channel set 7 (green, blue - green,
+    red - green; add1 and add2 the differences' minimums), shifted by amount
+    and clamped as delta_mapper.pack_image does: the same as
+    get_blue_green_red, then pack_image."""
+    for k in range(k0, k1):
+        g = c0[k]
+        for c in range(3):
+            v = g + c1[k] + add1 if c == 0 else (g if c == 1 else g + c2[k] + add2)
+            v = v >> -amount if amount < 0 else v << amount
+            out[k, c] = 0 if v < 0 else (255 if v > 255 else v)
 
 
 class GenericDecoder:
@@ -117,18 +154,29 @@ class GenericDecoder:
         reading's in read_time."""
         start = time.perf_counter()
         w, h = self.size
-        raw = [np.zeros(w * h, dtype=np.int64) for _ in range(3)]
+        raw = [np.empty(w * h, dtype=np.int64) for _ in range(3)]   # (every value is written)
         if self.entropy_type == gw.ENTROPY_MIXED:
             self._decode_mixed(w, h, raw)
         else:
             self._decode_huffman(w, h, raw)
-        channel = [raw[i] + self.min[i] if gw.CHANNELS[i] > 2 else raw[i] for i in range(3)]
-        bgr = dm.get_blue_green_red(gw.SET_ID, *channel)
-        if self.pixel_quant != 0:
-            def resize(c):
-                bgr[c] = rm.resize2(bgr[c], w, self.xdim, self.ydim)
-            vs.parallel(3, resize)
-        rgb = dm.pack_image(bgr, self.xdim, self.ydim, self.pixel_shift)
+        if self.pixel_quant == 0 and gw.SET_ID == 7:
+            # No resizing: the minimums, blue, green and red, and the packing
+            # in one pass, in pieces at the same time.
+            add = [self.min[i] if gw.CHANNELS[i] > 2 else 0 for i in range(3)]
+            out = np.empty((w * h, 3), dtype=np.uint8)
+            pieces = 16
+            def pack(p):
+                _pack_set7(raw[0], raw[1], raw[2], add[1], add[2], self.pixel_shift, out, p * len(out) // pieces, (p + 1) * len(out) // pieces)
+            vs.parallel(pieces, pack)
+            rgb = out.reshape(self.ydim, self.xdim, 3)
+        else:
+            channel = [raw[i] + self.min[i] if gw.CHANNELS[i] > 2 else raw[i] for i in range(3)]
+            bgr = dm.get_blue_green_red(gw.SET_ID, *channel)
+            if self.pixel_quant != 0:
+                def resize(c):
+                    bgr[c] = rm.resize2(bgr[c], w, self.xdim, self.ydim)
+                vs.parallel(3, resize)
+            rgb = dm.pack_image(bgr, self.xdim, self.ydim, self.pixel_shift)
         self.took = time.perf_counter() - start
         return rgb
 
@@ -235,7 +283,8 @@ class GenericDecoder:
             else:
                 delta[b][i] = nm.neighbour_decode(coded[b][i], w, y1 - y0)
             if self.delta_type == gw.DELTA_AVERAGE:
-                raw[i][y0 * w:y1 * w] = dm.get_values_from_deltas(delta[b][i], w, y1 - y0, init[b][i], 2)
+                _average_into(delta[b][i], w, y1 - y0, init[b][i], raw[i][y0 * w:y1 * w])   # (straight into the channel)
+                delta[b][i] = None
         vs.parallel(3 * n, decode_one)
 
         def rebuild(b):
