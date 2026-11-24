@@ -198,6 +198,7 @@ NativeEncoder beside it, or `--java` and `--native` to say where):
 ```
 python test/results_table.py scrubjay.jpg   # the generic coder in its three versions
 python test/coding_table.py scrubjay.jpg    # NativeWriter's codings compared
+python test/combination_table.py scrubjay.jpg   # every delta / entropy combination, a column each
 ```
 
 `results_table.py` times NativeWriter/NativeReader, GenericWriter/GenericReader
@@ -205,5 +206,9 @@ and generic_writer.py/generic_reader.py at each quantization, coding (context
 aware, Context tables, Huffman, neighbour Huffman) and number of bands, and checks that all
 three write the same files. `coding_table.py`
 compares NativeWriter's codings (Context aware, Context tables, Huffman and Huffman tables)
-at each quantization, delta type and number of bands. Each saves its table as a .txt and a .csv in the current folder; the
+at each quantization, delta type and number of bands. `combination_table.py`
+puts every delta / entropy combination (LS and Avg, each with A, T, H and N)
+in a column of its own, the rows each quantization and number of bands, in
+blocks: the ratios, then each version's (--versions native,java,python)
+encoding and decoding times. Each saves its table as a .txt and a .csv in the current folder; the
 top of each script lists its options.
