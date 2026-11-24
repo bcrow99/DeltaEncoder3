@@ -204,11 +204,10 @@ def _tables(count, steps, prec, weight):
     return freq, length, size, pv[:p], pb[:p]
 
 
-@njit
-def _count(sym, d, v, xdim, cb, fwd, c9b, m, act_table, count):
+@njit_no_refs   # (no arrays made: see numba_support; a per-pixel loop with them is several times slower)
+def _count(sym, d, v, xdim, cb, fwd, c9b, m, act_table, count, ctx):
     """Each model's counts of the symbols by context (count[j, 0]) and merged
-    (count[j, 1][:MERGED_CONTEXTS])."""
-    ctx = np.zeros(3, dtype=np.int64)
+    (count[j, 1][:MERGED_CONTEXTS]); ctx is scratch (3)."""
     for k in range(sym.shape[0]):
         dm._mix_contexts(k, d, v, xdim, cb, fwd, c9b, m, act_table, ctx, True, v[k] - d[k])
         for j in range(m):
@@ -216,22 +215,30 @@ def _count(sym, d, v, xdim, cb, fwd, c9b, m, act_table, count):
             count[j, 1, _merged(ctx[j]), sym[k]] += 1
 
 
+@njit_no_refs   # (no arrays made: see numba_support)
+def _model_contexts(d, v, xdim, cb, fwd, c9b, m, act_table, model, merge, cc):
+    """The chosen model's context at each pixel (merged or not), into cc."""
+    for k in range(d.shape[0]):
+        c = _context(k, d, v, xdim, cb, fwd, c9b, m, act_table, model, v[k] - d[k])
+        cc[k] = _merged(c) if merge else c
+
+
 @njit
-def _rans_encode(sym, d, v, xdim, cb, fwd, c9b, m, act_table, model, merge, freq, prec):
-    """The chosen model's contexts, then the ranks rANS coded from the last
-    (ContextTables.code): the coded bytes, in the order the decoder reads them."""
-    n = sym.shape[0]
-    ctx = np.zeros(3, dtype=np.int64)
-    cc = np.zeros(n, dtype=np.int64)
-    for k in range(n):
-        dm._mix_contexts(k, d, v, xdim, cb, fwd, c9b, m, act_table, ctx, True, v[k] - d[k])
-        cc[k] = _merged(ctx[model]) if merge else ctx[model]
+def _cumulative(freq):
+    """Each context's cumulative frequencies."""
     contexts, symbols = freq.shape
     cum = np.zeros((contexts, symbols), dtype=np.int64)
     for c in range(contexts):
         for s in range(1, symbols):
             cum[c, s] = cum[c, s - 1] + freq[c, s - 1]
-    buf = np.zeros(2 * n + 16, dtype=np.uint8)
+    return cum
+
+
+@njit_no_refs   # (no arrays made: see numba_support)
+def _rans(sym, cc, freq, cum, prec, buf):
+    """The ranks rANS coded from the last (ContextTables.code), into the end
+    of buf: returns where they start (the decoder reads them in order)."""
+    n = sym.shape[0]
     p = buf.shape[0]
     x = RANS_LOW
     for k in range(n - 1, -1, -1):
@@ -247,7 +254,7 @@ def _rans_encode(sym, d, v, xdim, cb, fwd, c9b, m, act_table, model, merge, freq
     for b in range(3, -1, -1):
         p -= 1
         buf[p] = (x >> (8 * b)) & 0xff
-    return buf[p:]
+    return p
 
 
 def code(delta, value, previous, xdim):
@@ -264,7 +271,7 @@ def code(delta, value, previous, xdim):
     prec = precision(symbols)
     cb, fwd, c9b, m = dm._mix_setup(previous, xdim, n)
     count = np.zeros((m, 2, CONTEXTS, symbols), dtype=np.int64)
-    _count(sym, d, v, int(xdim), cb, fwd, c9b, m, dm.MIX_ACTIVITY_TABLE, count)
+    _count(sym, d, v, int(xdim), cb, fwd, c9b, m, dm.MIX_ACTIVITY_TABLE, count, np.zeros(3, dtype=np.int64))
     best = None
     for j in range(m):
         for g in range(2):
@@ -276,7 +283,10 @@ def code(delta, value, previous, xdim):
                 if best is None or size < best[0]:
                     best = (size, j, g, st, freq, tb)
     _, model, merge, steps, freq, tb = best
-    coded = _rans_encode(sym, d, v, int(xdim), cb, fwd, c9b, m, dm.MIX_ACTIVITY_TABLE, model, merge, freq, prec)
+    cc = np.empty(n, dtype=np.int64)
+    _model_contexts(d, v, int(xdim), cb, fwd, c9b, m, dm.MIX_ACTIVITY_TABLE, model, merge, cc)
+    buf = np.empty(2 * n + 16, dtype=np.uint8)
+    coded = buf[_rans(sym, cc, freq, _cumulative(freq), prec, buf):]
     out = DataOutput()
     out.write_int(lo)
     dm.write_table(out, rank)
