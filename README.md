@@ -21,7 +21,7 @@ python3 simple_writer2.py [image]    # Simple 2 format 'F' version 2
 python3 simple_reader2.py foo
 python3 huffman_writer.py [image]    # Huffman format 'H' version 3 (the reader reads 1 too)
 python3 huffman_reader.py foo
-python3 generic_writer.py [image]    # Simple 2 'F' versions 2 and 3, Huffman 'H' versions 3 and 4 (the reader reads 1 and 2 too), Neighbour Huffman 'N' version 1
+python3 generic_writer.py [image]    # Simple 2 'F' versions 2 and 3, Huffman 'H' versions 3 and 4 (the reader reads 1 and 2 too), Neighbour Huffman 'N' version 2 (the reader reads 1 too)
 python3 generic_reader.py foo
 python3 block_writer.py [image]      # Block format 'B'
 python3 block_reader.py foo
@@ -46,7 +46,8 @@ byte for byte; with the least-squares deltas those are simple_writer2.py's and
 huffman_writer.py's, so generic_reader.py opens those too. The Entropy menu
 also has Neighbour Huffman (neighbour_mapper.py): the deltas Huffman coded
 with tables chosen by each delta's neighbours, a run mode and pairs in the
-quiet parts, the same files as HuffmanWriter2.java.
+quiet parts, and a single delta's sign flipped where its neighbours' is
+negative (version 2), the same files as HuffmanWriter2.java.
 
 The Pixel format's ID byte is 'X'; it was 'P' until that turned out to be the
 Packet format's too, so pixel_reader.py explains a 'P' file instead of

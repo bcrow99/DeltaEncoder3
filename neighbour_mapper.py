@@ -14,12 +14,17 @@ to the row's end at most, coded as one symbol: its length's size class, then
 the length's bits below its top bit as they are, then the delta that stopped
 the run), and pairs (in contexts 1 to PAIR_CONTEXTS, two deltas as one
 symbol, each -PAIR_RANGE to PAIR_RANGE or an escape, then coded from a table
-of its own). Each channel has its own tables, made from its own deltas; their
+of its own). A single delta is coded with its sign flipped where its
+neighbours' (left + above) is negative (version 2: NeighbourMapper.flipped),
+so a delta going the way its neighbours go is always coded as positive, and a
+table can give its short codes to one side. Each channel has its own tables,
+made from its own deltas; their
 code lengths are coded compactly (_length_symbols), with no Deflate, so the
 coding doesn't depend on a zlib (Python's own is zlib-ng on Windows).
 
-Layout (neighbour_code): int lo, the smallest delta; int the number of delta
-values (hi - lo + 1); int the number of bytes that follow; those bytes, a bit
+Layout (neighbour_code): int lo, the smallest delta either way round (-max of
+|smallest|, |largest|, so that a flipped delta is in range too); int the number
+of delta values (-2 lo + 1); int the number of bytes that follow; those bytes, a bit
 stream (most significant bit first): the tables' code lengths, then the codes.
 Delta 0 isn't coded (the band's first value is written instead).
 
@@ -52,6 +57,11 @@ LENGTH_MANY_ZEROS = LENGTH_ZEROS + 1
 LENGTH_SYMBOLS = LENGTH_MANY_ZEROS + 1
 MAX_LENGTH_CODE_LENGTH = 15
 LOOKUP_BITS = 10
+# The coding's versions, those of the files that hold it (NeighbourMapper.VERSION,
+# VERSION_UNFLIPPED): 2, the single deltas' signs flipped where their
+# neighbours' (left + above) is negative, which neighbour_code writes; 1, the
+# first, without, which neighbour_decode still reads.
+VERSION, VERSION_UNFLIPPED = 2, 1
 
 
 def _context_table():
@@ -372,7 +382,10 @@ def _walk(d, n, xdim, lo, frequency, record, extra):
                     m += 1
                 k += 2
                 continue
-            s = d[k] - lo
+            single = d[k]
+            if (d[k - 1] if x > 0 else 0) + (d[k - xdim] if y > 0 else 0) < 0:
+                single = -single   # its neighbours' sign negative: flipped (NeighbourMapper.flipped)
+            s = single - lo
             frequency[c, s] += 1
             record[m] = (c << 24) | s
             m += 1
@@ -411,6 +424,8 @@ def _code(delta, xdim):
                 lo = d[k]
             elif d[k] > hi:
                 hi = d[k]
+    hi = max(-lo, hi)   # either way round: a flipped delta is in range too
+    lo = -hi
     values = hi - lo + 1
     width = max(values, PAIR_WIDTH * PAIR_WIDTH, RUN_SYMBOLS)
     frequency = np.zeros((TABLES, width), dtype=np.int64)
@@ -493,12 +508,14 @@ def neighbour_code(delta, xdim):
 
 class NeighbourChannel:
     """A channel's coding as neighbour_code wrote it (neighbour_read)."""
-    __slots__ = ("lo", "values", "code")
+    __slots__ = ("lo", "values", "code", "flip")
 
 
-def neighbour_read(inp):
-    """Reads a channel's coding neighbour_code wrote (NeighbourMapper.neighbourRead)."""
+def neighbour_read(inp, version=VERSION):
+    """Reads a channel's coding of a version (the file's: VERSION, which
+    neighbour_code writes, or VERSION_UNFLIPPED) (NeighbourMapper.neighbourRead)."""
     h = NeighbourChannel()
+    h.flip = version >= VERSION
     h.lo = inp.read_int()
     h.values = inp.read_int()
     length = inp.read_int()
@@ -647,9 +664,10 @@ def _read_lengths(buf, st, total, max_length, L, longest, first, count, start, s
 
 
 @njit
-def _decode(buf, lo, values, xdim, ydim):
+def _decode(buf, lo, values, xdim, ydim, flip):
     """neighbour_decode's work: (0 and the deltas, or a code saying what's
-    wrong and None-like zeros)."""
+    wrong and None-like zeros). flip: the single deltas' signs are flipped
+    (version 2)."""
     n = xdim * ydim
     delta = np.zeros(n, dtype=np.int64)
     st = np.zeros(4, dtype=np.int64)
@@ -774,7 +792,10 @@ def _decode(buf, lo, values, xdim, ydim):
                     else:
                         k += 2
                 else:
-                    delta[k] = s + lo
+                    single = s + lo
+                    if flip and (delta[k - 1] if k > row else 0) + (delta[k - xdim] if y > 0 else 0) < 0:
+                        single = -single   # flipped back (NeighbourMapper.flipped)
+                    delta[k] = single
                     k += 1
             elif step == STOP:
                 delta[k] = s + lo
@@ -805,7 +826,7 @@ def neighbour_decode(h, xdim, ydim):
     Raises IOError if the coding isn't what neighbour_code writes."""
     if h.values < 1:
         raise IOError("bad neighbour Huffman coding")
-    status, delta = _decode(np.frombuffer(h.code, dtype=np.uint8), int(h.lo), int(h.values), int(xdim), int(ydim))
+    status, delta = _decode(np.frombuffer(h.code, dtype=np.uint8), int(h.lo), int(h.values), int(xdim), int(ydim), bool(h.flip))
     if status != 0:
         raise IOError("bad neighbour Huffman coding: " + _DECODE_ERRORS[status])
     return delta

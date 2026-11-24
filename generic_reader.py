@@ -148,9 +148,13 @@ class GenericDecoder:
             if self.huffman_deflated:
                 version += gw.HUFFMAN_VERSION - gw.HUFFMAN_VERSION_DEFLATE
         elif ident in gw.FORMAT_IDS[2:]:
-            # Neighbour Huffman: one version, the delta type always there.
+            # Neighbour Huffman: the delta type always there; the version
+            # before, its signs not flipped, read too, as this one.
             self.entropy_type = gw.FORMAT_IDS.index(ident)
             ls_version, type_version, fmt = -1, gw.FORMAT_VERSION, gw.ENTROPY_NAMES[self.entropy_type]
+            self.neighbour_version = version
+            if version == gw.FORMAT_VERSION_UNFLIPPED:
+                version = gw.FORMAT_VERSION
         else:
             raise IOError(self.filename + " is not a file generic_writer.py writes.")
         if version != ls_version and version != type_version:
@@ -307,7 +311,7 @@ class GenericDecoder:
                 # Each channel: init, then huffman_code's or neighbour_code's bytes.
                 for i in range(3):
                     init[b][i] = bi.read_int()
-                    coded[b][i] = hw.huffman_read(bi, self.huffman_deflated) if self.entropy_type == gw.ENTROPY_HUFFMAN else nm.neighbour_read(bi)
+                    coded[b][i] = hw.huffman_read(bi, self.huffman_deflated) if self.entropy_type == gw.ENTROPY_HUFFMAN else nm.neighbour_read(bi, self.neighbour_version)
                 if bi.f.tell() != len(band):
                     raise IOError("%s: band %d is not the length its header says." % (self.filename, b))
         self.read_time = time.perf_counter() - read
