@@ -2450,6 +2450,22 @@ def _row_fit_row_inline(ref, has_ref, xdim, ydim, init, every, data, value, prev
                  act_table, state, coef, valid, z, delta, dst, y)
 
 
+@njit
+def average_into(delta, xdim, ydim, init, dst):
+    """get_values_from_deltas for the average deltas (type 2), the values
+    written into dst (a band of the channel: no fresh memory, which is slow
+    to touch the first time on a big image), as the readers rebuild them."""
+    dst[0] = init
+    for k in range(1, xdim):
+        dst[k] = dst[k - 1] + delta[k]
+    for i in range(1, ydim):
+        k = i * xdim
+        dst[k] = dst[k - xdim] + delta[k]
+        for j in range(1, xdim):
+            k = i * xdim + j
+            dst[k] = jdiv(dst[k - 1] + dst[k - xdim], 2) + delta[k]
+
+
 def get_values_from_row_fit_channels(mixed, xdim, ydim, init, radius, every):
     """Decodes channels pack_mixed_deltas coded (with the second opinions)
     from their RowFit deltas, rebuilding them as it goes

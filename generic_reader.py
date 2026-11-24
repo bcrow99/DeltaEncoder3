@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-generic_reader.py version 1.2 -- GenericReader.java for Python (PySide6).
+generic_reader.py version 1.3 -- GenericReader.java for Python (PySide6).
 
 Reads generic_writer.py's files (and GenericWriter.java's and NativeEncoder's
 NativeWriter's, the same files, and simple_writer2.py's and huffman_writer.py's:
@@ -16,10 +16,14 @@ were coded:
   read; a band's channels are decoded at the same time, each a few rows
   behind the one before (its contexts use their deltas).
 
+  Context tables ('T'): the file is read, then each band's channels are
+  decoded as they're rebuilt, a few rows behind the one before (as context
+  aware), the bands at the same time (context_tables.tables_bands).
+
   Huffman ('H'): the file is read, then every band's channels' deltas are
   decoded (huffman_writer.huffman_decode) and the channels rebuilt from them.
 
-  Neighbour Huffman ('N'): as Huffman, with neighbour_mapper.neighbour_decode.
+  Neighbour Huffman ('N'): as Huffman, with neighbour_mapper.neighbour_bands.
 
 The deltas: LS, every interior pixel predicted by the least-squares fit from
 the rows above (window radius generic_writer.RADIUS, solved at every
@@ -45,11 +49,12 @@ import delta_mapper as dm
 import generic_writer as gw
 import huffman_writer as hw
 import neighbour_mapper as nm
+import context_tables as ct
 import resize_mapper as rm
 import simple_writer as sw
 import viewer_support as vs
 from java_io import DataInput
-from numba_support import njit, jdiv
+from numba_support import njit
 
 CHUNK = 1 << 16   # how many coded bytes are read at a time, saying each time that they have arrived (GenericReader.CHUNK)
 
@@ -57,25 +62,10 @@ CHUNK = 1 << 16   # how many coded bytes are read at a time, saying each time th
 # Big images are a lot of memory each step (scrubjay's channels are 76 MB
 # each), and fresh memory is slow to touch for the first time, more so on
 # Windows; so the decoding writes into memory it already has where it can:
-# the average deltas' values straight into the channel (_average_into), and,
+# the average deltas' values straight into the channel (delta_mapper.average_into), and,
 # the minimums, blue, green and red, the resizing (if any) and the packing in
 # one pass into the image (_pack_set7, or _resize_set7), not an array for
 # each.
-
-@njit
-def _average_into(delta, xdim, ydim, init, dst):
-    """delta_mapper.get_values_from_deltas for the average deltas (type 2),
-    the values written into dst (a band of the channel)."""
-    dst[0] = init
-    for k in range(1, xdim):
-        dst[k] = dst[k - 1] + delta[k]
-    for i in range(1, ydim):
-        k = i * xdim
-        dst[k] = dst[k - xdim] + delta[k]
-        for j in range(1, xdim):
-            k = i * xdim + j
-            dst[k] = jdiv(dst[k - 1] + dst[k - xdim], 2) + delta[k]
-
 
 @njit
 def _pack_set7(c0, c1, c2, add1, add2, amount, out, k0, k1):
@@ -148,13 +138,18 @@ class GenericDecoder:
             if self.huffman_deflated:
                 version += gw.HUFFMAN_VERSION - gw.HUFFMAN_VERSION_DEFLATE
         elif ident in gw.FORMAT_IDS[2:]:
-            # Neighbour Huffman: the delta type always there; the version
-            # before, its signs not flipped, read too, as this one.
+            # Context tables and Neighbour Huffman: the delta type always
+            # there. Neighbour Huffman's versions before (without the second
+            # opinions; nor the signs flipped) are read too, as this one.
             self.entropy_type = gw.FORMAT_IDS.index(ident)
-            ls_version, type_version, fmt = -1, gw.FORMAT_VERSION, gw.ENTROPY_NAMES[self.entropy_type]
-            self.neighbour_version = version
-            if version == gw.FORMAT_VERSION_UNFLIPPED:
-                version = gw.FORMAT_VERSION
+            fmt = gw.ENTROPY_NAMES[self.entropy_type]
+            if self.entropy_type == gw.ENTROPY_TABLES:
+                ls_version, type_version = -1, gw.TABLES_VERSION
+            else:
+                ls_version, type_version = -1, gw.FORMAT_VERSION
+                self.neighbour_version = version
+                if version in (gw.FORMAT_VERSION_FLIPPED, gw.FORMAT_VERSION_UNFLIPPED):
+                    version = gw.FORMAT_VERSION
         else:
             raise IOError(self.filename + " is not a file generic_writer.py writes.")
         if version != ls_version and version != type_version:
@@ -185,7 +180,7 @@ class GenericDecoder:
     def decode(self):
         """The image as an (ydim, xdim, 3) uint8 array, R, G, B
         (GenericReader.decodeFile): the channels decoded (_decode_mixed, or
-        _decode_huffman for Huffman and Neighbour Huffman, by the format), then blue, green and red rebuilt,
+        _decode_huffman for Context tables, Huffman and Neighbour Huffman, by the format), then blue, green and red rebuilt,
         resized and shifted. Its time (seconds) is left in took, and the
         reading's in read_time."""
         start = time.perf_counter()
@@ -292,11 +287,13 @@ class GenericDecoder:
             raise failed[0]
 
     def _decode_huffman(self, w, h, raw):
-        """A Huffman or Neighbour Huffman file (GenericReader.decodeHuffman
-        and decodeAlone): read whole, then
-        every band's channels' deltas decoded at the same time, then the
-        channels rebuilt: with the average deltas each on its own, all at
-        once; with LS, viewer_support.ls_bands_at_once bands at a time."""
+        """A Context tables, Huffman or Neighbour Huffman file
+        (GenericReader.decodeHuffman and decodeAlone): read whole, then
+        (Huffman) every band's channels' deltas decoded at the same time,
+        then the channels rebuilt: with the average deltas each on its own,
+        all at once; with LS, viewer_support.ls_bands_at_once bands at a
+        time; or (Context tables) context_tables.tables_bands; or (Neighbour
+        Huffman) neighbour_mapper.neighbour_bands."""
         n = self.bands
         radius = [gw.RADIUS] * 3
         init = [[0] * 3 for _ in range(n)]
@@ -308,25 +305,34 @@ class GenericDecoder:
             for b in range(n):
                 band = inp.read_fully(self.length[b])
                 bi = DataInput(band)
-                # Each channel: init, then huffman_code's or neighbour_code's bytes.
+                # Each channel: init, then its coding's bytes.
                 for i in range(3):
                     init[b][i] = bi.read_int()
-                    coded[b][i] = hw.huffman_read(bi, self.huffman_deflated) if self.entropy_type == gw.ENTROPY_HUFFMAN else nm.neighbour_read(bi, self.neighbour_version)
+                    if self.entropy_type == gw.ENTROPY_HUFFMAN:
+                        coded[b][i] = hw.huffman_read(bi, self.huffman_deflated)
+                    elif self.entropy_type == gw.ENTROPY_TABLES:
+                        coded[b][i] = ct.read(bi)
+                    else:
+                        coded[b][i] = nm.neighbour_read(bi, self.neighbour_version)
                 if bi.f.tell() != len(band):
                     raise IOError("%s: band %d is not the length its header says." % (self.filename, b))
         self.read_time = time.perf_counter() - read
+
+        if self.entropy_type == gw.ENTROPY_NEIGHBOUR:
+            nm.neighbour_bands(coded, init, w, h, self.delta_type == gw.DELTA_AVERAGE, radius, gw.EVERY, raw)
+            return
+        if self.entropy_type == gw.ENTROPY_TABLES:
+            ct.tables_bands(coded, init, w, h, self.delta_type == gw.DELTA_AVERAGE, radius, gw.EVERY, raw)
+            return
 
         delta = [[None] * 3 for _ in range(n)]
 
         def decode_one(j):
             b, i = j // 3, j % 3
             y0, y1 = sw.band_start(b, n, h), sw.band_start(b + 1, n, h)
-            if self.entropy_type == gw.ENTROPY_HUFFMAN:
-                delta[b][i] = hw.huffman_decode(coded[b][i], w * (y1 - y0))
-            else:
-                delta[b][i] = nm.neighbour_decode(coded[b][i], w, y1 - y0)
+            delta[b][i] = hw.huffman_decode(coded[b][i], w * (y1 - y0))
             if self.delta_type == gw.DELTA_AVERAGE:
-                _average_into(delta[b][i], w, y1 - y0, init[b][i], raw[i][y0 * w:y1 * w])   # (straight into the channel)
+                dm.average_into(delta[b][i], w, y1 - y0, init[b][i], raw[i][y0 * w:y1 * w])   # (straight into the channel)
                 delta[b][i] = None
         vs.parallel(3 * n, decode_one)
 
