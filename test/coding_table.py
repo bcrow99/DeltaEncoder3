@@ -12,14 +12,15 @@ number of bands:
     --quants LIST   color/pixel pairs          (default 0/0,1/1,2/2,3/4)
     --bands LIST    band counts                (default 1,2,4,8)
     --deltas LIST   LS, Avg                    (default LS,Avg)
-    --codings LIST  codings, in column order   (default A,H,N)
+    --codings LIST  codings, in column order   (default A,T,H,N)
     --runs N        timed runs per setting     (default 2)
 
 The codings (the Entropy menu):
     A   Context aware
+    T   Context tables: context aware's contexts with fixed tables, rANS coded
     H   Huffman: unary strings, bit-pair compressed if it pays, Huffman coded
-    N   Neighbour Huffman: Huffman tables chosen by the neighbours, a run
-        mode and pairs (HuffmanWriter2's coding)
+    N   Huffman tables (neighbour Huffman): Huffman tables chosen by the
+        neighbours, a run mode and pairs (HuffmanWriter2's coding)
 
 The ratio is the file's size over the raw image's (3 bytes a pixel), so
 smaller is better. The times are in milliseconds, as the writer and reader
@@ -43,7 +44,7 @@ import sys
 
 import results_table as rt
 
-CODING_NAMES = {"A": "Context aware", "H": "Huffman", "N": "Neighbour"}
+CODING_NAMES = {"A": "Context aware", "T": "Context tables", "H": "Huffman", "N": "Huffman tables"}
 
 
 def main():
@@ -55,7 +56,7 @@ def main():
     parser.add_argument("--quants", default="0/0,1/1,2/2,3/4")
     parser.add_argument("--bands", default="1,2,4,8")
     parser.add_argument("--deltas", default="LS,Avg")
-    parser.add_argument("--codings", default="A,H,N")
+    parser.add_argument("--codings", default="A,T,H,N")
     parser.add_argument("--runs", type=int, default=2)
     args = parser.parse_args()
     args.quants = [q.strip() for q in args.quants.split(",") if q.strip()]

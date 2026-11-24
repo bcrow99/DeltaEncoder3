@@ -7,8 +7,8 @@ versions of the generic writer and reader:
   Python  this repository's generic_writer.py and generic_reader.py
 
 for each quantization (Color Resolution / Pixel Resolution), coding (LS or
-Avg deltas; context aware arithmetic (A), Huffman (H) or neighbour Huffman
-(N) coding) and number of bands asked for:
+Avg deltas; context aware arithmetic (A), Context tables (T), Huffman (H) or
+Huffman tables, neighbour Huffman (N) coding) and number of bands asked for:
 
     python test/results_table.py image [options]
 
@@ -16,7 +16,7 @@ Avg deltas; context aware arithmetic (A), Huffman (H) or neighbour Huffman
     --native DIR    NativeEncoder's folder     (default: ../NativeEncoder beside this repository)
     --quants LIST   color/pixel pairs          (default 0/0,2/2,3/4)
     --bands LIST    band counts                (default 1,2,4,8)
-    --methods LIST  codings                    (default LS-A,LS-H,LS-N,Avg-A,Avg-H,Avg-N)
+    --methods LIST  codings                    (default LS-A,LS-T,LS-H,LS-N,Avg-A,Avg-T,Avg-H,Avg-N)
     --runs N        timed runs per setting     (default 2)
     --skip LIST     versions to leave out, e.g. --skip python  (native, java, python)
 
@@ -164,7 +164,7 @@ def run_python(image, args):
                 coder.apply()
             for m in args.methods:
                 coder.delta_type = gw.DELTA_LS if m.startswith("LS") else gw.DELTA_AVERAGE
-                coder.entropy_type = {"A": gw.ENTROPY_MIXED, "H": gw.ENTROPY_HUFFMAN, "N": gw.ENTROPY_NEIGHBOUR}[m.split("-")[1]]
+                coder.entropy_type = {"A": gw.ENTROPY_MIXED, "T": gw.ENTROPY_TABLES, "H": gw.ENTROPY_HUFFMAN, "N": gw.ENTROPY_NEIGHBOUR}[m.split("-")[1]]
                 last = -1
                 for b in args.bands:
                     coder.bands = b
@@ -320,7 +320,7 @@ def main():
     parser.add_argument("--native", default=os.path.join(os.path.dirname(REPO), "NativeEncoder"))
     parser.add_argument("--quants", default="0/0,2/2,3/4")
     parser.add_argument("--bands", default="1,2,4,8")
-    parser.add_argument("--methods", default="LS-A,LS-H,LS-N,Avg-A,Avg-H,Avg-N")
+    parser.add_argument("--methods", default="LS-A,LS-T,LS-H,LS-N,Avg-A,Avg-T,Avg-H,Avg-N")
     parser.add_argument("--runs", type=int, default=2)
     parser.add_argument("--skip", default="")
     args = parser.parse_args()
@@ -328,8 +328,8 @@ def main():
     args.bands = [int(b) for b in args.bands.split(",") if b.strip()]
     args.methods = [m.strip() for m in args.methods.split(",") if m.strip()]
     for m in args.methods:
-        if m not in ("LS-A", "LS-H", "LS-N", "Avg-A", "Avg-H", "Avg-N"):
-            parser.error("unknown method %s: use LS-A, LS-H, LS-N, Avg-A, Avg-H or Avg-N" % m)
+        if m not in ("LS-A", "LS-T", "LS-H", "LS-N", "Avg-A", "Avg-T", "Avg-H", "Avg-N"):
+            parser.error("unknown method %s: use LS-A, LS-T, LS-H, LS-N, Avg-A, Avg-T, Avg-H or Avg-N" % m)
     for q in args.quants:
         if len(q.split("/")) != 2:
             parser.error("quant %s: give it as color/pixel, e.g. 3/4" % q)
