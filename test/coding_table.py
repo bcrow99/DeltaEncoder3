@@ -17,7 +17,7 @@ number of bands:
 
 The codings (the Entropy menu):
     A   Context aware
-    T   Context tables: context aware's contexts with fixed tables, rANS coded
+    T   Context tables: each channel's own contexts with fixed tables, rANS coded
     H   Huffman: unary strings, bit-pair compressed if it pays, Huffman coded
     N   Huffman tables (neighbour Huffman): Huffman tables chosen by the
         neighbours, a run mode and pairs (HuffmanWriter2's coding)
