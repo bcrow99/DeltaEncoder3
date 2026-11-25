@@ -213,65 +213,120 @@ else:
         return n
 
 
+def _byte_values():
+    """For each byte (its bits from the low one): the whole values in it, as
+    _unpack_strings reads them from a value's start when every rank under 8
+    is ones then a zero (the last rank 8 or more): the ranks, 3 bits each, the
+    first lowest (bits 0 to 23), how many (bits 24 to 27) and the bits they
+    take (bits 28 to 31) (StringMapper.BYTE_VALUES)."""
+    t = np.zeros(256, dtype=np.int64)
+    for b in range(256):
+        values = taken = ones = ranks = 0
+        for j in range(8):
+            if (b >> j) & 1:
+                ones += 1
+            else:
+                ranks |= ones << (3 * values)
+                values += 1
+                taken = j + 1
+                ones = 0
+        t[b] = ranks | (values << 24) | (taken << 28)
+    return t
+
+
+BYTE_VALUES = _byte_values()
+
+
 @njit
-def _unpack_strings(src, table, size, bitlength):
+def _unpack_strings(src, table, size, bitlength, byte_values):
     """StringMapper.unpackStrings. Bit by bit, "length" counts from 1: a one
     adds to it (up to max_length), a zero ends the value (rank length - 1),
-    and a one when it's already max_length ends the last rank's value. Here
-    the bits are taken up to 56 at a time, and each run of zeros or ones in
-    them at once."""
+    and a one when it's already max_length ends the last rank's value. Here,
+    from a value's start, whole values are read at once while 64 bits are
+    there: a byte's worth from byte_values (when the last rank is 8 or
+    more), or one value from its ones; a value of more than 56 bits, and the
+    end, bit by bit."""
     n = table.shape[0]
     max_length = n - 1
     dst = np.zeros(size, dtype=np.int64)
     inverse = np.zeros(n, dtype=np.int64)
     for i in range(n):
         inverse[table[i]] = i
-    length = 1
-    dst_byte = 0
+    k = 0
     i = 0
-    while dst_byte < size and i < bitlength:
-        x = _bits_from(src, i)
-        avail = min(56, bitlength - i)
+    while max_length >= 1 and k < size and i + 64 <= bitlength:
+        x = _bits_from(src, i)          # (64 bits, all the string's)
         used = 0
-        while used < avail and dst_byte < size:
-            if (x & np.uint64(1)) == 0:
-                # z zeros: the first ends the value under way, each other one
-                # is a value of rank 0.
-                z = min(_trailing_zeros(x), avail - used)
-                dst[dst_byte] = inverse[length - 1]
-                dst_byte += 1
-                length = 1
-                for _ in range(1, z):
-                    if dst_byte >= size:
-                        break
-                    dst[dst_byte] = inverse[0]
-                    dst_byte += 1
-                x >>= np.uint64(z)
-                used += z
+        if max_length >= 8:
+            while used <= 56 - 8 and k + 8 <= size:
+                e = byte_values[np.int64(x & np.uint64(255))]
+                values = (e >> 24) & 15
+                if values == 0:
+                    break               # eight ones: a value of rank 8 or more
+                for j in range(8):      # (those past the values written over next)
+                    dst[k + j] = inverse[(e >> (3 * j)) & 7]
+                taken = e >> 28
+                k += values
+                x >>= np.uint64(taken)
+                used += taken
+        while k < size:
+            ones = _trailing_zeros(~x)
+            left = 56 - used
+            if ones >= max_length and max_length <= left:
+                dst[k] = inverse[max_length]
+                k += 1
+                x >>= np.uint64(max_length)
+                used += max_length
+            elif ones < max_length and ones < left:
+                dst[k] = inverse[ones]
+                k += 1
+                x >>= np.uint64(ones + 1)
+                used += ones + 1
             else:
-                ones = min(_trailing_zeros(~x), avail - used)
-                x >>= np.uint64(ones)
-                used += ones
-                if max_length < 1:
-                    continue                    # one value: ones mean nothing
-                while ones > 0 and dst_byte < size:
-                    if length < max_length:
-                        m = min(max_length - length, ones)
-                        length += m
-                        ones -= m
-                    else:
-                        dst[dst_byte] = inverse[length]
-                        dst_byte += 1
-                        length = 1
-                        ones -= 1
+                break
+            if max_length >= 8 and (x & np.uint64(255)) != np.uint64(255) and used <= 56 - 8:
+                break                   # back to the bytes
         i += used
+        if used == 0:                   # a value of more than 56 bits: bit by bit
+            length = 1
+            while i < bitlength:
+                bit = (src[i >> 3] >> (i & 7)) & 1
+                i += 1
+                if bit == 0:
+                    dst[k] = inverse[length - 1]
+                    k += 1
+                    break
+                elif length < max_length:
+                    length += 1
+                else:
+                    dst[k] = inverse[length]
+                    k += 1
+                    break
+    length = 1                          # the rest bit by bit
+    while k < size and i < bitlength:
+        bit = (src[i >> 3] >> (i & 7)) & 1
+        i += 1
+        if bit == 0:
+            dst[k] = inverse[length - 1]
+            k += 1
+            length = 1
+        elif max_length < 1:
+            continue                    # one value: ones mean nothing
+        elif length < max_length:
+            length += 1
+        else:
+            dst[k] = inverse[length]
+            k += 1
+            length = 1
+    for j in range(k, size):
+        dst[j] = 0                      # (any written past the last value)
     return dst
 
 
 def unpack_strings(src, table, size, bitlength):
     src = _u8(src)
     bitlength = min(bitlength, get_bitlength(src))
-    return _unpack_strings(src, np.asarray(table, dtype=np.int64), size, bitlength)
+    return _unpack_strings(src, np.asarray(table, dtype=np.int64), size, bitlength, BYTE_VALUES)
 
 
 def get_string_list(values, compress):

@@ -146,20 +146,56 @@ def pack_regular_code(data, length):
     return _pack_regular(np.asarray(data, dtype=np.uint8), length, get_regular_canonical_code(length))
 
 
+LOOKUP_BITS = 11   # how many leading bits unpack_regular_code looks up at once
+
+
+@njit
+def _peek_bits(src, position):
+    """The next 32 bits of src from bit position on, the first in the high
+    bit (zeros past the end)."""
+    b = position >> 3
+    x = 0
+    for j in range(5):
+        x = (x << 8) | (src[b + j] if b + j < src.shape[0] else 0)
+    return (x >> (8 - (position & 7))) & 0xFFFFFFFF
+
+
 @njit
 def _unpack_regular(src, n, count, first_code, first_index, order):
+    """The codes (CodeMapper.unpackRegularCode): each looked up from its
+    first LOOKUP_BITS bits (the table made by reading each start bit by bit,
+    as below for the longer codes: value | length << 8, 0 if longer, -1 if
+    not a code)."""
+    lookup = np.zeros(1 << LOOKUP_BITS, dtype=np.int64)
+    for p in range(1 << LOOKUP_BITS):
+        c = 0
+        for L in range(1, LOOKUP_BITS + 1):
+            c = (c << 1) | ((p >> (LOOKUP_BITS - L)) & 1)
+            offset = c - first_code[L]
+            if offset < count[L]:
+                lookup[p] = -1 if first_index[L] + offset < 0 else order[first_index[L] + offset] | (L << 8)
+                break
     dst = np.zeros(n, dtype=np.uint8)
     position = 0
     for k in range(n):
+        x = _peek_bits(src, position)
+        e = lookup[x >> (32 - LOOKUP_BITS)]
+        if e < 0:
+            return dst                  # corrupt data; Java would throw
+        if e != 0:
+            dst[k] = e & 255
+            position += e >> 8
+            continue
         c = 0
         L = 1
         while True:
-            byte = src[position >> 3] if (position >> 3) < src.shape[0] else 0
-            c = (c << 1) | ((byte >> (7 - (position & 7))) & 1)
-            position += 1
+            c = (c << 1) | ((x >> (32 - L)) & 1)
             offset = c - first_code[L]
             if offset < count[L]:
+                if first_index[L] + offset < 0:
+                    return dst          # corrupt data; Java would throw
                 dst[k] = order[first_index[L] + offset]
+                position += L
                 break
             L += 1
             if L > 24:
