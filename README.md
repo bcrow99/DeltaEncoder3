@@ -21,7 +21,7 @@ python3 simple_writer2.py [image]    # Simple 2 format 'F' version 2
 python3 simple_reader2.py foo
 python3 huffman_writer.py [image]    # Huffman format 'H' version 3 (the reader reads 1 too)
 python3 huffman_reader.py foo
-python3 generic_writer.py [image]    # Simple 2 'F' versions 2 and 3, Context tables 'T' version 1, Huffman 'H' versions 3 and 4 (the reader reads 1 and 2 too), Neighbour Huffman 'N' version 3 (the reader reads 1 and 2 too)
+python3 generic_writer.py [image]    # Simple 2 'F' versions 2 and 3, Context tables 'T' version 2 (the reader reads 1 too), Huffman 'H' versions 3 and 4 (the reader reads 1 and 2 too), Neighbour Huffman 'N' version 3 (the reader reads 1 and 2 too)
 python3 generic_reader.py foo
 python3 block_writer.py [image]      # Block format 'B'
 python3 block_reader.py foo
@@ -44,9 +44,12 @@ alone): simple_writer2.py's and huffman_writer.py's codings in one program (the
 (the **Delta** menu), in up to 64 bands. Their files are the Java programs',
 byte for byte; with the least-squares deltas those are simple_writer2.py's and
 huffman_writer.py's, so generic_reader.py opens those too. The Entropy menu
-also has Context tables (context_tables.py): the context aware coding's
-contexts with fixed tables in place of its adaptive models, the deltas rANS
-coded with them, about 1-3% bigger than context aware and faster to decode;
+also has Context tables (context_tables.py): fixed tables chosen by each
+delta's own context (its neighbours' activity and its second opinion) in
+place of the context aware coding's adaptive models, the deltas rANS coded
+with them, about 1-8% bigger than context aware and faster to decode, each
+channel on its own (version 2; version 1, with the context aware coding's
+contexts, is read too);
 and Huffman tables, neighbour Huffman (neighbour_mapper.py): the deltas Huffman coded
 with tables chosen by each delta's neighbours, a run mode and pairs in the
 quiet parts, a second opinion (the median edge detector's distance from the
@@ -100,7 +103,7 @@ after that it loads from the cache in `__pycache__`.
 | `string_mapper.py` | StringMapper | unary strings and their bit-run compression |
 | `code_mapper.py` | CodeMapper | Huffman ("regular"), Shannon estimate, Deflate |
 | `neighbour_mapper.py` | NeighbourMapper | the neighbour Huffman coding: tables chosen by each delta's neighbours, run mode, pairs |
-| `context_tables.py` | ContextTables | the Context tables coding: the context aware coding's contexts, fixed tables, rANS |
+| `context_tables.py` | ContextTables | the Context tables coding: each channel's own contexts, fixed tables, rANS |
 | `resize_mapper.py` | ResizeMapper | Pixel Resolution resizing |
 | `segment_mapper.py` | SegmentMapper | the segmenting and packing the Packet programs use |
 | `pixel_mapper.py` | PixelMapper | per-block context models for the pixels or prediction errors, red/green/blue or green-difference channels, MED or least-squares prediction |

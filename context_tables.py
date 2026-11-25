@@ -3,34 +3,40 @@ context_tables.py -- ContextTables.java for Python: the Context tables coding
 of a channel's deltas (GenericWriter's and NativeWriter's "Context tables"),
 the same bytes from the same deltas, and the same deltas back.
 
-The context aware coding's contexts (delta_mapper._mix_contexts: the
-activity, the earlier channels' deltas and a second opinion), with fixed
-tables in place of its adaptive models: the deltas are counted once, by
-context, the counts written as tables, and the deltas coded with them by rANS
-(range asymmetric numeral systems), which decodes a symbol with a table
-lookup and a multiply, and no division. Smaller than the Huffman codings, a
-little bigger than context aware (whose models adapt, and mix three
-opinions), and several times faster to decode.
+Fixed tables chosen by each delta's context, in place of the context aware
+coding's adaptive models: the deltas are counted once, by context, the counts
+written as tables, and the deltas coded with them by rANS (range asymmetric
+numeral systems), which decodes a symbol with a table lookup and a multiply,
+and no division. Smaller than the Huffman codings, a little bigger than
+context aware (whose models adapt, and mix three opinions), and several times
+faster to decode.
+
+Version 2 (written): each delta's context is the channel's own (_own_context):
+the activity bucket of its neighbours' deltas (the context aware coding's
+buckets) and its second opinion, the median edge detector's distance from the
+prediction, as a gradient level (9 levels): OWN_CONTEXTS of them. No other
+channel is used, so the channels (and the bands) decode independently.
+Version 1 (still read): the context aware coding's contexts (delta_mapper.
+_mix_contexts: with the earlier channels' deltas too), one model's (0, 1 or,
+after the first channel, 2), with its cross buckets merged or not.
 
 The symbols are the deltas' ranks (as the context aware coding's: the most
-frequent value is 0). One model's contexts are used: model 0, 1 or, after the
-first channel, 2 (MIX_OPINION_LEVELS times CONTEXTS of them), or the same
-with the earlier channels' cross buckets merged (fewer tables, for a small
-image). Each context's table is its symbols' probabilities to a step of a
-factor of 2 (steps 1) or of the square root of 2 (steps 2), as levels 1 to
-LEVEL_RANGE times steps (0: a symbol that isn't there), from which coder and
-decoder make the same frequencies, out of 2^precision (_normalize). The
-model, the merging and the steps are chosen by the coded size.
+frequent value is 0). Each context's table is its symbols' probabilities to a
+step of a factor of 2 (steps 1) or of the square root of 2 (steps 2: chosen by
+the coded size), as levels 1 to LEVEL_RANGE times steps (0: a symbol that
+isn't there), from which coder and decoder make the same frequencies, out of
+2^precision (_normalize).
 
 Layout (code): int the smallest delta, the rank table (delta_mapper.
-write_table), byte the model, byte 1 if merged (else 0), byte the steps, byte
-the precision, int the tables' length, the tables, int the coded length, and
-the coded bytes: rANS's final state (4 bytes, the low first), then the bytes
-it gave out, in the order the decoder reads them. The tables: a bit stream
-(most significant bit first) of each context's number of levels (its last
-symbol + 1; 0 for a context not used) plus 1, in Elias's gamma code, then the
-used contexts' levels, one table after another, as _chain writes them
-(neighbour_mapper._length_symbols, up to twice the top level).
+write_table), byte the model (OWN; version 1: 0 to 2), byte 0 (version 1: 1
+if merged), byte the steps, byte the precision, int the tables' length, the
+tables, int the coded length, and the coded bytes: rANS's final state (4
+bytes, the low first), then the bytes it gave out, in the order the decoder
+reads them. The tables: a bit stream (most significant bit first) of each
+context's number of levels (its last symbol + 1; 0 for a context not used)
+plus 1, in Elias's gamma code, then the used contexts' levels, one table
+after another, as _chain writes them (neighbour_mapper._length_symbols, up to
+twice the top level).
 """
 
 import threading
@@ -41,11 +47,13 @@ from numba_support import njit, njit_no_refs, jdiv
 import delta_mapper as dm
 import neighbour_mapper as nm
 
-VERSION = 1   # the coding's version, the Context tables format's ('T')
-CONTEXTS = dm.CONTEXTS * dm.MIX_OPINION_LEVELS
+VERSION, VERSION_MIXED = 2, 1   # the coding's version, the Context tables format's ('T'): the channel's own contexts; the context aware coding's (read)
+OWN = 3                         # version 2's model byte (version 1's: the context aware coding's model, 0 to 2)
+CONTEXTS = dm.CONTEXTS * dm.MIX_OPINION_LEVELS   # version 1's
 CROSS = len(dm.CROSS_LIMIT)
 LEVELS = dm.MIX_OPINION_LEVELS
 MERGED_CONTEXTS = CONTEXTS // CROSS
+OWN_CONTEXTS = CONTEXTS // CROSS                 # the activity buckets times the opinion levels
 MIN_PRECISION, MAX_PRECISION = 12, 16
 LEVEL_RANGE = 12
 # Each level's weight (0 to LEVEL_RANGE steps), for steps 1 and 2: 16 times
@@ -204,23 +212,39 @@ def _tables(count, steps, prec, weight):
     return freq, length, size, pv[:p], pb[:p]
 
 
+@njit(inline="always")   # called per pixel: a call passing arrays is slow in Numba
+def _own_context(k, x, y, d, v, xdim, act_table, pred):
+    """A delta's own context (ContextTables.ownContext): the activity bucket
+    of its neighbours' deltas (left, above, above left and above right, those
+    there are) times the opinion levels, plus, inside the image (row 1 on,
+    but the first and last columns), the gradient level of the median edge
+    detector's prediction less the rebuilding's (pred); elsewhere the middle
+    level."""
+    o = LEVELS // 2
+    if y >= 1 and x >= 1 and x < xdim - 1:
+        a = abs(d[k - 1]) + abs(d[k - xdim]) + abs(d[k - xdim - 1]) + abs(d[k - xdim + 1])
+        o += dm._gradient_level(dm._med(v[k - 1], v[k - xdim], v[k - xdim - 1]) - pred)
+    else:
+        a = abs(d[k - 1]) if x > 0 else 0
+        if y > 0:
+            a += abs(d[k - xdim])
+            if x > 0:
+                a += abs(d[k - xdim - 1])
+            if x < xdim - 1:
+                a += abs(d[k - xdim + 1])
+    return act_table[min(a, act_table.shape[0] - 1)] * LEVELS + o
+
+
 @njit_no_refs   # (no arrays made: see numba_support; a per-pixel loop with them is several times slower)
-def _count(sym, d, v, xdim, cb, fwd, c9b, m, act_table, count, ctx):
-    """Each model's counts of the symbols by context (count[j, 0]) and merged
-    (count[j, 1][:MERGED_CONTEXTS]); ctx is scratch (3)."""
-    for k in range(sym.shape[0]):
-        dm._mix_contexts(k, d, v, xdim, cb, fwd, c9b, m, act_table, ctx, True, v[k] - d[k])
-        for j in range(m):
-            count[j, 0, ctx[j], sym[k]] += 1
-            count[j, 1, _merged(ctx[j]), sym[k]] += 1
-
-
-@njit_no_refs   # (no arrays made: see numba_support)
-def _model_contexts(d, v, xdim, cb, fwd, c9b, m, act_table, model, merge, cc):
-    """The chosen model's context at each pixel (merged or not), into cc."""
-    for k in range(d.shape[0]):
-        c = _context(k, d, v, xdim, cb, fwd, c9b, m, act_table, model, v[k] - d[k])
-        cc[k] = _merged(c) if merge else c
+def _own_count(sym, d, v, xdim, act_table, count, cc):
+    """Each pixel's own context (into cc) and the symbols' counts by context."""
+    k = 0
+    for y in range(sym.shape[0] // xdim):
+        for x in range(xdim):
+            c = _own_context(k, x, y, d, v, xdim, act_table, v[k] - d[k])
+            cc[k] = c
+            count[c, sym[k]] += 1
+            k += 1
 
 
 @njit
@@ -257,41 +281,36 @@ def _rans(sym, cc, freq, cum, prec, buf):
     return p
 
 
-def code(delta, value, previous, xdim):
-    """A channel's deltas Context tables coded (ContextTables.code; see the
-    top of this module): value the band's values as the decoder rebuilds
-    them (for the second opinions, the predictions value - delta); previous
-    the deltas of the channels coded before it."""
+def code(delta, value, offset, xdim):
+    """A channel's deltas Context tables coded, version 2 (ContextTables.code;
+    see the top of this module): value the channel's values as the decoder
+    rebuilds them (for the second opinions, the predictions value - delta),
+    the band's from offset on."""
     from java_io import DataOutput
     d = np.ascontiguousarray(delta, dtype=np.int64)
-    v = np.ascontiguousarray(value, dtype=np.int64)
     n = len(d)
+    v = np.ascontiguousarray(value[offset:offset + n], dtype=np.int64)
     sym, lo, rank = dm._rank_symbols(d)
     symbols = len(rank)
     prec = precision(symbols)
-    cb, fwd, c9b, m = dm._mix_setup(previous, xdim, n)
-    count = np.zeros((m, 2, CONTEXTS, symbols), dtype=np.int64)
-    _count(sym, d, v, int(xdim), cb, fwd, c9b, m, dm.MIX_ACTIVITY_TABLE, count, np.zeros(3, dtype=np.int64))
-    best = None
-    for j in range(m):
-        for g in range(2):
-            cnt = count[j, g, :MERGED_CONTEXTS] if g else count[j, g]
-            for st in (1, 2):
-                freq, length, size, pv, pb = _tables(cnt, st, prec, WEIGHT)
-                tb = nm._pack_bits(pv, pb)
-                size += (8 * len(tb)) << 16
-                if best is None or size < best[0]:
-                    best = (size, j, g, st, freq, tb)
-    _, model, merge, steps, freq, tb = best
+    count = np.zeros((OWN_CONTEXTS, symbols), dtype=np.int64)
     cc = np.empty(n, dtype=np.int64)
-    _model_contexts(d, v, int(xdim), cb, fwd, c9b, m, dm.MIX_ACTIVITY_TABLE, model, merge, cc)
+    _own_count(sym, d, v, int(xdim), dm.MIX_ACTIVITY_TABLE, count, cc)
+    best = None
+    for st in (1, 2):
+        freq, length, size, pv, pb = _tables(count, st, prec, WEIGHT)
+        tb = nm._pack_bits(pv, pb)
+        size += (8 * len(tb)) << 16
+        if best is None or size < best[0]:
+            best = (size, st, freq, tb)
+    _, steps, freq, tb = best
     buf = np.empty(2 * n + 16, dtype=np.uint8)
     coded = buf[_rans(sym, cc, freq, _cumulative(freq), prec, buf):]
     out = DataOutput()
     out.write_int(lo)
     dm.write_table(out, rank)
-    out.write_byte(model)
-    out.write_byte(merge)
+    out.write_byte(OWN)
+    out.write_byte(0)
     out.write_byte(steps)
     out.write_byte(prec)
     out.write_int(len(tb))
@@ -319,7 +338,7 @@ def read(inp):
     merge = inp.read_unsigned_byte()
     h.steps = inp.read_unsigned_byte()
     h.precision = inp.read_unsigned_byte()
-    if h.model > 2 or merge > 1 or not 1 <= h.steps <= 2 or not MIN_PRECISION <= h.precision <= MAX_PRECISION:
+    if h.model > OWN or merge > (0 if h.model == OWN else 1) or not 1 <= h.steps <= 2 or not MIN_PRECISION <= h.precision <= MAX_PRECISION:
         raise IOError("bad Context tables coding: model %d, merged %d, steps %d, precision %d" % (h.model, merge, h.steps, h.precision))
     h.merged = merge == 1
     length = inp.read_int()
@@ -417,12 +436,12 @@ _TABLE_ERRORS = {1: "a table's length", 2: "the levels", 3: "a level", 4: "the t
 
 
 def decoder(h, m):
-    """The state of a decoder at the start of a channel's coding (with m
-    models' contexts: 3, or 2 for the first channel): (slot, freq, cum,
-    lookup, code, state: rANS's x, the next byte, an error)."""
-    if h.model >= m:
+    """The state of a decoder at the start of a channel's coding (version 1
+    with m models' contexts: 3, or 2 for the first channel): (slot, freq,
+    cum, lookup, code, state: rANS's x, the next byte, an error)."""
+    if h.model != OWN and h.model >= m:
         raise IOError("bad Context tables coding: model %d of %d" % (h.model, m))
-    contexts = MERGED_CONTEXTS if h.merged else CONTEXTS
+    contexts = OWN_CONTEXTS if h.model == OWN else MERGED_CONTEXTS if h.merged else CONTEXTS
     status, slot, freq, cum, look = _read_tables(h.tables, contexts, len(h.value), h.steps, h.precision, WEIGHT)
     if status != 0:
         raise IOError("bad Context tables coding: " + _TABLE_ERRORS[status])
@@ -494,10 +513,21 @@ def _context(k, d, v, xdim, cb, fwd, c9b, m, act_table, j, pred):
 @njit(inline="always")   # called per pixel: a call passing arrays is slow in Numba
 def _ct_next(slot, freq, cum, look, code, st, value, model, merge, prec, k, d, v, xdim, cb, fwd, c9b, m, act_table, ctx, pred):
     """Decodes delta k into d[k] (ContextTables.TablesDecoder.decode): its
-    context, its symbol from the context's lookup, rANS's state moved on."""
-    c = _context(k, d, v, xdim, cb, fwd, c9b, m, act_table, model, pred)
-    if merge:
-        c = _merged(c)
+    context (version 2's own, or version 1's), then _ct_symbol."""
+    if model == OWN:
+        y = k // xdim
+        c = _own_context(k, k - y * xdim, y, d, v, xdim, act_table, pred)
+    else:
+        c = _context(k, d, v, xdim, cb, fwd, c9b, m, act_table, model, pred)
+        if merge:
+            c = _merged(c)
+    _ct_symbol(slot, freq, cum, look, code, st, value, prec, c, k, d)
+
+
+@njit(inline="always")   # called per pixel: a call passing arrays is slow in Numba
+def _ct_symbol(slot, freq, cum, look, code, st, value, prec, c, k, d):
+    """Delta k, whose context is c, into d[k]: its symbol from the context's
+    lookup, rANS's state moved on (renormalized a byte at a time)."""
     r = slot[c]
     if r < 0:
         st[2] = 1
@@ -524,12 +554,13 @@ def _ct_known(slot, freq, cum, look, code, st, value, model, merge, prec, d, v, 
         _ct_next(slot, freq, cum, look, code, st, value, model, merge, prec, k, d, v, xdim, cb, fwd, c9b, m, act_table, ctx, v[k] - delta[k])
 
 
-def decode_known(h, value, delta, previous, xdim):
-    """A band's channel's deltas decoded with its values and predictions
-    known (ContextTables.decodeKnown: the writers' check)."""
-    v = np.ascontiguousarray(value, dtype=np.int64)
+def decode_known(h, value, offset, delta, xdim):
+    """A band's channel's deltas decoded with its values (from offset on)
+    and predictions known (ContextTables.decodeKnown: the writers' check;
+    version 2)."""
     dl = np.ascontiguousarray(delta, dtype=np.int64)
-    cb, fwd, c9b, m = dm._mix_setup(previous, xdim, len(dl))
+    v = np.ascontiguousarray(value[offset:offset + len(dl)], dtype=np.int64)
+    cb, fwd, c9b, m = dm._mix_setup([], xdim, len(dl))
     dec = decoder(h, m)
     d = np.zeros(len(dl), dtype=np.int64)
     _ct_known(*dec, h.value, h.model, h.merged, h.precision, d, v, dl, int(xdim), cb, fwd, c9b, m, dm.MIX_ACTIVITY_TABLE, np.zeros(3, dtype=np.int64))
@@ -591,11 +622,13 @@ def _ct_average_row(xdim, ydim, init, delta, dst, y, previous, cross, cb, fwd, c
 
 def channels(coded, xdim, ydim, init, average, radius, every):
     """A band's channels decoded and rebuilt (GenericReader.tablesBands' for
-    a band): a thread per channel, a row at a time, once the channel before
-    has decoded two rows further (this row's contexts use its rows y and
-    y + 1), each row a single compiled call (_ct_average_row or
-    _ct_row_fit_row, its fits solved in the same call). Returns the values,
-    per channel."""
+    a band): a thread per channel, a row at a time, each row a single
+    compiled call (_ct_average_row or _ct_row_fit_row, its fits solved in the
+    same call). Version 2 (the channel's own contexts): with the average
+    deltas each channel on its own; with the fit's once the channel before
+    has rebuilt this row (the fit uses it). Version 1: once the channel
+    before has decoded two rows further (this row's contexts use its rows y
+    and y + 1). Returns the values, per channel."""
     nch, n = len(coded), xdim * ydim
     delta = np.zeros((nch, n), dtype=np.int64)     # rows of one array: a channel's previous is delta[:i], no copy
     value = np.zeros((nch, n), dtype=np.int64)
@@ -606,7 +639,9 @@ def channels(coded, xdim, ydim, init, average, radius, every):
     def run(i):
         try:
             h = coded[i]
-            m = 3 if i > 0 else 2
+            own = h.model == OWN
+            m = 3 if i > 0 and not own else 2     # (the earlier channels' terms: version 1's contexts only)
+            ahead = (0 if average else 1) if own else 2
             dec = decoder(h, m)
             args = (*dec, h.value, h.model, h.merged, h.precision)
             terms = dm._mix_terms(n)   # cross, cb, fwd, c9b (zero for the first channel)
@@ -619,8 +654,8 @@ def channels(coded, xdim, ydim, init, average, radius, every):
                 ref = value[i - 1] if i > 0 else np.zeros(1, dtype=np.int64)
                 w = dm._rf_work(nf)
             for y in range(ydim):
-                if i > 0:
-                    need = min(ydim, y + 2)
+                if i > 0 and ahead > 0:
+                    need = min(ydim, y + ahead)
                     with cond:
                         while done[i - 1] < need and not failed:
                             cond.wait()
@@ -655,8 +690,9 @@ def channels(coded, xdim, ydim, init, average, radius, every):
 def tables_bands(coded, init, w, h, average, radius, every, raw):
     """Every band's channels decoded and rebuilt into the channels raw[i]
     (GenericReader.tablesBands): each band's channels decoded inside the
-    rebuilding (channels); with the average deltas all the bands at the
-    same time, with the fit's viewer_support.ls_bands_at_once at a time."""
+    rebuilding (channels: version 2's with the average deltas each on its
+    own); with the average deltas all the bands at the same time, with the
+    fit's viewer_support.ls_bands_at_once at a time."""
     import viewer_support as vs
     from simple_writer import band_start
     n = len(coded)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-generic_reader.py version 1.3 -- GenericReader.java for Python (PySide6).
+generic_reader.py version 1.4 -- GenericReader.java for Python (PySide6).
 
 Reads generic_writer.py's files (and GenericWriter.java's and NativeEncoder's
 NativeWriter's, the same files, and simple_writer2.py's and huffman_writer.py's:
@@ -17,8 +17,11 @@ were coded:
   behind the one before (its contexts use their deltas).
 
   Context tables ('T'): the file is read, then each band's channels are
-  decoded as they're rebuilt, a few rows behind the one before (as context
-  aware), the bands at the same time (context_tables.tables_bands).
+  decoded as they're rebuilt (context_tables.tables_bands). Version 2: each
+  channel on its own with Avg (its contexts are its own); with LS a row
+  behind the one before (its fit uses it). Version 1 (the context aware
+  coding's contexts): a few rows behind the one before (its contexts use
+  their deltas). The bands at the same time (LS: ls_bands_at_once).
 
   Huffman ('H'): the file is read, then every band's channels' deltas are
   decoded (huffman_writer.huffman_decode) and the channels rebuilt from them.
@@ -145,6 +148,8 @@ class GenericDecoder:
             fmt = gw.ENTROPY_NAMES[self.entropy_type]
             if self.entropy_type == gw.ENTROPY_TABLES:
                 ls_version, type_version = -1, gw.TABLES_VERSION
+                if version == ct.VERSION_MIXED:
+                    version = type_version    # (each channel's coding says which)
             else:
                 ls_version, type_version = -1, gw.FORMAT_VERSION
                 self.neighbour_version = version

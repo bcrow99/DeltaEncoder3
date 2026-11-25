@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-generic_writer.py version 1.2 -- GenericWriter.java for Python (PySide6).
+generic_writer.py version 1.3 -- GenericWriter.java for Python (PySide6).
 
 simple_writer2.py and huffman_writer.py in one, with a choice of deltas: the
 same image, the same Apply and the same channels (green, blue-green and
@@ -24,11 +24,14 @@ The Entropy menu chooses the coding:
        of the channels before it). Simple 2 format 'F': version 2 with LS,
        the same files as simple_writer2.py; 3 with Avg (the delta type after
        the Pixel Resolution). The default.
-  Context tables: the context aware coding's contexts with fixed tables:
-       each channel's deltas counted by context, the counts written as
-       tables, the deltas rANS coded with them (context_tables.code).
-       Context tables format 'T' 1, always with the delta type. A little
-       bigger than context aware, several times faster to decode.
+  Context tables: fixed tables chosen by each delta's context (its
+       neighbours' activity and its second opinion, the channel's own): each
+       channel's deltas counted by context, the counts written as tables,
+       the deltas rANS coded with them (context_tables.code); a channel's
+       coding uses no other channel. Context tables format 'T' 2, always
+       with the delta type (1, the context aware coding's contexts: read,
+       not written). A little bigger than context aware, several times
+       faster to decode.
   Huffman: each channel's deltas as huffman_writer.py codes them
        (huffman_writer.huffman_code); no contexts, so a channel's coding uses
        no other channel. Huffman format 'H': version 3 with LS, the same files
@@ -106,19 +109,19 @@ def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, 
     (pack_mixed_deltas, with the second opinions), Context tables
     (context_tables.code), Huffman
     (huffman_writer.huffman_code) or neighbour Huffman
-    (neighbour_mapper.neighbour_code, which uses the values too: its second
-    opinions).
+    (neighbour_mapper.neighbour_code); Context tables and neighbour Huffman
+    use the values too (their second opinions).
 
     With LS, each channel is fitted once over the whole image; the bands'
     deltas come from it, with only each band's first rows fitted again
     (delta_mapper.get_row_fit_band_deltas). The average deltas are found a
     band at a time. A channel's coding needs only the deltas of the channels
-    before it (the context codings) or its own (Huffman), so its bands are coded
+    before it (context aware) or its own (the others), so its bands are coded
     while the next channel's deltas are found. Once everything is coded, if
     check is set, each band's channels are checked by decoding them back, at
     the same time; the time that took is returned (0 without it), so the
     coding can be timed without it."""
-    alone = entropy_type in (ENTROPY_HUFFMAN, ENTROPY_NEIGHBOUR)   # each channel coded on its own
+    alone = entropy_type != ENTROPY_MIXED   # each channel coded on its own
     value = [np.asarray(v, dtype=np.int64) for v in value]
     rows = len(value[0]) // xdim
     d = [[None] * 3 for _ in range(n)]          # [band][channel]
@@ -134,7 +137,7 @@ def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, 
         elif entropy_type == ENTROPY_NEIGHBOUR:
             coded[b][i] = nm.neighbour_code(d[b][i], value[i], band_start(b, n, rows) * xdim, xdim)
         elif entropy_type == ENTROPY_TABLES:
-            coded[b][i] = ct.code(d[b][i], band(b, i), d[b][:i], xdim)
+            coded[b][i] = ct.code(d[b][i], value[i], band_start(b, n, rows) * xdim, xdim)
         else:
             coded[b][i] = dm.pack_mixed_deltas(d[b][i], band(b, i), d[b][:i], xdim, True)
 
@@ -143,16 +146,15 @@ def encode(value, mins, xdim, image_xdim, image_ydim, pixel_shift, pixel_quant, 
         if alone:
             if entropy_type == ENTROPY_HUFFMAN:
                 back = hw.huffman_decode(DataInput(coded[b][i]), len(dd))
+            elif entropy_type == ENTROPY_TABLES:
+                back = ct.decode_known(ct.read(DataInput(coded[b][i])), value[i], band_start(b, n, rows) * xdim, dd, xdim)
             else:
                 back = nm.neighbour_decode_known(nm.neighbour_read(DataInput(coded[b][i])), value[i], band_start(b, n, rows) * xdim, dd, xdim)
             # (Delta 0 isn't coded: the band's first value, init, is written instead.)
             same = len(back) == len(dd) and np.array_equal(back[1:], dd[1:])
         else:
             ch = band(b, i)
-            if entropy_type == ENTROPY_TABLES:
-                back = ct.decode_known(ct.read(DataInput(coded[b][i])), ch, dd, d[b][:i], xdim)
-            else:
-                back = dm.unpack_mixed_deltas(coded[b][i], ch, d[b][:i], xdim, ch - dd)
+            back = dm.unpack_mixed_deltas(coded[b][i], ch, d[b][:i], xdim, ch - dd)
             same = np.array_equal(back, dd)
         if not same:
             print("WARNING: band %d channel %d deltas do not decode back." % (b, i))
