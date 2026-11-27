@@ -104,6 +104,7 @@ after that it loads from the cache in `__pycache__`.
 | `code_mapper.py` | CodeMapper | Huffman ("regular"), Shannon estimate, Deflate |
 | `neighbour_mapper.py` | NeighbourMapper | the neighbour Huffman coding: tables chosen by each delta's neighbours, run mode, pairs |
 | `context_tables.py` | ContextTables | the Context tables coding: each channel's own contexts, fixed tables, rANS |
+| `length_coding.py` | LengthCoding | the table machinery the table codings share: bit streams, canonical Huffman tables, length-limited code lengths, code lengths written compactly |
 | `resize_mapper.py` | ResizeMapper | Pixel Resolution resizing |
 | `segment_mapper.py` | SegmentMapper | the segmenting and packing the Packet programs use |
 | `pixel_mapper.py` | PixelMapper | per-block context models for the pixels or prediction errors, red/green/blue or green-difference channels, MED or least-squares prediction |

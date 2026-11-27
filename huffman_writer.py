@@ -35,7 +35,7 @@ import numpy as np
 import arithmetic_mapper as am
 import code_mapper as cm
 import delta_mapper as dm
-import neighbour_mapper as nm
+import length_coding as lc
 import string_mapper as sm
 import viewer_support as vs
 from java_io import DataInput, DataOutput
@@ -44,7 +44,7 @@ from simple_writer import band_start
 from simple_writer2 import SET_ID, CHANNELS, RADIUS, EVERY, MAX_BANDS, SimpleCoder2  # noqa: F401
 
 FORMAT_ID = ord('H')
-FORMAT_VERSION = 3          # 3: the code lengths coded compactly, with no Deflate (neighbour_mapper.pack_lengths), so the files don't depend on a zlib
+FORMAT_VERSION = 3          # 3: the code lengths coded compactly, with no Deflate (length_coding.pack_lengths), so the files don't depend on a zlib
 FORMAT_VERSION_DEFLATE = 1  # 1: the first, the code lengths Deflated (read too). (2 is generic_writer.py's version 1 with the delta type.)
 
 
@@ -139,14 +139,14 @@ def huffman_code(delta):
     code) (HuffmanWriter.huffmanCode). Layout: int the deltas' minimum, int
     the unary string's bit length, its rank table (delta_mapper.write_table),
     int the (transformed) string's byte length, int and the Huffman code
-    lengths (neighbour_mapper.pack_lengths: compactly, with no Deflate; the
+    lengths (length_coding.pack_lengths: compactly, with no Deflate; the
     formats before had them Deflated, code_mapper.pack_regular_tables), int
     and the code. Delta 0 isn't used (the band's first value is written
     instead)."""
     lo, bits, table, string = sm.get_string_list(delta, True)
     lengths = cm.get_regular_huffman_length(am.get_frequency(string))
     code = cm.pack_regular_code(string, lengths)
-    tables = nm.pack_lengths(lengths, cm.REGULAR_MAX_CODE_LENGTH)   # (no Deflate)
+    tables = lc.pack_lengths(lengths, cm.REGULAR_MAX_CODE_LENGTH)   # (no Deflate)
     out = DataOutput()
     out.write_int(int(lo))
     out.write_int(int(bits))
@@ -174,7 +174,7 @@ def huffman_read(inp, deflated=False):
     h.length = inp.read_int()
     tables = inp.read_fully(inp.read_int())
     h.code = inp.read_fully(inp.read_int())
-    h.lengths = cm.unpack_regular_tables(tables, 1)[0] if deflated else nm.unpack_lengths(tables, 256, cm.REGULAR_MAX_CODE_LENGTH)
+    h.lengths = cm.unpack_regular_tables(tables, 1)[0] if deflated else lc.unpack_lengths(tables, 256, cm.REGULAR_MAX_CODE_LENGTH)
     return h
 
 

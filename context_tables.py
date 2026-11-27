@@ -35,7 +35,7 @@ bytes, the low first), then the bytes it gave out, in the order the decoder
 reads them. The tables: a bit stream (most significant bit first) of each
 context's number of levels (its last symbol + 1; 0 for a context not used)
 plus 1, in Elias's gamma code, then the used contexts' levels, one table
-after another, as _chain writes them (neighbour_mapper._length_symbols, up to
+after another, as _chain writes them (length_coding._length_symbols, up to
 twice the top level).
 """
 
@@ -45,7 +45,7 @@ import numpy as np
 
 from numba_support import njit, njit_no_refs, jdiv
 import delta_mapper as dm
-import neighbour_mapper as nm
+import length_coding as lc
 
 VERSION, VERSION_MIXED = 2, 1   # the coding's version, the Context tables format's ('T'): the channel's own contexts; the context aware coding's (read)
 OWN = 3                         # version 2's model byte (version 1's: the context aware coding's model, 0 to 2)
@@ -187,7 +187,7 @@ def _tables(count, steps, prec, weight):
                 out[at] = 1 + (2 * diff if diff >= 0 else -2 * diff - 1)
                 before = e
             at += 1
-    vals, nbits = nm._length_symbols(out, 2 * top)
+    vals, nbits = lc._length_symbols(out, 2 * top)
     pv = np.zeros(2 * contexts + len(vals), dtype=np.int64)
     pb = np.zeros(2 * contexts + len(vals), dtype=np.int64)
     p = 0
@@ -299,7 +299,7 @@ def code(delta, value, offset, xdim):
     best = None
     for st in (1, 2):
         freq, length, size, pv, pb = _tables(count, st, prec, WEIGHT)
-        tb = nm._pack_bits(pv, pb)
+        tb = lc._pack_bits(pv, pb)
         size += (8 * len(tb)) << 16
         if best is None or size < best[0]:
             best = (size, st, freq, tb)
@@ -373,7 +373,7 @@ def _read_tables(buf, contexts, symbols, steps, prec, weight):
             nb += 1
             if nb > 24:
                 return 1, e1, e2, e2, e3
-        v = 1 if nb == 1 else (1 << (nb - 1)) | nm._read_bits(buf, st, nb - 1)
+        v = 1 if nb == 1 else (1 << (nb - 1)) | lc._read_bits(buf, st, nb - 1)
         length[c] = v - 1
         if length[c] > symbols:
             return 1, e1, e2, e2, e3
@@ -382,12 +382,12 @@ def _read_tables(buf, contexts, symbols, steps, prec, weight):
             used += 1
         total += length[c]
     longest = np.zeros(1, dtype=np.int64)
-    first = np.zeros((1, nm.MAX_CODE_LENGTH + 2), dtype=np.int64)
-    count = np.zeros((1, nm.MAX_CODE_LENGTH + 2), dtype=np.int64)
-    start = np.zeros((1, nm.MAX_CODE_LENGTH + 2), dtype=np.int64)
+    first = np.zeros((1, lc.MAX_CODE_LENGTH + 2), dtype=np.int64)
+    count = np.zeros((1, lc.MAX_CODE_LENGTH + 2), dtype=np.int64)
+    start = np.zeros((1, lc.MAX_CODE_LENGTH + 2), dtype=np.int64)
     sorted_ = np.zeros((1, 2 * top + 4), dtype=np.int64)
-    lookup = np.zeros((1, 1 << nm.LOOKUP_BITS), dtype=np.int64)
-    ok, out = nm._read_lengths(buf, st, total, 2 * top, 0, longest, first, count, start, sorted_, lookup)
+    lookup = np.zeros((1, 1 << lc.LOOKUP_BITS), dtype=np.int64)
+    ok, out = lc._read_lengths(buf, st, total, 2 * top, 0, longest, first, count, start, sorted_, lookup)
     if not ok:
         return 2, e1, e2, e2, e3
     if 8 * st[3] > st[1]:
@@ -429,7 +429,7 @@ def _read_tables(buf, contexts, symbols, steps, prec, weight):
 @njit(inline="always")
 def _read_zero(buf, st):
     """Reads a bit; whether it's 0 (for the gamma code's prefix)."""
-    return nm._read_bits(buf, st, 1) == 0
+    return lc._read_bits(buf, st, 1) == 0
 
 
 _TABLE_ERRORS = {1: "a table's length", 2: "the levels", 3: "a level", 4: "the tables end too soon", 5: "a table ends with a symbol that isn't there"}
@@ -620,6 +620,50 @@ def _ct_average_row(xdim, ydim, init, delta, dst, y, previous, cross, cb, fwd, c
         dst[k] = init if k == 0 else p + delta[k]
 
 
+@njit_no_refs   # (no arrays made: see numba_support)
+def _ct_own_average(xdim, ydim, init, delta, dst, act_table, slot, freq, cum, look, code, st, value, prec):
+    """A band's channel (version 2: its own contexts) decoded and rebuilt
+    from its average deltas, all of it in one call (ContextTables.average):
+    as _ct_average_row and _ct_symbol, but with rANS's state in locals."""
+    x = st[0]
+    at = st[1]
+    bad = 0
+    mask = (1 << prec) - 1
+    end = code.shape[0]
+    for y in range(ydim):
+        for c in range(xdim):
+            k = y * xdim + c
+            if k == 0:
+                p = init
+            elif y == 0:
+                p = dst[k - 1]
+            elif c == 0:
+                p = dst[k - xdim]
+            else:
+                p = jdiv(dst[k - 1] + dst[k - xdim], 2)
+            r = slot[_own_context(k, c, y, delta, dst, xdim, act_table, p)]
+            if r < 0:
+                bad = 1
+                dk = 0
+            else:
+                low = x & mask
+                s = look[r, low]
+                x = freq[r, s] * (x >> prec) + low - cum[r, s]
+                while x < RANS_LOW:
+                    b = 0
+                    if at < end:
+                        b = code[at]
+                        at += 1
+                    x = (x << 8) | b
+                dk = value[s]
+            delta[k] = dk
+            dst[k] = init if k == 0 else p + dk
+    st[0] = x
+    st[1] = at
+    if bad:
+        st[2] = 1
+
+
 def channels(coded, xdim, ydim, init, average, radius, every):
     """A band's channels decoded and rebuilt (GenericReader.tablesBands' for
     a band): a thread per channel, a row at a time, each row a single
@@ -653,6 +697,10 @@ def channels(coded, xdim, ydim, init, average, radius, every):
                 col, coef, valid, z, _, _, _, _, _, _, _, points = dm._rf_state(xdim, has_ref, every)
                 ref = value[i - 1] if i > 0 else np.zeros(1, dtype=np.int64)
                 w = dm._rf_work(nf)
+            if own and average:   # (each channel on its own: all of it in one call)
+                _ct_own_average(xdim, ydim, int(init[i]), delta[i], value[i], dm.MIX_ACTIVITY_TABLE, *dec[:6], h.value, h.precision)
+                finish(dec, h)
+                return
             for y in range(ydim):
                 if i > 0 and ahead > 0:
                     need = min(ydim, y + ahead)
